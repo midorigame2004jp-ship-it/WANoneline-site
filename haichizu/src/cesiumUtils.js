@@ -1,0 +1,191 @@
+﻿// ===== Cesiumユーティリティ =====
+const CESIUM_TOKEN = (typeof window !== 'undefined' && window._ENV && window._ENV.CESIUM_ION_TOKEN) || '';
+const DEF_GEO_ORIGIN = { lat: 33.275, lng: 131.667 }; // デフォルト原点（大分臨海工業地帯付近）
+const M_PER_DEG_LAT = 111320;
+
+// フィールドポリゴン（ユーザー定義の敷地境界）
+function getSavedFieldPolygon() {
+  try {
+    const s = localStorage.getItem('field_polygon');
+    if (s) { const a = JSON.parse(s); if (Array.isArray(a) && a.length >= 3) return a; }
+  } catch (_) {}
+  return null;
+}
+function saveFieldPolygon(pts) {
+  try { localStorage.setItem('field_polygon', JSON.stringify(pts)); } catch (_) {}
+}
+
+// GEO_ORIGIN & METERS_PER_PX: フィールドポリゴンから毎回再計算（TW/TH変更に対応）
+let GEO_ORIGIN, METERS_PER_PX, M_PER_DEG_LNG;
+(() => {
+  const poly = getSavedFieldPolygon();
+  if (poly && poly.length >= 3) {
+    const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
+    const centerLat = (Math.min(...lats) + Math.max(...lats)) / 2;
+    const centerLng = (Math.min(...lngs) + Math.max(...lngs)) / 2;
+    const mPerDegLng = 111320 * Math.cos(centerLat * Math.PI / 180);
+    const bboxW = (Math.max(...lngs) - Math.min(...lngs)) * mPerDegLng;
+    const bboxH = (Math.max(...lats) - Math.min(...lats)) * M_PER_DEG_LAT;
+    const mpp = Math.max(bboxW / (TW * 0.9), bboxH / (TH * 0.9), 0.001);
+    // GEO_ORIGINをフィールド中心から逆算（グリッド中心=フィールド中心）
+    const originLat = centerLat - (TH / 2) * mpp / M_PER_DEG_LAT;
+    const originLng = centerLng - (TW / 2) * mpp / mPerDegLng;
+    GEO_ORIGIN = { lat: originLat, lng: originLng };
+    METERS_PER_PX = mpp;
+    M_PER_DEG_LNG = mPerDegLng;
+    // localStorageも更新
+    try { localStorage.setItem('geo_origin', JSON.stringify(GEO_ORIGIN)); } catch (_) {}
+  } else {
+    // フィールドポリゴンなし: デフォルト
+    try {
+      const s = localStorage.getItem('geo_origin');
+      if (s) { const o = JSON.parse(s); if (o.lat && o.lng) { GEO_ORIGIN = o; } }
+    } catch (_) {}
+    if (!GEO_ORIGIN) GEO_ORIGIN = { ...DEF_GEO_ORIGIN };
+    METERS_PER_PX = 0.1; // デフォルト: 1px=0.1m → 1 MAJORセル(36px)≈3.6m。3次元図の縦横比を適切に保つ
+    M_PER_DEG_LNG = 111320 * Math.cos(GEO_ORIGIN.lat * Math.PI / 180);
+  }
+})();
+
+function updateGeoOrigin(lat, lng) {
+  GEO_ORIGIN = { lat, lng };
+  M_PER_DEG_LNG = 111320 * Math.cos(lat * Math.PI / 180);
+  try { localStorage.setItem('geo_origin', JSON.stringify(GEO_ORIGIN)); } catch (_) {}
+}
+
+// ── キャッシュ & パフォーマンス ──
+function getElevCacheKey() { return `cesium_elev_min_${GEO_ORIGIN.lat}_${GEO_ORIGIN.lng}`; }
+const ELEV_CACHE_KEY = getElevCacheKey();
+function getCachedElevation() {
+  try {
+    const raw = localStorage.getItem(getElevCacheKey());
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (Date.now() - data.ts < 86400000) return data.elev;
+  } catch (_) {}
+  return null;
+}
+function setCachedElevation(elev) {
+  try { localStorage.setItem(getElevCacheKey(), JSON.stringify({ elev, ts: Date.now() })); } catch (_) {}
+}
+
+// 共有マテリアル（毎フレーム生成を避ける）
+let _sharedMaterials = null;
+function getSharedMaterials() {
+  if (_sharedMaterials) return _sharedMaterials;
+  const wireColor = Cesium.Color.fromCssColorString('#1a1a1a');
+  const outlineColor = Cesium.Color.fromCssColorString('#E8ECF0');
+  _sharedMaterials = {
+    wireColor: wireColor.withAlpha(0.9),
+    wireDepthFail: wireColor.withAlpha(0.9),
+    wireOutline: outlineColor.withAlpha(0.95),
+    wireOutlineDepthFail: outlineColor.withAlpha(0.95),
+  };
+  return _sharedMaterials;
+}
+
+// シンボルアイコン生成（Canvas→DataURL、キャッシュ付き）
+const _iconCache = {};
+function makeSymbolIcon(shape, color, label, size = 36) {
+  const key = `${shape}_${color}_${label}_${size}`;
+  if (_iconCache[key]) return _iconCache[key];
+  const lblH = label ? 14 : 0;
+  const c = document.createElement('canvas');
+  c.width = size + 2; c.height = size + lblH + 2;
+  const ctx = c.getContext('2d');
+  const h = size / 2 + 1; // 1px padding
+  // 白カード背景（HTMLビューのdivと統一）
+  ctx.beginPath();
+  ctx.roundRect(0, 0, size + 2, size + 2, 4);
+  ctx.fillStyle = 'rgba(255,255,255,1.0)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.12)';
+  ctx.lineWidth = 0.8;
+  ctx.stroke();
+  if (shape === 'gen') {
+    // 発電機: 円(stroke only) + G — Symと同一スタイル
+    ctx.beginPath(); ctx.arc(h, h, size / 2 - 2, 0, Math.PI * 2);
+    ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.fillStyle = color; ctx.font = `bold ${size * 0.42}px sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('G', h, h + 0.5);
+  } else {
+    // 遮断器: 角丸矩形 + 52 — Symと同一スタイル
+    const isG = shape === 'cb_g';
+    const fc = isG ? '#16A34A' : '#DC2626';
+    ctx.beginPath();
+    ctx.roundRect(2, 2, size - 2, size - 2, 2);
+    ctx.fillStyle = fc; ctx.fill();
+    ctx.fillStyle = '#FFF'; ctx.font = `bold ${size * 0.36}px sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('52', h, h + 0.5);
+  }
+  // ラベル（アイコン下、白文字+黒縁）
+  if (label) {
+    ctx.font = `bold 10px sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.strokeStyle = 'rgba(0,0,0,0.75)'; ctx.lineWidth = 2.5;
+    ctx.strokeText(label, h, size + 3);
+    ctx.fillStyle = '#FFF';
+    ctx.fillText(label, h, size + 3);
+  }
+  _iconCache[key] = c.toDataURL();
+  return _iconCache[key];
+}
+
+// サーバー側プロキシキャッシュ: Cesium Ionリクエストを /proxy 経由に書き換え
+function installTileProxy() {
+  if (typeof Cesium === 'undefined') return;
+  const proxyDomains = ['assets.cesium.com', 'api.cesium.com'];
+  const origFetch = Cesium.Resource._Implementations.loadWithXhr;
+  if (!origFetch || Cesium.Resource._proxyInstalled) return;
+  Cesium.Resource._proxyInstalled = true;
+
+  Cesium.Resource._Implementations.loadWithXhr = function(url, responseType, method, data, headers, deferred, overrideMimeType) {
+    let finalUrl = url;
+    try {
+      const parsed = new URL(url);
+      if (proxyDomains.some(d => parsed.hostname === d || parsed.hostname.endsWith('.' + d))) {
+        // ローカルサーバー経由でプロキシ
+        finalUrl = '/proxy?url=' + encodeURIComponent(url);
+      }
+    } catch (_) {}
+    return origFetch.call(this, finalUrl, responseType, method, data, headers, deferred, overrideMimeType);
+  };
+  console.log('[TileProxy] サーバー側キャッシュプロキシ有効');
+}
+// プロキシサーバー稼働判定（/proxy が使えるか）
+function detectAndInstallProxy() {
+  fetch('/stats').then(r => {
+    if (r.ok) {
+      installTileProxy();
+    } else {
+      console.log('[TileProxy] プロキシサーバー未検出、直接接続モード');
+    }
+  }).catch(() => {
+    console.log('[TileProxy] プロキシサーバー未検出、直接接続モード');
+  });
+}
+detectAndInstallProxy();
+
+function gridToGeo(x, y) {
+  return {
+    lng: GEO_ORIGIN.lng + x * METERS_PER_PX / M_PER_DEG_LNG,
+    lat: GEO_ORIGIN.lat + (TH - y) * METERS_PER_PX / M_PER_DEG_LAT, // Y反転: 平面図の上=北
+  };
+}
+
+function geoToGrid(lat, lng) {
+  return {
+    x: (lng - GEO_ORIGIN.lng) * M_PER_DEG_LNG / METERS_PER_PX,
+    y: TH - (lat - GEO_ORIGIN.lat) * M_PER_DEG_LAT / METERS_PER_PX, // Y反転
+  };
+}
+
+// フィールドポリゴンのグリッド座標変換（全ビュー共通）
+const FIELD_POLY_GRID = (() => {
+  const poly = getSavedFieldPolygon();
+  if (!poly) return null;
+  return poly.map(p => geoToGrid(p.lat, p.lng));
+})();
+

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 220" font-family="'Zen Kaku Gothic New','Hiragino Sans','Yu Gothic',sans-serif">
+  <!-- 【ロゴ思想】単線結線図の最小単位(電源—遮断器—負荷)をそのまま紋章化。
+       上=高圧(橙) 下=低圧(黄)で「変わる電圧」を、左への分岐で WAN(広がる網)を表す。
+       納品時は文字をアウトライン化すること。 -->
+  <defs>
+    <linearGradient id="ghv" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff6a3d"/><stop offset="1" stop-color="#ff8a3d"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- プレビュー用背景(透過版では削除) -->
+  <rect width="780" height="220" fill="#05080f"/>
+
+  <!-- ══ ロゴマーク ══ -->
+  <g transform="translate(36,50)">
+    <rect x="0" y="0" width="120" height="120" rx="28" fill="#0b1322" stroke="#26385c" stroke-width="2"/>
+    <!-- 電源ドット -->
+    <circle cx="60" cy="18" r="6" fill="#ff6a3d" filter="url(#glow)"/>
+    <!-- 一次側(高圧) -->
+    <path d="M60 24 V44" stroke="url(#ghv)" stroke-width="7" stroke-linecap="round" filter="url(#glow)"/>
+    <!-- 遮断器 -->
+    <rect x="43" y="44" width="34" height="34" rx="8" fill="none" stroke="#dbe6f7" stroke-width="6"/>
+    <!-- 二次側(低圧) -->
+    <path d="M60 78 V104" stroke="#ffc94d" stroke-width="7" stroke-linecap="round" filter="url(#glow)"/>
+    <!-- WANの分岐 -->
+    <path d="M60 92 H34" stroke="#ffc94d" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="27" cy="92" r="5" fill="#ffc94d"/>
+  </g>
+
+  <!-- ══ ワードマーク ══ -->
+  <text x="192" y="128" font-weight="900" font-size="58" letter-spacing="1">
+    <tspan fill="#8298ba">WAN</tspan><tspan fill="#ff6a3d">One</tspan><tspan fill="#dbe6f7">Line</tspan>
+  </text>
+  <text x="196" y="166" font-size="15.5" fill="#5a7095" letter-spacing="5">単線結線図プラットフォーム — 電気を、見える化する。</text>
+</svg>

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>配置図 - CesiumJS統合プロトタイプ</title>
+
+<!-- 環境変数（.envからサーバー経由で注入） -->
+<script src="env.js"></script>
+
+<!-- CesiumJS -->
+<script>window.CESIUM_BASE_URL = 'https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/';</script>
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Cesium.js"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+
+<!-- React 18 (UMD) -->
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+
+<!-- Babel Standalone (JSX変換) -->
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+
+  /* CesiumJS ウィジェットのFloatWin内表示調整 */
+  .cesium-viewer { width: 100% !important; height: 100% !important; }
+  .cesium-viewer-bottom { display: none !important; }
+  .cesium-viewer .cesium-widget-credits { font-size: 8px !important; }
+  .cesium-viewer .cesium-toolbar { right: 4px !important; top: 4px !important; }
+</style>
+</head>
+<body>
+
+<!-- file://プロトコルチェック -->
+<div id="serverWarn" style="display:none; background:#7C2D12; color:#FED7AA; padding:16px 20px; font-size:13px; line-height:1.8; font-family:'Segoe UI',sans-serif;">
+  <b>file://プロトコルでは動作しません。</b>ローカルHTTPサーバーが必要です。<br>
+  以下のいずれかでこのファイルがあるフォルダで実行してください:<br>
+  <b>方法1 (Python):</b> <code>python -m http.server 8080</code> → ブラウザで <code>http://localhost:8080/cesium-integrated.html</code><br>
+  <b>方法2 (Node):</b> <code>npx serve .</code> → 表示されたURLを開く<br>
+  <b>方法3 (VSCode):</b> Live Server拡張 → 右クリック「Open with Live Server」
+</div>
+
+<div id="root"></div>
+
+<script>
+// file://チェック
+if (location.protocol === 'file:') {
+  document.getElementById('serverWarn').style.display = 'block';
+}
+
+// Service Worker登録（タイル・アセットキャッシュ）
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  navigator.serviceWorker.register('sw-cesium.js')
+    .then(reg => console.log('[SW] 登録成功:', reg.scope))
+    .catch(err => console.warn('[SW] 登録失敗（動作に影響なし）:', err.message));
+}
+
+// ?solo=<winId> で指定した FloatWin だけをフルスクリーン表示するモード
+window.SOLO_WIN = new URLSearchParams(location.search).get('solo') || '';
+
+// 分割ファイルを順番に読み込み・結合してBabel変換・実行
+async function loadApp() {
+  const srcFiles = [
+    'src/constants.js',
+    'solidModel.js',
+    'src/geometry.js',
+    'src/panel/panelChambers.js',
+    'src/panel/panelSolid.js',
+    'src/panel/panelDrawCore.js',
+    'src/terrain.js',
+    'src/cesiumUtils.js',
+    'src/mapPosStore.js',
+    'src/FloatWin.jsx',
+    'src/CesiumMap.jsx',
+    'App.jsx',
+  ];
+
+  try {
+    const ts = Date.now();
+    let combined = `const { useState, useRef, useCallback, useEffect, useMemo, useLayoutEffect } = React;\n`;
+
+    for (const f of srcFiles) {
+      const res = await fetch(f + '?t=' + ts);
+      if (!res.ok) throw new Error(`Failed to load ${f}: ${res.status}`);
+      let code = await res.text();
+      // react import を削除（グローバルから使うため）
+      code = code.replace(/^import\s+\{[^}]+\}\s+from\s+["']react["'];?\s*\n?/gm, '');
+      combined += `\n// ===== ${f} =====\n` + code + '\n';
+    }
+
+    // export default → window.App（App.jsx側で変換済みだが念のため）
+    combined = combined.replace('export default function App()', 'window.App = function App()');
+
+    // Babel でJSX変換
+    const transformed = Babel.transform(combined, {
+      presets: ['react'],
+      filename: 'app.jsx',
+    }).code;
+
+    // 実行
+    const script = document.createElement('script');
+    script.textContent = transformed;
+    document.body.appendChild(script);
+
+    // Reactアプリをマウント
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(window.App));
+
+    console.log('App loaded successfully');
+  } catch (e) {
+    console.error('App load error:', e);
+    document.getElementById('root').innerHTML =
+      '<div style="padding:40px;font-family:sans-serif;color:#EF4444;">' +
+      '<h2>読み込みエラー</h2>' +
+      '<p>' + e.message + '</p>' +
+      '<p style="color:#94A3B8;margin-top:12px;">HTTPサーバーで開いているか確認してください。</p>' +
+      '</div>';
+  }
+}
+
+loadApp();
+</script>
+</body>
+</html>

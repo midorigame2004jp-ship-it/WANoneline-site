@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 220" font-family="'Zen Kaku Gothic New','Hiragino Sans','Yu Gothic',sans-serif">
+  <!-- 【ロゴ思想】母線(単線結線図の一本線)が心電図の鼓動を打つ。
+       「電脈」=設備の血管と鼓動。図面が生きていることを一筆で表す。
+       納品時は文字をアウトライン化すること。 -->
+  <defs>
+    <linearGradient id="gpulse" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff6a3d"/><stop offset="1" stop-color="#ffc94d"/>
+    </linearGradient>
+    <filter id="glow2" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2.4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- プレビュー用背景(透過版では削除) -->
+  <rect width="780" height="220" fill="#05080f"/>
+
+  <!-- ══ ロゴマーク ══ -->
+  <g transform="translate(36,50)">
+    <rect x="0" y="0" width="120" height="120" rx="28" fill="#0b1322" stroke="#26385c" stroke-width="2"/>
+    <!-- 母線 × 鼓動 -->
+    <path d="M16 60 H40 L49 30 L61 88 L69 60 H104"
+          fill="none" stroke="url(#gpulse)" stroke-width="7"
+          stroke-linecap="round" stroke-linejoin="round" filter="url(#glow2)"/>
+    <circle cx="16" cy="60" r="5.5" fill="#ff6a3d"/>
+    <circle cx="104" cy="60" r="5.5" fill="#ffc94d"/>
+  </g>
+
+  <!-- ══ ワードマーク ══ -->
+  <text x="192" y="126" font-weight="900" font-size="66" fill="#dbe6f7" letter-spacing="6">電脈</text>
+  <text x="342" y="122" font-family="'IBM Plex Mono',monospace" font-size="17" fill="#ff6a3d" letter-spacing="8">DENMYAKU</text>
+  <text x="196" y="168" font-size="15.5" fill="#5a7095" letter-spacing="5">設備の鼓動を、単線結線図に。</text>
+</svg>
