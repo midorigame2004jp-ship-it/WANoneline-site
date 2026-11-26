@@ -27,6 +27,36 @@ function pdcTransparency(panel) {
   return (panel && panel.outerOpacity) ?? PDC_DEFAULT_TRANSPARENCY;
 }
 
+// ── 盤の色・盤名称ラベルの見た目（唯一の正）──
+// 同じ盤が図面ごとに違う色・違う大きさで見えるのを防ぐため、色と文字の決め方はここだけに置く。
+// 3次元図・平面図・立面図・側面図・矢視図・追加平面図は、必ずこの関数から取得すること。
+// 各ビューで色を直書きしてはいけない（2026-08、2Dだけ濃紺・3次元図だけ盤色になり乖離した）。
+const PDC_DEFAULT_PANEL_COLOR = '#4A90D9';   // 盤の色が未設定のときの既定
+// 【削除・2026-09-09】PDC_SELECT_COLOR（'#3B82F6'）は参照ゼロの死んだ定数だった。
+// 「配置したものを選んでいる／カーソルが当たっている」の色は BC_UI.accent ただ1つ
+// （壁・扉・機器と盤で色が割れていたのが「盤だけオレンジにならない」の原因）。
+// ここに残すと、また盤だけ別の色になる入口が生える
+// 文字の縁取り色は PDC_LABEL.HALO ただ1つ（同じ意味の定数を2つ持たない・2026-09-07）
+
+// 盤そのものの色
+function pdcPanelColor(panel) {
+  return (panel && panel.color) || PDC_DEFAULT_PANEL_COLOR;
+}
+// 盤名称ラベルの文字色。
+// 【選択中でも色を変えない】選択は盤の外形の強調（太線＋強調色）で示す。
+// ラベルまで色を変えると、同じ図面の中で選択中の盤だけ色が違って見え、
+// 「盤ごとに色が一致していない」ように読めてしまう（2026-08 の指摘）。
+// 【2026-09-06 ユーザー指示】盤も機器も黒文字＋白フチに統一する。
+// 盤の色をラベルにも使うと、図の中で盤ごとに文字色が違い、機器のラベルとも揃わない。
+// 盤の色は外形で示す（ラベルは「読むための注記」なので色を持たせない）
+function pdcPanelNameColor(panel) {
+  return PDC_LABEL.TEXT;
+}
+// 【pdcPanelNameFontSize は廃止・2026-09-07】盤の文字サイズだけの入口だったが、
+// 中身は pdcLabelMetrics を呼ぶだけの空の口になっていた（呼び出し元も0）。
+// 値を作らない入口を残すと、そこにまた別の式が生えて「盤だけ大きさが違う」に戻る。
+// 盤も機器も pdcLabelMetrics を直接呼ぶ（大きさの規則は1つ）。
+
 // ── 色ヘルパー（PanelCanvas3D.jsx から移設）──
 function _hexToRGB(hex) {
   const h = (hex || '#94A3B8').replace('#', '');
@@ -112,6 +142,124 @@ function pdcDoorCorners(door, panel) {
   const effSide = _hFlip.has(face) ? (hingeSide==='right' ? 'left' : 'right') : (hingeSide || 'left');
   if (effSide === 'right') return [rotFree(B,A), B, C, rotFree(C,Dp)];
   return [A, rotFree(A,B), rotFree(Dp,C), Dp];
+}
+
+// ── 複数アイコンの整列パターン（区画・扉で共通／面にも寸法にも依存しない純粋なパターン）──
+// layoutName: 'h'=横並び, 'v'=縦並び, 't1b2'=上1下2(N=3), 't2b1'=上2下1(N=3), その他=auto(√Nグリッド)
+//
+// 分数は「分子/分母」の整数のまま返す。呼び出し側で min + 分子*(max-min)/分母 と展開することで
+// 正規化small数を経由する桁落ちを避け、区画側の既存の並びを保つ。
+// c=面内の横軸方向, r=面内の縦軸方向。r は下→上に増える（区画側は縦軸=z のため。扉側の v も z 向き）。
+//
+// 【不変条件】どのレイアウトでも「アイコンの位置 = そのスロット矩形の中心」。
+// 区画側は面→軸の写像でmmに、扉側は扉4隅のアフィン写像で3Dに落とす。
+function pdcLayoutSlotRects(N, layoutName) {
+  const cell = (col, cols, row, rows) => ({ c0: col, c1: col + 1, cols, r0: row, r1: row + 1, rows });
+  if (layoutName === 'h') return Array.from({ length: N }, (_, i) => cell(i, N, 0, 1));
+  if (layoutName === 'v') return Array.from({ length: N }, (_, i) => cell(0, 1, i, N));
+  if (N === 3 && layoutName === 't1b2') return [
+    { c0: 0, c1: 1, cols: 1, r0: 0, r1: 1, rows: 2 },   // 下段を全幅で1つ
+    cell(0, 2, 1, 2), cell(1, 2, 1, 2),                 // 上段を2分割
+  ];
+  if (N === 3 && layoutName === 't2b1') return [
+    cell(0, 2, 0, 2), cell(1, 2, 0, 2),                 // 下段を2分割
+    { c0: 0, c1: 1, cols: 1, r0: 1, r1: 2, rows: 2 },   // 上段を全幅で1つ
+  ];
+  const cols = Math.ceil(Math.sqrt(N)), rows = Math.ceil(N / cols);
+  return Array.from({ length: N }, (_, i) => cell(i % cols, cols, Math.floor(i / cols), rows));
+}
+
+// 扉のワイヤーフレーム（辺）の見た目。Zバッファ枝・Painter's枝の両方でここを使う。
+// 線は「面より1段階高い解像度」で描くのが方針（回転中の劣化は線のボケとして視認されるため）。
+const PDC_DOOR_WIRE = { rgb: [100, 150, 255], css: 'rgb(100,150,255)', lineWidth: 1 };
+
+// 面の日本語名（UI表示用の唯一の正。各所のインラインコピーはここに寄せる）
+const PDC_FACE_JP = { front:'前面', back:'後面', left:'左面', right:'右面', top:'上面', bottom:'下面' };
+
+// ── 扉に貼るアイコンの3D配置座標 ──
+// 扉は開扉110°回転後も平行四辺形を保つ（ヒンジ辺を軸とした剛体回転で対辺が同一ベクトルだけ回るため）。
+// よって正規化(s,t)→3D は A + s*(B-A) + t*(D-A) のアフィン写像1本で足り、
+// 開閉・面の違い・ヒンジ左右を個別対応せずにアイコンが扉へ追従する。
+// pdcDoorCorners の戻り順は [A, B, C, D] = 面ローカルUVの (u,v) (u+w,v) (u+w,v+h) (u,v+h)。
+// pdcFaceUV は v=z（下→上）なので A=左下 / B=右下 / C=右上 / D=左上 に相当する。
+function pdcDoorSlotPositions(door, panel, N, layoutName) {
+  const c = pdcDoorCorners(door, panel);
+  if (!c) return [];
+  const [A, B, , Dp] = c;
+  const eu = [B[0]-A[0], B[1]-A[1], B[2]-A[2]];    // 扉の横方向ベクトル
+  const ev = [Dp[0]-A[0], Dp[1]-A[1], Dp[2]-A[2]]; // 扉の縦方向ベクトル（下→上）
+  return pdcLayoutSlotRects(N, layoutName).map(r => {
+    const s = (r.c0 + r.c1) / (2 * r.cols);        // スロット矩形の中心（正規化）
+    const t = (r.r0 + r.r1) / (2 * r.rows);
+    return { wx: A[0] + s*eu[0] + t*ev[0],
+             wy: A[1] + s*eu[1] + t*ev[1],
+             wz: A[2] + s*eu[2] + t*ev[2], s, t };
+  });
+}
+
+// ── 扉に貼るアイコンの flat 四角（扉平面上）──
+// 区画側の flat アイコン（pdcIconFlatHalf / PDC_ICON_FLAT_STYLE）と同じ大きさ・同じ描画関数を使う。
+// 違うのは「向き」だけ: 区画は世界軸のx-z平面、扉は扉平面（開扉なら110°回転後）に貼る。
+// 小さい扉でスロットからはみ出さないよう、扉の辺長に対しても上限を掛ける。
+// s,t は pdcDoorSlotPositions が返す正規化スロット中心。
+function pdcDoorIconFlatCorners(view, door, panel, s, t) {
+  const c = pdcDoorCorners(door, panel);
+  if (!c) return null;
+  const [A, B, , Dp] = c;
+  const eu = [B[0]-A[0], B[1]-A[1], B[2]-A[2]];
+  const ev = [Dp[0]-A[0], Dp[1]-A[1], Dp[2]-A[2]];
+  const nu = Math.hypot(eu[0], eu[1], eu[2]) || 1;
+  const nv = Math.hypot(ev[0], ev[1], ev[2]) || 1;
+  const h = Math.min(pdcIconFlatHalf(panel), nu * 0.2, nv * 0.2);
+  const uu = eu.map(v => v / nu * h), vv = ev.map(v => v / nv * h);
+  const P = [A[0] + s*eu[0] + t*ev[0], A[1] + s*eu[1] + t*ev[1], A[2] + s*eu[2] + t*ev[2]];
+  const mk = (su, sv) => view.proj(
+    P[0] + su*uu[0] + sv*vv[0], P[1] + su*uu[1] + sv*vv[1], P[2] + su*uu[2] + sv*vv[2]);
+  return [mk(-1,-1), mk(1,-1), mk(1,1), mk(-1,1)];
+}
+
+// ── 扉に貼られたアイコンの配置（エディタ・3次元図の共通の唯一の正）──
+// doorId でグルーピングし、扉ごとに pdcDoorSlotPositions で位置を決める。
+// 戻り値: Map(doorId → [{ icon, pos }])。pos は {wx,wy,wz,s,t}
+// ・順序は placedIcons の並び順をそのまま保つ（並び替え機能がこの順序を前提にしている）
+// ・存在しない扉を指すアイコンは落とす（盤中心などへフォールバックさせない）
+// ・並び替え／扉間移動のプレビューはこの戻り値を呼び出し側で差し替える（コアに混ぜない）
+function pdcDoorIconPlacements(panel, iconLayouts) {
+  const out = new Map();
+  const byDoor = new Map();
+  for (const icon of (panel.placedIcons || [])) {
+    if (!icon.doorId) continue;
+    if (!byDoor.has(icon.doorId)) byDoor.set(icon.doorId, []);
+    byDoor.get(icon.doorId).push(icon);
+  }
+  for (const [doorId, icons] of byDoor) {
+    const door = (panel.doors || []).find(d => d.id === doorId);
+    if (!door || !icons.length) continue;
+    const lname = (iconLayouts || {})[`door:${doorId}`] || 'auto';
+    const pos = pdcDoorSlotPositions(door, panel, icons.length, lname);
+    if (!pos.length) continue;
+    out.set(doorId, icons.map((icon, i) => ({ icon, pos: pos[i] })));
+  }
+  return out;
+}
+
+// ── 扉アイコン1個の描画（四角＋ラベル）: エディタ・3次元図で同じ絵にするための唯一の入口 ──
+// opts: { isSel, isGhost }（編集UI固有の色。3次元図は指定しない）
+function pdcPaintDoorIcon(ctx, door, panel, view, icon, pos, opts) {
+  const corners = pdcDoorIconFlatCorners(view, door, panel, pos.s, pos.t);
+  if (!corners) return null;
+  const o = opts || {};
+  const _prev = ctx.globalAlpha;
+  ctx.globalAlpha = o.isGhost ? 0.85 : 1;
+  pdcPaintIconFlat(ctx, corners, view, {
+    fillStyle:   o.isGhost ? '#D97706' : (o.isSel ? '#1E40AF' : icon.iconColor || undefined),
+    strokeStyle: o.isGhost ? '#FDE68A' : (o.isSel ? '#FBBF24' : undefined),
+    lineWidth:   o.isGhost ? 2 : (o.isSel ? 2.5 : undefined),
+  });
+  ctx.globalAlpha = 1;
+  pdcPaintIconLabel(ctx, view.proj(pos.wx, pos.wy, pos.wz), pdcIconLabelText(icon), view, { isSel: o.isSel });
+  ctx.globalAlpha = _prev;
+  return corners;
 }
 
 // ── Step 1: 外箱の可視面を収集（遠→近ソート済み）──
@@ -247,7 +395,11 @@ function pdcInteriorAlpha(transparency, solidAlpha) {
 const PDC_ICONONLY_COMPOSITE_ALPHA = 0.6;
 
 // ── 仕切り面の塗り色RGB（エディタZバッファ枝 L1441-1445 と同一）──
-// isSel: エディタの選択ハイライト（×1.3輝度）。3次元図は常にfalse
+// isSel: 選択・カーソルが当たっているときの強調（×1.3輝度）。
+// 【2026-09-09】3次元図は false 固定だったので、配置した盤を選んでも明るくならなかった
+// （ユーザー報告「床に設置した盤についてはオレンジエフェクトにならない」）。
+// 呼び出し側が view.hot で渡す。係数1.3は建物側の BC_HOT_BRIGHTNESS と同じ値なので、
+// 盤も壁・扉・機器も同じ明るさで反応する
 function pdcPartitionFaceRGB(color, normal, isSel) {
   const br = Math.min(panelFaceBrightness(normal) * (isSel ? 1.3 : 1), 1.5);
   const [ri, gi, bi] = _hexToRGB(color || '#94A3B8');
@@ -419,55 +571,90 @@ function _pdcSplitPolyByPlane(verts, plane) {
   return { front: _pdcWeldPoly(front), back: _pdcWeldPoly(back) };
 }
 
-// ── 仕切り面の事前分割（視点非依存・キャッシュ推奨）──
-// solids: panelToSolids(panel) の結果
-// 戻り値: [{ color, normal, vertices, originSolid }] — pdcCollectPartitionFaces の第3引数に渡す
-// ・各面は「他の仕切りの中央平面」でのみ分割する。自分のsolidの平面では絶対に
-//   分割しない（solidオブジェクト同一性で除外。板の表裏2枚の面は自分の中央平面から
-//   ±板厚/2 離れているが、平面値でなくsolid単位で除外するので板厚に関わらず安全）
-// ・中央平面が求まらないsolid（凹形状・異常形状等）は分割対象から除外し、
-//   そのsolidの面はそのまま（未分割）出力する安全なフォールバック
-// ・凸多角形でない面（凹poly仕切り等）も分割せずそのまま出力する安全なフォールバック
-// ・AABBが交差しない仕切りペアは分割しない（断片数の抑制。T字接触はEPSマージンで含む）
-// ・同一平面上の仕切り同士は全頂点が平面上扱い → 分割されない（ゼロ面積断片なし）
-// ・断片数が上限に達したら、それ以上の分割を打ち切り元の断片を残す（暴走防止）
-function pdcBuildPartitionSplit(solids) {
-  const parts = [];
-  (solids || []).forEach(solid => {
-    if (solid._isOuter) return;
-    parts.push({ solid, plane: _pdcSolidMidPlane(solid), aabb: _pdcSolidAABB(solid) });
+// ── 汎用: 面グループを「他グループの中央平面」でクリップ分割する ──
+// Painter's（面の平均depthでソート）の前処理の【核】。
+// 面が他の板を貫いていると、その面は奥行き方向に広い範囲を占めるため
+// 平均depth 1つでは前後を決められず、視点によって順序が反転する。
+// 他の板の中央平面で事前に切っておけば、断片はどの板もまたがないので
+// depthソートが常に正しくなる。
+//
+// 配電盤（pdcBuildPartitionSplit）と建物エディタ（壁の角柱）で共有する。
+// 形式に依存しないよう、入出力は「面の配列」という最小の形にしてある。
+//
+// groups: [{ faces: [{vertices:[{x,y,z}], normal:{nx,ny,nz}}], meta, planes?, key? }]
+//   planes: 切る平面群（未指定なら中央平面1枚。配電盤は未指定＝従来どおり）
+//   key   : 同じ key のグループ同士では切らない。1つのものを複数グループに分けて
+//           渡す場合（建物の壁を高さの帯で分けるなど）に必須。
+//           自分自身の平面で切ると壁の厚みの中央に線が入る
+// 戻り値: [{ vertices, normal, meta, groupIndex }]
+//
+// 安全策（配電盤の実装から引き継ぎ）:
+// ・自分のグループの平面では絶対に切らない（グループ単位で除外）
+// ・中央平面が求まらないグループは「切る側」から外す（面はそのまま出力）
+// ・凸多角形でない面は切らずそのまま出力（Sutherland–Hodgmanは凸前提）
+// ・AABBが交差しないペアは切らない（断片数の抑制）
+// ・断片数が上限に達したら打ち切って元の断片を残す（暴走防止）
+function pdcSplitFaceGroups(groups) {
+  const gs = (groups || []).map(g => {
+    const mid = _pdcSolidMidPlane({ faces: g.faces });
+    // planes を渡せばその平面群で切る（建物は中央平面＋両面）。未指定なら中央平面1枚
+    return {
+      g,
+      planes: (g.planes && g.planes.length) ? g.planes : (mid ? [mid] : []),
+      aabb: _pdcSolidAABB({ faces: g.faces }),
+    };
   });
   const out = [];
   let totalFrags = 0;
-  for (const ps of parts) {
-    for (const f of (ps.solid.faces || [])) {
+  gs.forEach((gi, idx) => {
+    for (const f of (gi.g.faces || [])) {
       if (!f.vertices || f.vertices.length < 3) continue;
-      // 凹多角形は分割せずそのまま出力（Sutherland-Hodgmanは凸多角形前提のため）
       const isConvex = _pdcIsConvexPoly(f.vertices, f.normal);
       let frags = [f.vertices];
       if (isConvex) {
-        for (const other of parts) {
-          if (other === ps || !other.plane) continue;
-          if (!_pdcAABBOverlap(ps.aabb, other.aabb, PDC_SPLIT_EPS_DIST)) continue;
+        for (const other of gs) {
+          // 自分自身では切らない。key が同じ＝「同じものを分割した破片」も切らない。
+          // 建物の壁は高さの帯で複数グループに分かれるが、それらは同じ壁なので
+          // 互いの中央平面で切ると**壁の厚みの中央に線が入る**（2026-08-26 ユーザー指摘）。
+          // 配電盤が solid の同一性で除外しているのと同じ考え方
+          if (other === gi || !other.planes.length) continue;
+          if (gi.g.key != null && other.g.key === gi.g.key) continue;
+          if (!_pdcAABBOverlap(gi.aabb, other.aabb, PDC_SPLIT_EPS_DIST)) continue;
           if (frags.length >= PDC_SPLIT_MAX_FRAGS_PER_FACE || totalFrags >= PDC_SPLIT_MAX_FRAGS_TOTAL) break;
-          const next = [];
-          for (const fr of frags) {
-            const sp = _pdcSplitPolyByPlane(fr, other.plane);
-            if (!sp) { next.push(fr); continue; }
-            if (sp.front) next.push(sp.front);
-            if (sp.back) next.push(sp.back);
-            if (!sp.front && !sp.back) next.push(fr); // 両側縮退時は元断片を残す（消失防止）
+          for (const plane of other.planes) {
+            if (frags.length >= PDC_SPLIT_MAX_FRAGS_PER_FACE) break;
+            const next = [];
+            for (const fr of frags) {
+              const sp = _pdcSplitPolyByPlane(fr, plane);
+              if (!sp) { next.push(fr); continue; }
+              if (sp.front) next.push(sp.front);
+              if (sp.back) next.push(sp.back);
+              if (!sp.front && !sp.back) next.push(fr); // 両側縮退時は元断片を残す（消失防止）
+            }
+            frags = next;
           }
-          frags = next;
         }
       }
       totalFrags += frags.length;
-      for (const fr of frags) {
-        out.push({ color: ps.solid.color, normal: f.normal, vertices: fr, originSolid: ps.solid });
-      }
+      for (const fr of frags) out.push({ vertices: fr, normal: f.normal, meta: gi.g.meta, groupIndex: idx });
     }
-  }
+  });
   return out;
+}
+
+// ── 仕切り面の事前分割（視点非依存・キャッシュ推奨）──
+// solids: panelToSolids(panel) の結果
+// 戻り値: [{ color, normal, vertices, originSolid }] — pdcCollectPartitionFaces の第3引数に渡す
+// 中身は汎用の pdcSplitFaceGroups に委譲している（建物エディタと同じ核を使う）
+function pdcBuildPartitionSplit(solids) {
+  const groups = [];
+  (solids || []).forEach(solid => {
+    if (solid._isOuter) return;
+    groups.push({ faces: solid.faces || [], meta: solid });
+  });
+  return pdcSplitFaceGroups(groups).map(r => ({
+    color: r.meta.color, normal: r.normal, vertices: r.vertices, originSolid: r.meta,
+  }));
 }
 
 // ── 仕切り（非outer solid）の可視面を収集（遠→近ソート済み・3次元図Painter's用）──
@@ -486,7 +673,7 @@ function pdcCollectPartitionFaces(solids, view, split) {
       const pts = sf.vertices.map(v => view.proj(v.x, v.y, v.z));
       const depth = pts.reduce((s, p) => s + p.depth, 0) / pts.length;
       faces.push({ solid: sf.originSolid, f: sf, pts, depth,
-                   rgb: pdcPartitionFaceRGB(sf.color, sf.normal, false) });
+                   rgb: pdcPartitionFaceRGB(sf.color, sf.normal, !!view.hot) });
     }
   } else {
     solids.forEach(solid => {
@@ -496,7 +683,7 @@ function pdcCollectPartitionFaces(solids, view, split) {
         if (view.isBackFacing(f.normal)) return;
         const pts = f.vertices.map(v => view.proj(v.x, v.y, v.z));
         const depth = pts.reduce((s, p) => s + p.depth, 0) / pts.length;
-        faces.push({ solid, f, pts, depth, rgb: pdcPartitionFaceRGB(solid.color, f.normal, false) });
+        faces.push({ solid, f, pts, depth, rgb: pdcPartitionFaceRGB(solid.color, f.normal, !!view.hot) });
       });
     });
   }
@@ -649,6 +836,15 @@ const PDC_ICON_BOX_FACES = [
   { pts:[0,1,2,3], n:{nx:0,ny:0,nz:-1} },  // 下面 (z-)
 ];
 
+// ── アイコンBox 6面の名前（盤ローカル基準・PDC_ICON_BOX_FACES と同じ並び）──
+// ケーブルが入る面を指すのに使う。盤を回しても変わらない「盤の中での面」を表す。
+const PDC_ICON_FACE_NAMES = ['front', 'back', 'left', 'right', 'top', 'bottom'];
+function pdcIconFaceName(normal) {
+  const i = PDC_ICON_BOX_FACES.findIndex(f =>
+    f.n.nx === (normal.nx || 0) && f.n.ny === (normal.ny || 0) && f.n.nz === (normal.nz || 0));
+  return i >= 0 ? PDC_ICON_FACE_NAMES[i] : null;
+}
+
 // ── アイコンBox 1面の塗り色RGB（抽出元: _drawIconBox L109-111 / Zバッファ枝 L1505-1507）──
 // 輝度補正（×1.3や下限0.6）は掛けない。エディタは素の panelFaceBrightness を使う。
 function pdcIconFaceRGB(baseRGB, normal) {
@@ -691,6 +887,11 @@ function pdcCollectIconBoxFaces(view, cx, cy, cz, cellBox, face, baseRGB, zbChec
 // 枠線が出るのはエディタの直描き経路（カメラドラッグ中 / ドラッグゴースト）だけなので、
 // pdcPaintIconBoxFace は strokeStyle が明示指定されたときだけ stroke する。
 const PDC_ICON_BOX_STROKE = { color: 'rgba(255,255,255,0.5)', lineWidth: 0.8 };
+
+// ── アイコンBoxを「選んでいる・入れようとしている」ときの枠（オレンジ）──
+// 配電盤エディタの選択・ホバー枠（_drawIconCellBox）と、配置図3次元図のドロップ受け口が同じ値を使う。
+// 【なぜコアに置くか】同じ意味（このボックスが対象）を2つの窓で別の色にしないため。値を直書きしない。
+const PDC_ICON_BOX_SELECT = { color: '#FBBF24', lineWidth: 2 };
 
 // ── アイコンBox 1面の描画 ──
 // opts: { alpha, strokeStyle, lineWidth }
@@ -782,19 +983,205 @@ function pdcIconLabelText(icon) {
   return ((icon && icon.name) || '?').slice(0, PDC_ICON_LABEL.maxChars);
 }
 
+// ══ ラベルの「出すか」と「大きさ」（唯一の定義）・2026-09-05 ══
+// もとは App.jsx に置いていたが、呼び出し側が3次元図と建物エディタの2つになった時点で
+// CLAUDE.md「見た目を決める定数・ロジックは panelDrawCore.js だけで管理」に従いここへ移した。
+// 【なぜ「出すか」と「大きさ」を分けるか】大きさ1本で決めて2回続けて外した:
+//   ・上下限を viewBox 単位にする → 通常倍率で常に下限に張り付き、窓が小さいと読めない
+//   ・上下限を画面px にする → 縮小しても同じ大きさで出るのでラベル同士が重なりまくる
+//   大きさをどう調整しても「大きい=読めるが重なる／小さい=重ならないが読めない」にしかならない。
+//   **大きさでは重なりを解決できない**ので、出すかどうか と 大きさ を別の判断にする。
+// spanPx  = そのものの投影外接枠の「幅と高さの大きい方」[描画座標単位]。
+//   直方体なので、どの向きから見てもこれは潰れない（1辺だと真正面で0になる）。
+// scale = CSS px / 描画座標単位（3次元図は cabSvgScale、建物エディタは canvas 直描きなので 1）
+// opts.policy = どの図の方針で決めるか。**図ごとに違ってよいのは方針だけで、式は1つ**。
+//   個別の数値（基準・下限・出すしきい）を呼び出し側にばらまくと、
+//   数値の意味が散って「なぜその値か」が誰にも分からなくなる（Codex監査の指摘）。
+const PDC_LABEL = {
+  SIZE_CSS: 13,           // 文字の大きさ[画面px]。**倍率によらず常にこれ**（2026-09-16 ユーザー「小さくて何と書いてあるか分からない」で 11→13）
+  SHOW_FROM_PX: 16,       // 本体がこれ未満に見えるときは出さない（隠す方針のときだけ）
+  GAP_CSS: 4,             // 本体とのすき間[画面px]（選択しても変えない＝ラベルが動かない）
+  HALO_CSS: 2,            // 縁取りの太さ[画面px]
+  // 【遠景で小さくして消す・2026-09-13 ユーザー指示】「ある程度離れたら文字も小さくなり、最終的に非表示でよい」。
+  // 当初は3次元図だけ本体の見かけの大きさで決めていたが、2026-09-15 に下の画面px/m 規則へ一本化して廃止
+  HIDE_BELOW_CSS: 9,      // 縮んだ文字がこれ[画面px]未満なら出さない（2026-09-16 7→9。7px は読めない）
+  // 【出すかは「その図の画面px/m」で決める・2026-09-15 ユーザー裁定】「機器ラベルはどれも同じ条件」
+  // 「3次元図だけでなく他の図面すべてで近づいたらラベル表示」。本体の見かけの大きさで決めていたので、
+  // 大きい盤が小さい機器より先に出ていた。画面px/m は物に依らないので、同じ図の中では全部同時に出る。
+  // 値は床の機器の実測境界に合わせた（3次元図で 16.5→14.6 画面px/m の間で消えていた）:
+  //   文字 = SIZE_CSS × ppm / PPM_FULL、HIDE_BELOW_CSS 未満で消える ＝ 24×7/11 ≈ 15.3 画面px/m 未満で消える
+  // 【2026-09-16】文字を大きくしても「出る境界」は据え置く（15.27 画面px/m）。PPM_FULL は境界と大きさから導く
+  SHOW_FROM_PPM: 24 * 7 / 11,
+  get PPM_FULL() { return this.SHOW_FROM_PPM * this.SIZE_CSS / this.HIDE_BELOW_CSS; },
+  // 📷（選択中のラベルの右）。位置の式は pdcLabelCamBadge が唯一
+  CAM_GAP_CSS: 4,         // 文字の右端（白フチの外）から📷の丸までのすき間[画面px]
+  CAM_R_MIN_CSS: 10,      // 📷の丸の半径の下限[画面px]
+  // 【見た目は全ウィンドウ共通・2026-09-06 ユーザー指示】黒文字＋白フチ。
+  // 盤も機器も、どの図でも、置いた元（配電盤エディタ／建物エディタ）にもよらない
+  TEXT: '#0F172A', HALO: '#FFF', WEIGHT: 700,
+};
+// ══ 大きさの規則は1つだけ・2026-09-07（ユーザー指示「初めから文字ぴったりにしろ」）══
+// 【やめたこと1】図ごとに方針（比例／画面固定／基準値違い）を分けていた。
+//   同じ図面を並べたときに文字の大きさが揃わず、どれが同じ種類のものか読み取れない。
+// 【やめたこと2・今回】「本体の見かけの大きさに比例」させていた
+//   （本体が画面100pxを超えると文字が伸び始め、200pxで22pxに達して頭打ち）。
+//   拡大するほど文字が育ち、小さな窓では図が文字で埋まった
+//   （2026-09-07 ユーザー「拡大すると大きくなる。縮小すると文字ぴったりになる。
+//    なら初めから文字ぴったりにしろ」／「3次元図はいい感じ＝11px相当」）。
+// 【なぜ画面固定に戻して大丈夫か】以前「画面px固定にしたら縮小でラベルが重なる」と
+//   書いたが、それは **「出すか」と「大きさ」が同じ式だった頃**の話。
+//   今は show を別の判断（spanCss / alwaysShow / pinned）に分けてあるので、
+//   重なりは大きさではなくそちらで扱う。しかも縮小側は以前から下限11pxに
+//   張り付いていて、ユーザーはその状態を「ぴったり」と評価している。
+//   つまり今回の変更で見え方が変わるのは**拡大側だけ**で、重なりのリスクは増えない。
+// 【残す差は "隠すか隠さないか" だけ】
+//   ・建物エディタと盤のラベルは**隠さない**（14.61 ユーザー決定）→ opts.alwaysShow
+//   ・その他の図の機器は、本体が小さく見えているときは出さない（図が文字で埋まる）
+// pinned = 選択中・カーソルを当てている・掴んでいる。そのときは必ず出す（同時に1つなので重ならない）
+// spanPx は「出すかどうか」の判断だけに使い、**大きさには使わない**
+function pdcLabelMetrics(spanPx, scale, pinned, opts) {
+  const o = opts || {};
+  const csc = (Number.isFinite(scale) && scale > 0.001) ? scale : 1;
+  const span = Math.max(2, Number.isFinite(spanPx) ? spanPx : 2);
+  const spanCss = span * csc;                   // 画面上で見えている大きさ
+  // 画面上つねに SIZE_CSS。描画座標へ直すため倍率で割る（倍率に依存しない＝拡大で育たない）
+  let fsCss = PDC_LABEL.SIZE_CSS;
+  let show = !!o.alwaysShow || !!pinned || spanCss >= PDC_LABEL.SHOW_FROM_PX;
+  if (Number.isFinite(o.pxPerMeter)) {
+    // 全図・全種類で共通の規則（alwaysShow より優先）。spanPx は判定に使わない
+    fsCss = Math.min(PDC_LABEL.SIZE_CSS, PDC_LABEL.SIZE_CSS * Math.max(0, o.pxPerMeter) / PDC_LABEL.PPM_FULL);
+    show = fsCss >= PDC_LABEL.HIDE_BELOW_CSS;
+    // ホバー・ドラッグ中は必ず出すが、**見えている文字の大きさは変えない**（変えると当たり枠が動き、
+    // カーソルが外れてホバーが点滅する・Codex指摘）。消えていた文字だけ通常の大きさで出す
+    // （2026-09-16 旧: 最小の大きさ。ユーザー「小さくて何と書いてあるか分からない」）
+    if (pinned && !show) { fsCss = PDC_LABEL.SIZE_CSS; show = true; }
+  }
+  const fs = fsCss / csc;
+  return {
+    show, fs, csc,
+    // 縁取りも「画面px」で持つ（描画座標で固定すると、
+    // 倍率の大きいビューでは文字より太い縁になる）
+    strokeW: PDC_LABEL.HALO_CSS / csc,
+    // 【すき間も画面px】描画座標で固定すると、倍率の大きいビューでラベルが
+    // 本体から遠く離れ、どれを指しているのか分からなくなる（2026-09-06 ユーザー指摘）
+    // 【選択で値を変えない】選択したときだけ広げていたので、
+    // **選ぶたびにラベルがぴょこっと動いた**（2026-09-06 ユーザー指摘）。
+    // 位置は「何を選んでいるか」に依らせない
+    gap: PDC_LABEL.GAP_CSS / csc,
+  };
+}
+// ══ 押してから「動かした」とみなす距離（唯一の判定・全図共通）・2026-09-13 ══
+// この距離未満はクリック候補のまま。盤移動・機器移動・各ラベル移動（2D/3D・建物エディタ）で共通。
+// 【2026-09-17 共通コアへ移した】App.jsx の中だけにあったため建物エディタの3D（BuildingPreview3D）から使えず、
+//   建物エディタのラベルだけ「1pxで即移動・押して離しても機器を選ばない」になっていた。
+//   遠景では機器本体がホバーで出たラベルに覆われるので、機器を一切選べなかった（ユーザー報告）。
+const PDC_CLICK_SLOP_PX = 5;
+function pdcBeyondClickSlop(dx, dy) {
+  return dx * dx + dy * dy >= PDC_CLICK_SLOP_PX * PDC_CLICK_SLOP_PX;
+}
+// ══ 遠景でも必ず出すか（唯一の判定・全図共通）・2026-09-16 ユーザー裁定 ══
+// 「カーソルを当てている間」「掴んで動かしている間」「選択している間」。
+// 【2026-09-16 選択を戻した理由】ユーザー報告: ラベルを機器から離して置くと、ラベルへカーソルを近づける途中で
+//   ラベルが消え、出し続けるには機器の上からカーソルを動かせない、というジレンマになる。
+//   （2026-09-15 の「選択中でも遠景で消す」は撤回。発端だった「ドロップした盤が選択状態で消えない」は許容する）
+// 入力の取り方（何がホバー／ドラッグ／選択か）だけ呼び出し側。段階フラグ: window.__LABEL_PIN_SELECTED = false で旧規則＝陽性対照
+function pdcLabelPinned(o) {
+  const x = o || {};
+  const noPinSelected = typeof window !== 'undefined' && window.__LABEL_PIN_SELECTED === false;
+  return !!(x.hover || x.dragging || (!noPinSelected && x.selected));
+}
+// ══ 📷を出す条件（唯一の判定・全図共通）・2026-09-16 ユーザー指示 ══
+// 「盤・機器を選択したらカメラマーク」。旧: App はラベルにカーソルを当てたとき／建物エディタは選択時に↻の隣、とばらばらだった。
+// 段階フラグ window.__CAM_BADGE_ON_SELECT = false で旧条件（hover）＝陽性対照
+function pdcCamBadgeOn(o) {
+  const x = o || {};
+  const old = typeof window !== 'undefined' && window.__CAM_BADGE_ON_SELECT === false;
+  return !!(old ? x.hover : x.selected);
+}
+// ══ 📷の位置（唯一の式・全図共通）・2026-09-16 ユーザー指示 ══
+// 「○がラベル名称と被る。固定pxでなく文字の右端からXpx」。rightX は文字の実測右端（白フチを含まない）、
+// midY は丸の中心の高さ。scale は画面px/描画単位。返す値は描画単位。
+// SVG（App の _renderLabelLayer）と canvas（建物エディタ3D）の両方が必ずここを通す（別式を書かない）
+function pdcLabelCamBadge(rightX, midY, lm, scale) {
+  const s = (Number.isFinite(scale) && scale > 0.001) ? scale : 1;
+  const r = Math.max(lm.fs * 0.55, PDC_LABEL.CAM_R_MIN_CSS / s);
+  return { cx: rightX + lm.strokeW + PDC_LABEL.CAM_GAP_CSS / s + r, cy: midY, r };
+}
+
+// 概算テキスト幅（getBBox はレンダー中に使えないため近似）:
+// 全角(コードポイント>0xFF)=1.05em / 半角=0.62em（bold 700 の平均字幅）
+// 【全角の係数は実測・2026-09-06】ブラウザで「床の機器」(4文字・11px)の
+// getBBox を測ると 46.0px ＝ 1.045em/字。1.0em にしていたので見積りが
+// 常に少し狭く、当たり判定が文字より内側に入っていた
+function pdcLabelWidth(text, fs) {
+  return Array.from(String(text || '')).reduce(
+    (w, ch) => w + (ch.codePointAt(0) > 0xFF ? 1.05 : 0.62), 0) * fs;
+}
+
 // pt: view.proj で得たアイコン中心の2D点。opts: { alpha, isSel }
+// view.labelSpanPx を渡した呼び出しだけ「見かけの大きさに追従する」新しい規則を使う。
+// 渡さない呼び出し（配電盤エディタ）は従来どおり pdcIconLabelFontPx（固定8px系）のまま。
 function pdcPaintIconLabel(ctx, pt, text, view, opts) {
   if (!text) return;
-  const fontEff = pdcIconLabelFontPx(view);
+  const _sp = view && view.labelSpanPx;
+  let fontEff, lm = null;
+  if (Number.isFinite(_sp)) {
+    lm = pdcLabelMetrics(_sp, view.labelScale, view.labelPinned,
+                         { alwaysShow: view.labelAlwaysShow, pxPerMeter: view.labelPxPerMeter });
+    if (!lm.show) return;
+    fontEff = lm.fs;
+  } else {
+    fontEff = pdcIconLabelFontPx(view);
+  }
   if (fontEff < PDC_ICON_LABEL_MIN_PX) return; // 潰れ文字は描かない
   const o = opts || {};
   const _prevAlpha = ctx.globalAlpha; // 呼び出し元のalphaを壊さない
   if (o.alpha != null) ctx.globalAlpha = o.alpha;
-  ctx.fillStyle = o.isSel ? PDC_ICON_LABEL.selFill : PDC_ICON_LABEL.fill;
-  ctx.font = `${PDC_ICON_LABEL.weight} ${fontEff * (view.lwUnit || 1)}px sans-serif`;
+  const _u = (view.lwUnit || 1);
+  ctx.font = `${lm ? PDC_LABEL.WEIGHT : PDC_ICON_LABEL.weight} ${fontEff * _u}px sans-serif`;
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (lm) {
+    // 【全ウィンドウ共通の見た目・2026-09-06】黒文字＋白フチ。
+    // 背景（床・壁・盤）が明るくも暗くもなるので、フチが無いとどちらかで読めない
+    ctx.lineWidth = lm.strokeW * _u;
+    ctx.lineJoin = 'round'; ctx.miterLimit = 2;
+    ctx.strokeStyle = PDC_LABEL.HALO;
+    ctx.strokeText(text, pt.x, pt.y);
+    ctx.fillStyle = o.isSel ? PDC_ICON_LABEL.selFill : PDC_LABEL.TEXT;
+  } else {
+    ctx.fillStyle = o.isSel ? PDC_ICON_LABEL.selFill : PDC_ICON_LABEL.fill;
+  }
   ctx.fillText(text, pt.x, pt.y);
   ctx.globalAlpha = _prevAlpha;
+  // 【描いた大きさは「見積り」ではなく「実測」で返す・2026-09-08】
+  // ここは以前 pdcLabelWidth（1文字あたり何em かの概算）を返していた。
+  // canvas には measureText という「いま設定した書体で実際に何px描かれるか」を
+  // 返す関数があり、SVG の getBBox と同じ実測ができる。概算を返すと、
+  // 受け取った側の当たり判定が文字とずれる（2026-09-08 ユーザー報告
+  // 「固定pxにしていないか？その時の文字の表示サイズに依存するんだぞ」）。
+  // actualBoundingBox* は「実際にインクが乗る範囲」。textAlign=center /
+  // textBaseline=middle なので、pt を中心に左右・上下へこの値だけ広がる。
+  // 単位は ctx のユーザー座標（pt と同じ）なので、そのまま当たり判定に使える。
+  let _l, _r, _a, _d;
+  try {
+    const m = ctx.measureText(text);
+    _l = m.actualBoundingBoxLeft; _r = m.actualBoundingBoxRight;
+    _a = m.actualBoundingBoxAscent; _d = m.actualBoundingBoxDescent;
+  } catch (e) { /* measureText の無い環境では下の概算へ落ちる */ }
+  const _fpx = fontEff * _u;
+  if (!(Number.isFinite(_l) && Number.isFinite(_r) && _l + _r > 0)) {
+    const _hw = pdcLabelWidth(text, _fpx) / 2; _l = _hw; _r = _hw;
+  }
+  if (!(Number.isFinite(_a) && Number.isFinite(_d) && _a + _d > 0)) {
+    _a = _fpx * 0.5; _d = _fpx * 0.5;
+  }
+  // 【描いた大きさを返す】当たり判定を呼び出し側で作るときに使う。
+  // 呼び出し側が大きさを勝手に見積もると、描画と掴める範囲がずれる
+  // （＝見えているのに掴めない／見えていないのに掴める）。描いた本人が返すのが唯一の正
+  return {
+    fontPx: fontEff, width: _l + _r,
+    box: { x0: pt.x - _l, x1: pt.x + _r, y0: pt.y - _a, y1: pt.y + _d },
+  };
 }
 
 // ================================================================
@@ -1211,6 +1598,10 @@ function pdcBuildCableVisMask(entries, occZb, mask, W, H, widthScale, nearSign) 
 // ピクセル中心を拾えず全消えするため、配線マスクと同様に広げる
 const PDC_PARTITION_EDGE_MASK_MARGIN_PX = 2;
 
+// 低解像度マスクでも線が虫食いにならないための最小帯幅（マスク座標px）。
+// 低解像度化してもこれ以下には細らせない。ws=1（フル解像度）時の帯幅と同値。
+const PDC_EDGE_MASK_MIN_PX = 2.5;
+
 // 深度バイアス（mm）: 「自面・T字接合（共面 ≈0mm）＋自板シルエット（板厚 数mm〜十数mm）」
 // は消えず、「明確に手前にある別仕切り（区画寸法 = 通常50mm以上の差）」だけが消える値。
 // 呼び出し側で × view.depthPerMm して depth 単位に変換して渡すこと。
@@ -1227,7 +1618,14 @@ const PDC_PARTITION_EDGE_DEPTH_BIAS_MM = 15;
 function pdcBuildPartitionEdgeVisMask(segs, occZb, scratchZb, mask, W, H, widthScale, nearSign, depthBias) {
   const ns = nearSign || 1;
   const ws = widthScale != null ? widthScale : 1;
-  const lineW = (PDC_PARTITION_EDGE.lineWidth + PDC_PARTITION_EDGE_MASK_MARGIN_PX) * ws;
+  // マスク帯の幅は「マスク座標系で最低 PDC_EDGE_MASK_MIN_PX」を保証する。
+  // ws（=低解像度の縮小率）をそのまま掛けると、ws=0.25 のとき帯が 0.6px となり
+  // ラスタライザがピクセル中心を拾えず、マスクが虫食いになる。
+  // その結果フル解像度で引いた線が細切れに削られ、「ボケる・ジラジラする」ように見える。
+  // 扉の線マスク(_rasterLineMask)が無条件に±1px太らせているのと同じ役割を、ここでは下限で担保する。
+  const lineW = Math.max(
+    (PDC_PARTITION_EDGE.lineWidth + PDC_PARTITION_EDGE_MASK_MARGIN_PX) * ws,
+    PDC_EDGE_MASK_MIN_PX);
   const margin = depthBias != null ? depthBias : 1;
   for (const seg of (segs || [])) {
     const dx = seg.x1 - seg.x0, dy = seg.y1 - seg.y0;
@@ -1276,4 +1674,108 @@ function pdcPaintDoorOpenings(ctx, panel, view) {
     ctx.stroke();
   }
   ctx.restore();
+}
+
+
+// ================================================================
+// 正射影（平面図・立面図・側面図・矢視図）用の3D要素抽出
+// ================================================================
+// 配置図の2Dビューに配電盤を描くための共通コア。
+// 3次元図と同じ panelToSolids / pdcDoorCorners / pdcIconHalfExtents を使うため、
+// 仕切りの削り出し・扉の開閉角・アイコン寸法がすべて同じ根拠で反映される。
+//
+// ここでは「ビューごとの2D化」は行わず、盤ローカルmmの3D点のまま返す。
+// 据付回転を掛けてから軸を落とさないと、立面図・側面図で回転が反映されないため。
+// （回転→投影の順序が逆になると、回した盤の見かけ幅が変わらないという不具合になる）
+//
+// 戻り値: [{ kind, pts3:[[x,y,z],...], color, isOpen, name }]
+//   kind 'box'       : 外形の8隅（呼び出し側で投影後シルエットを作る）
+//   kind 'partition' : 仕切り面（1面ぶんの多角形）
+//   kind 'door'      : 扉の4隅
+//   kind 'icon'      : 機器Boxの8隅
+function pdcPanelSolidElems(panel) {
+  if (!panel) return [];
+  const W = panel.widthMm || 0, H = panel.heightMm || 0, D = panel.depthMm || 0;
+  const out = [];
+
+  out.push({
+    kind: 'box',
+    pts3: [
+      [0,0,0],[W,0,0],[W,D,0],[0,D,0],
+      [0,0,H],[W,0,H],[W,D,H],[0,D,H],
+    ],
+    color: pdcPanelColor(panel),
+  });
+
+  let solids = [];
+  try { solids = (typeof panelToSolids === 'function') ? (panelToSolids(panel) || []) : []; }
+  catch (_) { solids = []; }
+  for (const s of solids) {
+    if (s._isOuter) continue;
+    for (const f of (s.faces || [])) {
+      if (!f.vertices || f.vertices.length < 3) continue;
+      out.push({
+        kind: 'partition',
+        pts3: f.vertices.map(v => [v.x, v.y, v.z]),
+        color: s.color || '#94A3B8',
+        name: s.name,
+      });
+    }
+  }
+
+  const _doors = panel.doors || [];
+  for (let _di = 0; _di < _doors.length; _di++) {
+    const d = _doors[_di];
+    let c3 = null;
+    try { c3 = pdcDoorCorners(d, panel); } catch (_) { c3 = null; }
+    if (!c3 || c3.length < 3) continue;
+    out.push({
+      kind: 'door',
+      // どの扉かを識別する番号。これが無いと2Dビュー側で扉をクリックしても
+      // 「どの扉を開閉するのか」を決められない（3次元図だけが操作できる状態になる）。
+      doorIdx: _di,
+      doorId: d.id,
+      // pdcDoorCorners は [x,y,z] の配列を返す（pdcFaceUV / rotFree とも配列）。
+      // ここを .x/.y/.z で読むと undefined → NaN になり、平面図の扉が NaN 座標で描かれる。
+      pts3: c3.map(p => [p[0], p[1], p[2]]),
+      color: PDC_DOOR_WIRE.css,
+      isOpen: !!d.isOpen,
+      name: d.name,
+    });
+  }
+
+  // 扉に載せたアイコン(doorId あり)は座標を持たないためここでは扱わない
+  for (const ic of (panel.placedIcons || [])) {
+    if (ic.doorId || ic.wx == null) continue;
+    const e = pdcIconHalfExtents(ic.cellBox, ic.face);
+    const hx = e.hx, hy = e.hy, hz = e.hz;
+    const rgb = pdcIconBaseRGB(ic.color);
+    out.push({
+      kind: 'icon',
+      pts3: [
+        [ic.wx-hx, ic.wy-hy, ic.wz-hz], [ic.wx+hx, ic.wy-hy, ic.wz-hz],
+        [ic.wx+hx, ic.wy+hy, ic.wz-hz], [ic.wx-hx, ic.wy+hy, ic.wz-hz],
+        [ic.wx-hx, ic.wy-hy, ic.wz+hz], [ic.wx+hx, ic.wy-hy, ic.wz+hz],
+        [ic.wx+hx, ic.wy+hy, ic.wz+hz], [ic.wx-hx, ic.wy+hy, ic.wz+hz],
+      ],
+      color: `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`,
+      name: ic.name || '',
+    });
+  }
+
+  return out;
+}
+
+// 2D点群の凸包（投影後のシルエットを得る。Andrew's monotone chain）
+function pdcConvexHull2D(pts) {
+  const p = pts.filter(q => isFinite(q[0]) && isFinite(q[1]))
+    .slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (p.length < 3) return p;
+  const cross = (o, a, b) => (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0]);
+  const lo = [];
+  for (const q of p) { while (lo.length >= 2 && cross(lo[lo.length-2], lo[lo.length-1], q) <= 0) lo.pop(); lo.push(q); }
+  const up = [];
+  for (let i = p.length - 1; i >= 0; i--) { const q = p[i]; while (up.length >= 2 && cross(up[up.length-2], up[up.length-1], q) <= 0) up.pop(); up.push(q); }
+  lo.pop(); up.pop();
+  return lo.concat(up);
 }

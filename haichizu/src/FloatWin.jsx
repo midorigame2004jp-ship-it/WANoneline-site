@@ -6,6 +6,48 @@ function Sym({ shape, size = 20, color, hl = false }) {
   return <svg width={s - 2} height={s}><rect x={1} y={1} width={s - 4} height={s - 2} fill={fc} stroke={hl ? "#3B82F6" : fc} strokeWidth={1.5} rx={2} /><text x={(s - 2) / 2} y={s / 2 + 3.5} textAnchor="middle" fontSize={s * 0.36} fontWeight={700} fill="#FFF">52</text></svg>;
 }
 
+
+// ============================================================
+// キーボード所有権の裁定（全ウィンドウ共通・spec 12.4）
+// ------------------------------------------------------------
+// Delete / Ctrl+Z のような「選択中のものに効く」キーは、window に直接
+// addEventListener すると**どの窓を触っていても発火する**。
+// 実際に「建物エディタで壁を選ばずDeleteを押したら建屋ごと消えた」不具合が出た。
+//
+// 裁定の基準は winState の z（bringFront が更新している最前面）1本に絞る。
+// 新しい窓を足しても自動で正しく振る舞うようにするため、
+// ここ（winState の持ち主のそば）に置き、各ウィンドウが個別実装しない。
+// ============================================================
+// 別ウィンドウの入力欄に残ったフォーカスを外す。
+// Cesium のキャンバスは mousedown で preventDefault するため、クリックしても
+// ブラウザのフォーカスが移らない。その結果「建物エディタの入力欄にフォーカスが
+// 残ったまま地図をクリック」となり、入力欄ガード(bcCanHandleDeleteKey)が
+// Delete を弾いて建屋を削除できなかった（2026-08-19 実測で確定）。
+// 「別の窓をクリックしたらフォーカスは外れる」という当たり前の挙動を補う。
+function fwBlurForeignFocus(winId) {
+  const ae = document.activeElement;
+  if (!ae || ae === document.body) return;
+  const owner = ae.closest && ae.closest('[data-floatwinid]');
+  // 同じ窓の中なら編集継続とみなして触らない
+  if (owner && owner.dataset.floatwinid === winId) return;
+  if (typeof ae.blur === 'function') ae.blur();
+}
+function fwOwnsKeyboard(winId, winState) {
+  if (!winState) return true;                 // ウィンドウ管理外の文脈は従来通り通す
+  const ids = Array.isArray(winId) ? winId : [winId];
+  // solo モード（?solo=<id>）はその窓しか存在しないので常に所有者
+  if (window.SOLO_WIN) return ids.includes(window.SOLO_WIN);
+  let topId = null, topZ = -Infinity;
+  for (const id in winState) {
+    const w = winState[id];
+    if (!w || w.hidden || w.minimized) continue;
+    const z = w.z || 0;
+    if (z > topZ) { topZ = z; topId = id; }
+  }
+  if (topId == null) return true;             // 全部閉じている＝競合しない
+  return ids.includes(topId);
+}
+
 // ============================================================
 // フローティングウィンドウ
 // ============================================================
@@ -37,9 +79,12 @@ function FloatWin({ id, title, icon, winState, setWinState, bringFront, children
     return { x: e.clientX, y: e.clientY };
   };
 
+  // ウィンドウを最前面に出す唯一の入口。フォーカス解除と z 更新を必ずセットで行う
+  const raise = () => { fwBlurForeignFocus(id); bringFront(id); };
+
   const lastClickRef = useRef(0);
   const startMove = (e) => {
-    e.preventDefault(); e.stopPropagation(); bringFront(id);
+    e.preventDefault(); e.stopPropagation(); raise();
     // ダブルクリック検出（500ms以内の2回mousedown）
     const now = Date.now();
     const gap = now - lastClickRef.current;
@@ -70,7 +115,7 @@ function FloatWin({ id, title, icon, winState, setWinState, bringFront, children
 
   // 汎用リサイズ: edges = { l, r, t, b } どの辺を動かすか
   const startResize = (edges) => (e) => {
-    e.preventDefault(); e.stopPropagation(); bringFront(id);
+    e.preventDefault(); e.stopPropagation(); raise();
     const start = getXY(e);
     const orig = { x: w.x, y: w.y, w: w.w, h: w.h };
     const _ov = document.createElement('div');
@@ -102,7 +147,7 @@ function FloatWin({ id, title, icon, winState, setWinState, bringFront, children
   });
 
   return (
-    <div data-floatwinid={id} onMouseDown={() => bringFront(id)} onTouchStart={() => bringFront(id)}
+    <div data-floatwinid={id} onMouseDown={raise} onTouchStart={raise}
       style={{
         position: "absolute", left: w.x, top: w.y,
         width: minimized ? 130 : w.w,
@@ -118,7 +163,7 @@ function FloatWin({ id, title, icon, winState, setWinState, bringFront, children
       }}>
       {/* ヘッダー */}
       <div onMouseDown={startMove} onTouchStart={startMove}
-        onClick={minimized ? () => { setWinState(pr => ({ ...pr, [id]: { ...pr[id], minimized: false } })); bringFront(id); } : undefined}
+        onClick={minimized ? () => { setWinState(pr => ({ ...pr, [id]: { ...pr[id], minimized: false } })); raise(); } : undefined}
         style={{ padding: "5px 8px", background: "#1E293B", color: "#F8FAFC", display: "flex", alignItems: "center", gap: 6, cursor: "default", flexShrink: 0, userSelect: "none", touchAction: "none", borderRadius: minimized ? "5px" : "5px 5px 0 0" }}>
         <span style={{ fontSize: 10, fontWeight: 700, whiteSpace: "nowrap" }}>{icon ? `${icon} ` : ""}{title}</span>
         <div style={{ flex: 1 }} />

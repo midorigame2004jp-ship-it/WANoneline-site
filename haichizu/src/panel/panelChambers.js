@@ -177,25 +177,24 @@ function deriveChambers(panel) {
 
 // 扉がどの Chamber に面しているかを返す（なければ null）
 // 扉UV中心を3D点に変換し、その点を含む Chamber を探す
-// UV座標系は chamberFaceRects と同一（u/v の向きが face ごとに異なる）
+//
+// 【重要】このコードベースには面ローカルUVの v の向きが逆の規約が2系統ある:
+//   ・画面ヒット系（v=上→下）: _hitTestFace / hitChamber / hitAllChambers / chamberFaceRects
+//   ・扉ジオメトリ系（v=z そのもの・下→上）: deriveFaceDoorCandidates / pdcFaceUV / pdcDoorCorners
+// door.uMm/vMm は扉ジオメトリ系なので pdcFaceUV が唯一の正。
+// 旧実装は面別の自前switchで画面ヒット系（z = H - vc 等）の式を当てており、
+// bottom以外の全面で軸が反転していた（前面/右面=上下反転, 後面=左右+上下, 左面=奥行き+上下, 上面=奥行き）。
 function doorToChamberId(door, chambers, panel) {
   if (!door || !chambers || chambers.length === 0) return null;
   const { face, uMm, vMm, widthMm, heightMm } = door;
-  const W = panel.widthMm, H = panel.heightMm, D = panel.depthMm;
   const eps = 0.5;
   const uc = uMm + widthMm / 2;
   const vc = vMm + heightMm / 2;
-  // face ごとに UV → 3D内部点（壁面から eps だけ内側）
-  let x, y, z;
-  switch (face) {
-    case 'front':  x = uc;     y = eps;     z = H - vc; break;
-    case 'back':   x = W - uc; y = D - eps; z = H - vc; break;
-    case 'left':   x = eps;    y = D - uc;  z = H - vc; break;
-    case 'right':  x = W - eps; y = uc;     z = H - vc; break;
-    case 'top':    x = uc;     y = D - vc;  z = H - eps; break;
-    case 'bottom': x = uc;     y = vc;      z = eps;    break;
-    default: return null;
-  }
+  const p = pdcFaceUV(face, uc, vc, panel);
+  const n = PDC_DOOR_MOUNT_NORMALS[face];   // 外向き法線
+  if (!p || !n) return null;
+  // 得られるのは壁面上の点。外向きの逆＝内向きに eps だけ入れて「扉が面する内部セル」を指す
+  const x = p[0] - n.nx * eps, y = p[1] - n.ny * eps, z = p[2] - n.nz * eps;
   for (const ch of chambers) {
     for (const cell of ch.cells) {
       if (x >= cell.xMin - eps && x <= cell.xMax + eps &&

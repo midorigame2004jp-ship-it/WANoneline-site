@@ -1,7 +1,299 @@
-﻿// ===== CesiumMapコンポーネント =====
-function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ, onDropNode, onAddWp, onMoveWp, onDropWp, onRemoveWp, onMoveNode, onStartDragNode, onEndDragNode, hoverId, hoverSeg, setHoverId, setHoverSeg, setWireTip, routeFilter, routeSegs, setRouteFilter, focusNodeRef, focusPosRef, onFocusNode, dragUpdateRef, dragStateRef, cesiumRenderRef, cesiumQueryRef, movedNodeRef, blds, solids, setSolids, setSolidsDirect, hSections = [], onAddBuilding, onResizeBuilding, onMoveBldFace, onDeleteBuilding, onRotateBuilding, onMoveBuilding, onAddBlock, onSetBlockPoints, onDeleteBlock, onRevertExtrude, onMergeBlockIntoParent, onRenameBuilding = null, sharedBaseElev, onBaseElevChange, onBldUndo, onBldRedo, onBldPushUndo, onRemoveNodePos, setCurrentSSE = () => {}, plantNorthAngle = 0, setPlantNorthAngle, qualitySettings = null, sectionOverlays = [], onFocusBld = null, onDeleteBld = null }) {
+﻿// ══ 📷フォーカスの寄り方（唯一の実装・2026-08-30）══
+// 【直した不具合】以前は BoundingSphere(cart, 0) ＋ range=300m 固定で、
+//   **対象の大きさを一切見ていなかった**。幅0.6mの配電盤でも300m引きで止まる
+//   （ユーザー報告 2026-08-30）。他のビュー（平面図・断面図・3次元図）は
+//   focusGridPos から spanX/Y/Z を受け取って倍率を決めているのに、
+//   Cesium にだけ大きさが渡っていなかったのが発生源。
+// 【考え方】半径Rの球が画面の短い側の CM_FOCUS_FRACTION を占める距離を求める:
+//   d = R / (fraction * sin(fov/2))
+//   fov は縦横のうち**小さい方**を使う（窓が横長でも縦長でもはみ出さない）。
+// 【半径の単位】必ずメートル。呼び出し側がグリッドpxを持っている場合は
+//   METERS_PER_PX を掛けてから渡すこと（取り違えると桁で外れる）。
+// 【コンポーネントの外に置く理由】純粋関数なので毎レンダー作り直す必要が無く、
+//   node の検査（checks/focus_range.cjs）から直接呼べるようにするため。
+const CM_FOCUS_FRACTION = 0.45;   // 対象が画面の短辺に占める割合
+const CM_FOCUS_MIN_M = 3;         // 寄りすぎ防止（地面や対象へ突っ込まない）
+const CM_FOCUS_MAX_M = 4000;      // 引きすぎ防止
+const CM_FOCUS_LEGACY_M = 300;    // 半径が渡らない呼び出しは従来どおり（挙動を変えない）
+// frustum は {fov, fovy} を持つオブジェクト（OrthographicFrustum には無い＝種別ガード）
+function cmFocusRange(frustum, radiusM) {
+  if (!Number.isFinite(radiusM) || radiusM <= 0) return CM_FOCUS_LEGACY_M;
+  const cand = [frustum && frustum.fov, frustum && frustum.fovy]
+    .filter(a => Number.isFinite(a) && a > 0.01);
+  const fov = cand.length ? Math.min(...cand) : Math.PI / 3;   // 取れなければ60°相当
+  const s = Math.sin(fov / 2) || 0.5;
+  return Math.min(CM_FOCUS_MAX_M, Math.max(CM_FOCUS_MIN_M, radiusM / (CM_FOCUS_FRACTION * s)));
+}
+// 位置＋半径[m]で寄る唯一の入口。半径を渡さなければ従来の300m固定のまま
+function cmFlyToFocus(v, center, radiusM) {
+  const r = (Number.isFinite(radiusM) && radiusM > 0) ? radiusM : 0;
+  v.camera.flyToBoundingSphere(
+    new Cesium.BoundingSphere(center, r),
+    { offset: new Cesium.HeadingPitchRange(
+        v.camera.heading, v.camera.pitch, cmFocusRange(v.camera && v.camera.frustum, radiusM)),
+      duration: 1.0 }
+  );
+}
+
+// ══ 診断フック __panelDiag()（2026-09-01）══
+// Cesium はこちら側でヘッドレス検証ができない（Ionトークンが要る）ので、
+// 実機の状態を1行で取れるようにしておく。コンソールで `__panelDiag()` を呼ぶ。
+// 【モジュール先頭に置く理由】盤描画エフェクトの中で定義していたら、
+//   Cesiumビューア未作成のときエフェクトが早期returnして **__panelDiag 自体が undefined** になり、
+//   「診断が動かない」という余計な往復を生んだ。ここなら常に存在し、
+//   ビューアが無ければ「無い」と答える。
+// 【本番の挙動は変えない】参照を読むだけ。
+if (typeof window !== 'undefined') {
+  window.__panelDiag = () => {
+    const vs = (window.__cesiumViewers || []).filter(vv => vv && !vv.isDestroyed());
+    if (!vs.length) return 'Cesiumビューアがまだ作られていない（CesiumJS 3D/2D の「表示する」を押してから再実行）';
+    return vs.map((vv, i) => {
+      const cv = vv.scene && vv.scene.canvas;
+      let 画面中央のpick = null;
+      try {
+        if (cv) {
+          const p = vv.scene.pick(new Cesium.Cartesian2(cv.clientWidth / 2, cv.clientHeight / 2));
+          画面中央のpick = (p && p.id)
+            ? { 盤: p.id._placedPanelId || null, 扉: !!p.id._panelDoor, 機器: p.id._buildingIconId || null }
+            : 'なし';
+        }
+      } catch (err) { 画面中央のpick = 'pick例外: ' + err.message; }
+      // _panelEntities は盤と建物機器で共有しているので種別ごとに数える。
+      // 盤1台につき「本体+ラベル」で最低2個、3Dなら扉のぶんも増える。
+      const es = vv._panelEntities || [];
+      const 内訳 = { 盤本体: 0, 盤ラベル: 0, 扉: 0, 建物機器: 0, その他: 0 };
+      let 拾えた盤id = null;
+      for (const e2 of es) {
+        if (!e2) { 内訳.その他++; continue; }
+        if (e2._panelDoor) 内訳.扉++;
+        else if (e2._buildingIconId) 内訳.建物機器++;
+        else if (e2._placedPanelId) {
+          if (e2.label) 内訳.盤ラベル++; else 内訳.盤本体++;
+          拾えた盤id = e2._placedPanelId;
+        } else 内訳.その他++;
+      }
+      const ctrl = vv.scene && vv.scene.screenSpaceCameraController;
+      return {
+        番号: i, モード: vv._diagMode || null,
+        配置済み盤: vv._diagPlaced || [],
+        エンティティ内訳: 内訳,
+        盤エンティティ数: es.length,
+        全エンティティ数: vv.entities ? vv.entities.values.length : null,
+        画面中央のpick, 拾えた盤id,
+        カメラ操作: ctrl ? { 回転: ctrl.enableRotate, 平行移動: ctrl.enableTranslate,
+                            ズーム: ctrl.enableZoom, 傾き: ctrl.enableTilt } : null,
+      };
+    });
+  };
+}
+
+// ══ 面をダブルクリックしたときの視点（唯一の実装・2026-08-31）══
+// 【直した不具合】上面をダブルクリックして真上から覗いたあと、
+//   中ボタン（tilt）が効かなくなる（ユーザー報告 2026-08-31）。
+// 【真因】上面は法線 nz=1 なので `pitch = -asin(1)` が **厳密に −90°** になる。
+//   中ボタンの tilt は tilt中心の ENU フレームで `constrainedAxis = UNIT_Z` を立てて回すが、
+//   カメラ位置がその軸と平行（＝真上）だと Cesium の `Camera.rotateVertical` は
+//   `(northParallel && angle<0) || (southParallel && angle>0)` のときしか回さず、
+//   それ以外は**何もしない**。つまり極の特異点に座り込んで片方向にしか反応しなくなる。
+// 【対処】±90°ちょうどを避ける。0.02rad（約1.15°）逃がすだけで特異点から外れ、
+//   見た目は真上とほぼ変わらない。`constrainedAxis` を後から消す案は
+//   Cesium の通常操作モデルを崩すので採らない（Codex監査）。
+// 【なぜ共通関数にしたか】この計算は
+//   ①canvas の LEFT_DOUBLE_CLICK ②DOMオーバーレイの onDoubleClick
+//   の2箇所にまるごと重複していた。片方だけ直すともう片方が壊れたまま残る。
+//   呼び出し側で取り方が違う blk / sel は引数で受け取り、差異をここへ閉じ込める。
+// 中ボタンorbit が許す pitch の窓（天地逆転防止）。**orbit と飛び先で同じ値を使う**。
+// 【なぜ共有するか】以前は orbit 側が -1.55、飛び先が -(π/2-0.02)=-1.5508 と
+//   0.0008rad だけ食い違う別々のマジックナンバーだった。同じ概念は1箇所で持つ。
+const CM_PITCH_MIN = -1.55;   // ほぼ真下
+const CM_PITCH_MAX = -0.05;   // ほぼ水平（これより上は向かせない）
+// 飛び先を厳密な±90°に置かない。真下ちょうどだと orbit の傾き軸
+// `cross(地表法線, direction)` が 0 ベクトルに退化する（7248付近のフォールバック条件）。
+// なお窓の外へ着地しても、上の「悪化したら取り消す」判定で自力復帰できる。
+const CM_FACE_MAX_PITCH = Math.PI / 2 - 0.02;   // ±90°ちょうどに座らせない
+function cmFaceFlyTarget(blk, sel, baseElev) {
+  if (!blk || !sel) return null;
+  let nx = 0, ny = 0, nz = 0, cx, cy, cz;
+  if (sel._solidNormal && sel._faceCenterX != null) {
+    const sn = sel._solidNormal;
+    const len = Math.sqrt(sn.nx ** 2 + sn.ny ** 2 + sn.nz ** 2) || 1;
+    nx = sn.nx / len; ny = sn.ny / len; nz = sn.nz / len;
+    cx = sel._faceCenterX; cy = sel._faceCenterY; cz = sel._faceCenterZ;
+  } else if (sel.face === 'zTop' || sel.face === 'zBottom') {
+    const top = sel.face === 'zTop';
+    nx = 0; ny = 0; nz = top ? 1 : -1;
+    const pts = blk.points;
+    cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+    cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+    cz = top ? (blk.zTop || 40) : (blk.zBottom || 0);
+  } else if (typeof sel.face === 'number') {
+    // 側面: エッジから外向き法線を計算（nz=0 なので pitch は0のまま＝クランプの影響なし）
+    const pts = blk.points, n = pts.length;
+    const fi = sel.face;
+    const p0 = pts[fi], p1 = pts[(fi + 1) % n];
+    const ex = p1.x - p0.x, ey = p1.y - p0.y, elen = Math.sqrt(ex ** 2 + ey ** 2) || 1;
+    let gnx = ey / elen, gny = -ex / elen;
+    const cx0 = pts.reduce((s, p) => s + p.x, 0) / n, cy0 = pts.reduce((s, p) => s + p.y, 0) / n;
+    const mx = (p0.x + p1.x) / 2, my = (p0.y + p1.y) / 2;
+    if ((mx - cx0) * gnx + (my - cy0) * gny < 0) { gnx = -gnx; gny = -gny; }
+    nx = gnx; ny = gny; nz = 0;
+    cx = mx; cy = my; cz = ((blk.zTop || 40) + (blk.zBottom || 0)) / 2;
+  } else { return null; }
+
+  const bldSize = Math.max(
+    (blk.pxMaxX || 0) - (blk.pxMinX || 0), (blk.pxMaxY || 0) - (blk.pxMinY || 0),
+    ((blk.zTop || 40) - (blk.zBottom || 0)) / METERS_PER_PX,
+  );
+  const dist = Math.max(80, bldSize * 1.8);
+  const camGX = cx + nx * dist, camGY = cy + ny * dist;
+  const camGZm = (baseElev || 0) + (cz + nz * dist) * METERS_PER_PX;
+  const geo = gridToGeo(camGX, camGY);
+  // heading: カメラが法線の逆向きを向く。グリッドX=東 / グリッドY=南 なので north=-ny
+  const heading = Math.atan2(-nx, ny);
+  const pitchRaw = -Math.asin(Math.max(-1, Math.min(1, nz)));
+  const pitch = Math.max(-CM_FACE_MAX_PITCH, Math.min(CM_FACE_MAX_PITCH, pitchRaw));
+  return { lng: geo.lng, lat: geo.lat, altM: camGZm, heading, pitch };
+}
+function cmFlyToFace(v, blk, sel, baseElev) {
+  const t = cmFaceFlyTarget(blk, sel, baseElev);
+  if (!t) return;
+  v.camera.flyTo({
+    destination: Cesium.Cartesian3.fromDegrees(t.lng, t.lat, t.altM),
+    orientation: { heading: t.heading, pitch: t.pitch, roll: 0 },
+    duration: 1.0,
+  });
+}
+
+// ════════════════════════════════════════════════════════════════
+// 描画ループはアプリが1か所で持つ ・2026-10-16（ユーザー報告／advisor監査）
+// ════════════════════════════════════════════════════════════════
+// 【ユーザー報告】CesiumJS 2D の窓に Cesium 標準の赤いパネル
+//   「An error occurred while rendering. Rendering has stopped.」＋「[object Object]」が出た。
+// 【なぜ既定のループだと困るか】Cesium は描画の例外を**2つの出口**に分ける：
+//   (a) scene.render の中 → renderError を発火して飲み込む（1727 の購読はこれを見ていた）
+//   (b) ループ側（preRender/postRender の購読者・resize・clock.tick）→ renderError は**発火しない**
+//   ＝既定のままだと (b) は控えようがなく、どちらも赤いパネルが出て描画が止まる。
+//   裁定 2026-09-23「配置図は Cesium が使えなくても機能を失わない構成にする」に反する。
+//   ループを自前にすれば (a)(b) が**同じ受け口**に入り、控え・知らせ・間の空け方が1か所になる。
+// 【[object Object] にしない】name も message も無い値が投げられることがある。そのまま
+//   文字にすると発生源が消えるので、型・鍵・stack を分けて控える（window.__cesiumLastError）。
+// 陽性対照: window.__CESIUM_OWN_LOOP = false で Cesium 既定のループ（赤いパネル）に戻す。
+function _cesiumOwnLoopOn() {
+  return !(typeof window !== 'undefined' && window.__CESIUM_OWN_LOOP === false);
+}
+function _cesiumNoteError(e, 出口, mode) {
+  const 情報 = {
+    とき: new Date().toISOString(), 窓: mode || '?', 出口: 出口,
+    名: (e && e.name) || null,
+    文: (e && e.message) ? String(e.message).slice(0, 300) : null,
+    型: Object.prototype.toString.call(e),
+    鍵: (e && typeof e === 'object') ? Object.keys(e).slice(0, 12) : null,
+    文字列: (() => { try { return String(e).slice(0, 300); } catch (_) { return null; } })(),
+    積: (e && e.stack) ? String(e.stack).split('\n').slice(0, 8).join('\n') : null,
+  };
+  if (typeof window !== 'undefined') {
+    window.__cesiumLastError = 情報;
+    const a = (window.__cesiumErrors = window.__cesiumErrors || []);
+    a.push(情報); if (a.length > 20) a.shift();
+  }
+  console.warn('[Cesium] 描画の例外（' + 出口 + '・' + (mode || '?') + '）', 情報, e);
+  return 情報;
+}
+// 控えた例外の「一目で分かる見出し」。名前も文も無い値のときは持っている鍵を見せる
+//   （[object Object] とだけ出すと、利用者が伝えても発生源が絞れない）
+function _cesiumErrLabel(情報) {
+  if (!情報) return '不明';
+  if (情報.名) return 情報.名 + (情報.文 ? '：' + 情報.文.slice(0, 90) : '');
+  if (情報.文) return 情報.文.slice(0, 90);
+  if (情報.鍵 && 情報.鍵.length) return '名前の無い値（' + 情報.鍵.slice(0, 4).join(',') + '）';
+  const t = (情報.文字列 || 情報.型 || '');
+  return (t && t !== '[object Object]') ? t.slice(0, 90) : '名前も中身も無い値';
+}
+// 窓の隅の小さな知らせ（Cesium の赤いパネルの代わり。作業は止めない）
+function _cesiumShowNote(el, 文) {
+  if (!el || typeof document === 'undefined') return;
+  // 置き場が static だと absolute の基準が祖先に飛ぶ。ここで土台にしておく
+  try { if (getComputedStyle(el).position === 'static') el.style.position = 'relative'; }
+  catch (_) {}
+  let n = el.querySelector('[data-cesium-note]');
+  if (!n) {
+    n = document.createElement('div');
+    n.setAttribute('data-cesium-note', '1');
+    n.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:40;'
+      + 'max-width:calc(100% - 12px);background:rgba(15,23,42,0.88);color:#FCA5A5;'
+      + 'border:1px solid #DC2626;border-radius:4px;padding:3px 7px;font-size:10px;'
+      + 'font-weight:700;pointer-events:none;white-space:pre-wrap';
+    el.appendChild(n);
+  }
+  n.textContent = 文; n.style.display = '';
+}
+function _cesiumHideNote(el) {
+  const n = el && el.querySelector && el.querySelector('[data-cesium-note]');
+  if (n) n.style.display = 'none';
+}
+// 自前ループを始める。戻り値 true＝自前で回している
+function _cesiumStartOwnLoop(viewer, el, mode) {
+  if (!viewer || viewer.isDestroyed() || !_cesiumOwnLoopOn()) return false;
+  viewer.useDefaultRenderLoop = false;
+  // (a) の例外も外へ出す。出さないと renderError だけ発火して受け口（catch）に来ない
+  try { viewer.scene.rethrowRenderErrors = true; } catch (_) {}
+  viewer._ownLoop = true; viewer._ownLoopPaused = false;
+  let 連続 = 0, 休み = 0;
+  const tick = () => {
+    if (!viewer || viewer.isDestroyed()) return;
+    viewer._ownLoopRaf = requestAnimationFrame(tick);
+    if (viewer._ownLoopPaused) return;
+    if (休み > 0) { 休み--; return; }
+    try {
+      viewer.resize(); viewer.render();
+      if (連続) { 連続 = 0; _cesiumHideNote(el); }
+    } catch (e) {
+      const 情報 = _cesiumNoteError(e, '描画', mode);
+      連続++;
+      // 【続けて落ちるなら間を空ける】毎フレーム投げ続けると操作まで重くなる。
+      //   ただし長すぎると「地図が戻らない」に見えるので最大3秒（直ればすぐ元の速さに戻る）
+      休み = Math.min(180, 20 * 連続);
+      viewer._ownLoopErrCount = 連続;
+      // 【2回目から知らせる】1回きりは初期化時の一時エラー（0×0キャンバス）で起きるので黙る。
+      //   続くようなら黙っていても「地図が固まった」としか見えない
+      if (連続 >= 2) _cesiumShowNote(el,
+        '地図の描画でエラーが出ています（' + 連続 + '回）。作図は続けられます\n'
+        + _cesiumErrLabel(情報));
+    }
+  };
+  viewer._ownLoopRaf = requestAnimationFrame(tick);
+  return true;
+}
+function _cesiumStopOwnLoop(viewer) {
+  if (!viewer || !viewer._ownLoop) return;
+  try { cancelAnimationFrame(viewer._ownLoopRaf); } catch (_) {}
+  viewer._ownLoop = false;
+}
+
+// ===== CesiumMapコンポーネント =====
+function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ, onDropNode, onAddWp, onMoveWp, onDropWp, onRemoveWp, onMoveNode, onStartDragNode, onEndDragNode, hoverId, hoverSeg, setHoverId, setHoverSeg, setWireTip, routeFilter, routeSegs, setRouteFilter, focusNodeRef, focusPosRef, onFocusNode, dragUpdateRef, dragStateRef, cesiumRenderRef, cesiumQueryRef, movedNodeRef, blds, solids, setSolids, setSolidsDirect, hSections = [], onAddBuilding, onResizeBuilding, onMoveBldFace, onDeleteBuilding, onRotateBuilding, onMoveBuilding, onAddBlock, onSetBlockPoints, onDeleteBlock, onRevertExtrude, onMergeBlockIntoParent, onRenameBuilding = null, sharedBaseElev, onBaseElevChange, onBldUndo, onBldRedo, onBldPushUndo, onRemoveNodePos, setCurrentSSE = () => {}, plantNorthAngle = 0, setPlantNorthAngle, qualitySettings = null, sectionOverlays = [], onFocusBld = null, onDeleteBld = null, buildingsFull = [], floorFollow = true, onToggleFloorFollow = null, onAddFloor = null, onUpdateFloor = null, onDeleteFloor = null, onExportBuildings = null, onImportBuildings = null, onAddPartition = null, onUpdatePartition = null, onDeletePartition = null, onAddDoor = null, onDeleteDoor = null, onOpenBuildingEditor = null, winState = null,
+  // ── 配置済み配電盤 ──
+  // 盤のスキーマ（wx,wyが角／rotが絶対角／wzがグリッドpx）を知るのは panelPlacementCore.js だけ。
+  // ここでは ppc* ヘルパー越しにしか触らない。ドロップ判定も App 側の関数を受け取って使う
+  //（PANEL_DND_MIME や JSON 判定をこちらにコピーすると、受け口ごとに条件が食い違う）。
+  placedPanels = [], selectedPlacedPanelId = null, onSelectPlacedPanel = null,
+  readDroppedPanelTemplate = null, onDropPanelTemplate = null,
+  selectedDoorKey = null, onDoorClick = null,
+  // ドラッグで動かす。渡すのは世界座標(グリッドpx)と絶対角だけで、
+  // placedPanels の書き換えは App 側が行う（スキーマをここに持ち込まない）
+  onMovePlacedPanel = null, onRotatePlacedPanel = null }) {
   const containerRef = useRef(null);
   const viewerRef = useRef(null);
+  // ===== 階（建物内部 Phase A）用のUI状態 =====
+  const [floorAddZ, setFloorAddZ] = useState(0);      // 追加する階の床標高(m)
+  const [floorAddH, setFloorAddH] = useState(3);      // 追加する階の階高(m)
+  const [floorMsg, setFloorMsg] = useState(null);     // 階操作の検証エラー表示
+  const [floorPanelOpen, setFloorPanelOpen] = useState(false); // 階パネルの開閉
+  const bldImportInputRef = useRef(null);             // 建物json読込用の隠しinput
+  // ===== 仕切り（建物内部 Phase B）用のUI状態 =====
+  const [wallAddMode, setWallAddMode] = useState(null); // {buildingId, floorId, kind:'wall'|'clear', pts:[{x,y}]}
+  const wallAddModeRef = useRef(null);
+  useEffect(() => { wallAddModeRef.current = wallAddMode; }, [wallAddMode]);
   const qualitySettingsRef = useRef(null);
   const bldsLatestRef = useRef(blds);
   const solidsLatestRef = useRef(solids);
@@ -12,9 +304,14 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
   // cesiumRenderRef: ドラッグ中のCesium rAFループ停止 + mouseUp後に再開
   useEffect(() => {
     if (!cesiumRenderRef) return;
+    // 【止める／動かすの書き手は1つ・2026-10-16】自前ループのときは旗で止める。
+    //   useDefaultRenderLoop を直に書くと、自前ループと二重に効いて戻せなくなる
     cesiumRenderRef.current = {
-      pause:  () => { const v = viewerRef.current; if (v && !v.isDestroyed()) v.useDefaultRenderLoop = false; },
-      resume: () => { const v = viewerRef.current; if (v && !v.isDestroyed()) { v.useDefaultRenderLoop = true; v.scene.requestRender(); } },
+      pause:  () => { const v = viewerRef.current; if (!v || v.isDestroyed()) return;
+        if (v._ownLoop) v._ownLoopPaused = true; else v.useDefaultRenderLoop = false; },
+      resume: () => { const v = viewerRef.current; if (!v || v.isDestroyed()) return;
+        if (v._ownLoop) v._ownLoopPaused = false; else v.useDefaultRenderLoop = true;
+        v.scene.requestRender(); },
     };
   }, [cesiumRenderRef]);
 
@@ -449,6 +746,17 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
   const bldAddPtsLatest = useRef([]); // MOUSE_MOVEクロージャ用の最新値
   const nearClipDist = qualitySettings?.nearClipDist ?? 0; // 建物近傍クリップ距離(m): qualitySettings から導出
   const [bldSelected, setBldSelected] = useState(null); // 選択中の建屋 {buildingId, blockIdx, face}
+  // ── 配置済み配電盤のドラッグ（2026-09-01）──
+  // 【宣言はここ】盤描画エフェクトの依存配列で使うので、**そのエフェクトより前**で宣言する。
+  //   後ろに置くと依存配列の評価時に未初期化で ReferenceError になる。
+  const panelDragRef = useRef(null);                    // ドラッグ状態（移動 / Shift+回転）
+  const placedPanelsRef = useRef(placedPanels);         // 最新値。CallbackProperty が毎フレーム読む
+  const [panelRebuildTick, setPanelRebuildTick] = useState(0); // 離した時に作り直しを1回促す
+  // 直前のクリックが「動かしたドラッグ」だったか。空クリックの選択解除で使う
+  const panelDragMovedRef = useRef(false);
+  // 【必ず毎レンダー更新する】盤描画エフェクトはドラッグ中スキップするので、
+  // そちらで更新すると CallbackProperty が古い値を読み続けて盤が動かなくなる
+  useEffect(() => { placedPanelsRef.current = placedPanels; });
   const [selectedCarve, setSelectedCarve] = useState(null); // 選択中の削り出し {buildingId, childBlockIdx, parentFlatIdx}
   const [faceSketchPhase, setFaceSketchPhase] = useState(null); // null | 'draw' | 'extrude'
   const [faceSketchPts, setFaceSketchPts] = useState([]); // [{gx,gy,gz}] grid座標+メートル
@@ -749,6 +1057,14 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
         }
       }
       viewer._tileset3d = tileset3d;
+      // 【観測口は初期化の時点で開く・2026-10-12】
+      //   登録が「盤の再計算の useEffect」の中だけにあると、盤が無いときは登録されず、
+      //   外から viewer を一切見られない（実測: __cesiumViewers が常に空だった）。
+      //   初期化が終わった時点で登録する。動きは変えない。
+      if (typeof window !== 'undefined') {
+        const _reg0 = (window.__cesiumViewers = window.__cesiumViewers || []);
+        if (!_reg0.includes(viewer)) _reg0.push(viewer);
+      }
 
       // 3D: sharedBaseElevがあれば優先（3DTiles基準）
       // 2D: 自身のテレインサンプリング結果をそのまま使用（3Dと地表モデルが異なるため）
@@ -941,30 +1257,27 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
           currentSolids = passedSolids;
         } else {
           // bldListから変換（旧互換）
+          // 【ブロック→立体は唯一の入口 blockSolidsOf を通す・2026-10-03 Codex監査】
+          //   ここで面を自前に組み立てていたので、上面の傾き（片流れ屋根）・掃引（らせん）・
+          //   並べた部材（螺旋階段の段板）が落ちていた。passedSolids が間に合わない
+          //   1コマだけ走る道だが、「新しい形の作り方を知らない道」を残すと必ず再発する
           currentSolids = [];
           if (!bldList || bldList.length === 0) return;
-          let _fid = 0;
           bldList.forEach((blk, flatIdx) => {
             const pts = blk.points;
             if (!pts || pts.length < 3) return;
-            let area = 0;
-            for (let i = 0; i < pts.length; i++) { const j = (i+1)%pts.length; area += pts[i].x*pts[j].y - pts[j].x*pts[i].y; }
-            const normPts = area >= 0 ? pts : [...pts].reverse();
-            const zB = blk.zBottom || 0;
-            const zT = blk.zTop != null ? blk.zTop : (blk.height || 40);
-            const n = normPts.length;
-            const faces = [];
-            faces.push({ id: 'top_'+flatIdx, vertices: normPts.map(p => ({x:p.x, y:p.y, z:zT})), type: 'top', _edgeIdx: null });
-            faces.push({ id: 'bot_'+flatIdx, vertices: normPts.map(p => ({x:p.x, y:p.y, z:zB})).reverse(), type: 'bottom', _edgeIdx: null });
-            for (let i = 0; i < n; i++) {
-              const j = (i+1) % n;
-              faces.push({ id: 'wall_'+flatIdx+'_'+i, vertices: [
-                {x:normPts[i].x, y:normPts[i].y, z:zB}, {x:normPts[j].x, y:normPts[j].y, z:zB},
-                {x:normPts[j].x, y:normPts[j].y, z:zT}, {x:normPts[i].x, y:normPts[i].y, z:zT},
-              ], type: 'wall', _edgeIdx: i });
-            }
-            const finalFaces = _overrideFaces[flatIdx] || faces;
-            currentSolids.push({ id: blk.buildingId+'_'+flatIdx, label: blk.label, color: blk.color || '#6B7A8D', faces: finalFaces, flatIdx, _normPts: normPts });
+            // 旧名 height を zTop に吸収してから渡す（入口は zTop しか見ない）
+            const _blk = Object.assign({}, blk, { zTop: blk.zTop != null ? blk.zTop : (blk.height || 40) });
+            const _bld = { id: blk.buildingId, label: blk.label, color: blk.color || '#6B7A8D', blocks: [_blk] };
+            (blockSolidsOf(_bld, _blk, 0) || []).forEach((sd, k) => {
+              currentSolids.push(Object.assign({}, sd, {
+                id: blk.buildingId + '_' + flatIdx + (k ? '#' + k : ''),
+                label: blk.label, color: blk.color || '#6B7A8D',
+                // 削り出し済みの面があればそれを優先（従来どおり。並べた複製には掛けない）
+                faces: (k === 0 && _overrideFaces[flatIdx]) ? _overrideFaces[flatIdx] : sd.faces,
+                flatIdx,
+              }));
+            });
           });
         }
 
@@ -1289,7 +1602,12 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
                 });
               }
               // 全頂点にラベル描画
-              allVerts.forEach(pt => {
+              // 【頂点の名称は出さない・2026-11-24 ユーザー指示「非常に重い」】
+              //   頂点1つにつき Cesium のエンティティを1つ作るので、建物が増えるほど重くなる
+              //   （取り込みで200件になると頂点は千単位）。必要なときだけ
+              //   window.__CESIUM_VERTEX_LABELS = true で出せる（既定は出さない）。
+              const _頂点名 = (typeof window !== 'undefined' && window.__CESIUM_VERTEX_LABELS === true);
+              if (_頂点名) allVerts.forEach(pt => {
                 if (!pt._label) return;
                 const dx = pt.x - cx, dy = pt.y - cy;
                 const d = Math.sqrt(dx * dx + dy * dy);
@@ -1492,11 +1810,21 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
         });
         viewer.resolutionScale = window.devicePixelRatio || 1;
       } else {
-        viewer.camera.flyTo({
-          destination: Cesium.Cartesian3.fromDegrees(center.lng, center.lat, baseElevation + camAlt),
-          orientation: { heading: 0, pitch: Cesium.Math.toRadians(-70), roll: 0 },
-          duration: 0,
-        });
+        // 【3Dは敷地中心を斜めから注視する・2026-10-12 ユーザー報告／Codex監査 01a12e53】
+        //   「明らかに2Dだね。ポリゴンで表示されないもん」
+        //   調べると 3DTiles（Ion 2275207 = Google Photorealistic）は**出ていた**。
+        //   tileset.show を false にすると画面が真っ黒になる（166KB→18KB）ので、
+        //   あの絵はタイルそのもの。描画中20枚・読み込み済み176枚。
+        //   つまり『出ていない』のではなく、**高度1200m・-70°だと立体メッシュが
+        //   真上からの航空写真にしか見えない**だけだった（実測: -25°/350m で街並みと空が出る）。
+        //   【lookAt は参照系に入る】直後に lookAtTransform(IDENTITY) で必ず解除する。
+        //     忘れると以後の move/rotate/setView がその系に縛られる（Codex）。
+        //   -40° は中ボタンorbitのクランプ窓（CM_PITCH_MIN 〜 CM_PITCH_MAX）の内側。
+        //   2D の窓（-87°）は触らない。
+        viewer.camera.lookAt(
+          Cesium.Cartesian3.fromDegrees(center.lng, center.lat, baseElevation),
+          new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-40), camAlt * 1.3));
+        viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
         viewer.resolutionScale = window.devicePixelRatio || 1;
         // 3D: タイルストリーミング開始を待って複数回レンダーをリクエスト
         [500, 1000, 2000, 3000, 5000].forEach(ms => setTimeout(() => {
@@ -1510,10 +1838,16 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
 
       initDoneRef.current = true;
       setInitDone(true);
+      // 【描画ループはアプリが持つ・2026-10-16】例外の2つの出口を1つの受け口に集める
+      _cesiumStartOwnLoop(viewer, containerRef.current, mode);
 
       // Cesiumレンダーエラーを捕捉して抑制（0×0キャンバス初期化時の一時的エラー）
       viewer.scene.renderError.addEventListener((scene, error) => {
-        console.warn('[Cesium] renderError (suppressed, will retry):', error?.message || error);
+        // 【控えるのはここ1か所・2026-10-16】message だけ出すと [object Object] になって
+        //   発生源が消える。型・鍵・stack まで分けて控える
+        _cesiumNoteError(error, 'renderError', mode);
+        // 自前ループのときは、投げ直された同じ例外を catch 側が受けて面倒を見る
+        if (viewer && viewer._ownLoop) return;
         // renderLoopを再起動（Cesiumはエラー後にrenderLoopを停止するため）
         if (viewer && !viewer.isDestroyed()) {
           viewer.useDefaultRenderLoop = false;
@@ -1551,6 +1885,7 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
 
     return () => {
       destroyed = true;
+      _cesiumStopOwnLoop(viewerRef.current);   // 先に rAF を止める（2026-10-16）
       if (viewerRef.current && !viewerRef.current.isDestroyed()) {
         viewerRef.current.destroy();
         viewerRef.current = null;
@@ -1626,19 +1961,9 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
               // 非同期で確認ダイアログ（setState内では直接使えないのでsetTimeoutで脱出）
               setTimeout(() => {
                 if (window.confirm('３次元図の表示領域をフィールドに合わせますか？')) {
-                  const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
-                  const minLat = Math.min(...lats), maxLat = Math.max(...lats);
-                  const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
-                  const centerLat = (minLat + maxLat) / 2;
-                  const centerLng = (minLng + maxLng) / 2;
-                  const mPerDegLng = 111320 * Math.cos(centerLat * Math.PI / 180);
-                  const bboxW = (maxLng - minLng) * mPerDegLng;
-                  const bboxH = (maxLat - minLat) * M_PER_DEG_LAT;
-                  const mpp = Math.max(bboxW / (TW * 0.9), bboxH / (TH * 0.9), 0.001);
-                  const originLat = centerLat - (TH / 2) * mpp / M_PER_DEG_LAT;
-                  const originLng = centerLng - (TW / 2) * mpp / mPerDegLng;
-                  updateGeoOrigin(originLat, originLng);
-                  location.reload();
+                  // 原点と縮尺の式は cesiumUtils.js の fieldFrameFromPolygon 1か所（2026-11-22）。
+                  // ここに式を書き写さない（国土地理院の窓も同じ commitFieldPolygon を通る）。
+                  commitFieldPolygon(poly);
                 }
               }, 0);
               return [];
@@ -1691,6 +2016,215 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
       fdr.lineEnt = lineEnt;
     }
   }, [fieldDrawPts, fieldDrawMode]);
+
+  // ══ 配置済み配電盤：アウトライン＋名称ラベル ══
+  // 【描くのは外形と名前だけ】盤の中身（仕切り・扉・アイコン・配線）は平面図/3次元図/
+  // 配電盤エディタが描く。地図の役目は「どこに何があるか」なので、外形と名前に絞る。
+  // 【色は共通コアから取る】pdcPanelColor が唯一の正。ここに固定色を書かない（CLAUDE.md）。
+  // 【幾何は panelPlacementCore.js から取る】mm→ワールドの式をここに書かない。
+  // 2D は平面のポリゴン、3D は extrudedHeight で高さを持たせる。根拠（寸法・位置・回転・色）は
+  // 同じで、見せ方だけがモードで違う。
+  useEffect(() => {
+    placedPanelsRef.current = placedPanels;   // CallbackProperty が読む最新値を先に更新する
+    const v = viewerRef.current;
+    if (!v || v.isDestroyed()) return;
+    // ★ドラッグ中は作り直さない（2026-09-01）
+    //   毎フレーム remove→add すると、ポリゴンの形状生成が非同期なため本体だけ追いつかず、
+    //   位置が同期更新されるラベルだけが動いて「本体が置き去り」に見える。
+    //   形状は下の CallbackProperty がフレームごとに追従するので、作り直す必要がない。
+    if (panelDragRef.current) return;
+    // 前回ぶんを必ず片付ける。建物の _bldEntities とは混ぜない（寿命が別）
+    if (v._panelEntities) v._panelEntities.forEach(e => { if (e && v.entities.contains(e)) v.entities.remove(e); });
+    v._panelEntities = [];
+    if (typeof ppcFootprintPx !== 'function') return;   // コア未ロード時は何もしない
+    const baseElev = v._siteBaseElevation || 0;
+    const is3d = modeRef.current === '3d';
+    for (const pp of (placedPanels || [])) {
+      if (!pp || !isFinite(pp.wx) || !isFinite(pp.wy)) continue;
+      const span = ppcHeightSpan(pp);
+      const xf = ppcMakeXf(pp);
+      const colHex = (typeof pdcPanelColor === 'function' ? pdcPanelColor(pp.panelData) : null) || '#94A3B8';
+      const col = Cesium.Color.fromCssColorString(colHex);
+      const sel = selectedPlacedPanelId === pp.id;
+      // 常に最新の盤を読む。ドラッグ中はエフェクトが再実行されないので、
+      // ここが唯一の追従経路になる（見つからなければ作成時の値で描く）
+      const _ppId0 = pp.id;
+      const _live = () => (placedPanelsRef.current || []).find(q => q.id === _ppId0) || pp;
+      const _hierarchyOf = (lp) => {
+        const dg = [];
+        ppcFootprintPx(lp).forEach(q => { const g = gridToGeo(q.x, q.y); dg.push(g.lng, g.lat); });
+        return new Cesium.PolygonHierarchy(Cesium.Cartesian3.fromDegreesArray(dg));
+      };
+      const ent = v.entities.add({
+        polygon: {
+          // CallbackProperty にすると、形状を作り直さずフレームごとに評価される。
+          // 第2引数 false = 毎フレーム変わり得る（true にすると1回しか読まれない）
+          hierarchy: new Cesium.CallbackProperty(() => _hierarchyOf(_live()), false),
+          material: col.withAlpha(sel ? 0.55 : 0.35),
+          outline: true,
+          outlineColor: sel ? Cesium.Color.fromCssColorString('#F59E0B') : col,
+          outlineWidth: 2,
+          // 3D は盤の高さぶん立ち上げる。2D は地表に貼る
+          height: is3d ? baseElev + span.zMinM : undefined,
+          extrudedHeight: is3d ? baseElev + span.zMaxM : undefined,
+          heightReference: is3d ? undefined : Cesium.HeightReference.CLAMP_TO_GROUND,
+        },
+      });
+      ent._placedPanelId = pp.id;   // ピック時に盤を特定するための最小メタ情報
+      v._panelEntities.push(ent);
+      // 名称ラベル。中心の求め方は panelPlacementCore.js（角ではなく回転中心）
+      // 本体と同じく CallbackProperty で追従させる。片方だけ追従すると
+      // 「ラベルだけ動いて本体が置き去り」になる（2026-09-01に実際に起きた症状）
+      const lbl = v.entities.add({
+        position: new Cesium.CallbackProperty(() => {
+          const lp = _live();
+          const p2 = ppcPivot(lp);
+          const g2 = gridToGeo(p2.pivWx, p2.pivWy);
+          return Cesium.Cartesian3.fromDegrees(g2.lng, g2.lat, baseElev + (is3d ? span.zMaxM : 0) + 0.5);
+        }, false),
+        label: {
+          text: pp.instanceName || (pp.panelData && pp.panelData.name) || '配電盤',
+          font: '12px sans-serif',
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          outlineWidth: 2,
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          pixelOffset: new Cesium.Cartesian2(0, -4),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          heightReference: is3d ? undefined : Cesium.HeightReference.CLAMP_TO_GROUND,
+        },
+      });
+      lbl._placedPanelId = pp.id;
+      v._panelEntities.push(lbl);
+
+      // 扉：クリックで開閉できるようピック可能な面を置く。
+      // 【2Dには作らない】扉は垂直面なので真上から見る2Dでは線に潰れて掴めない。
+      // 2Dは盤本体のクリック（選択）だけを受け持ち、開閉は3Dで行う。
+      // 【扉非表示なら作らない】エディタで非表示にした扉が選択・開閉できてしまうのを防ぐ
+      //（3次元図の _pde_panelSVGElems と同じ扱い）。
+      if (is3d && typeof pdcDoorCorners === 'function'
+          && pp.panelData && pp.panelData.doorsVisible !== false) {
+        const doors = pp.panelData.doors || [];
+        for (let di = 0; di < doors.length; di++) {
+          const corners = pdcDoorCorners(doors[di], pp.panelData);
+          if (!corners || corners.length < 3) continue;
+          // 【扉は盤に乗っている】盤が動いたら扉も動かないと取り残される。
+          // 本体・ラベルと同じく、乗り先（＝盤の最新値）を毎フレーム読む（14.41 と同じ型の話）
+          const _doorHierarchy = () => {
+            const lp = _live();
+            const xf2 = ppcMakeXf(lp);
+            const dh = [];
+            for (const c of corners) {
+              const w = xf2.toM(c[0], c[1], c[2]);   // 高さはメートル（Cesiumに渡す単位）
+              if (!isFinite(w[0]) || !isFinite(w[1]) || !isFinite(w[2])) return null;
+              const g = gridToGeo(w[0], w[1]);
+              dh.push(g.lng, g.lat, baseElev + w[2]);
+            }
+            return new Cesium.PolygonHierarchy(Cesium.Cartesian3.fromDegreesArrayHeights(dh));
+          };
+          if (!_doorHierarchy()) continue;   // 作成時点で壊れている扉は置かない
+          const dSel = selectedDoorKey === (pp.id + '_' + di);
+          const dEnt = v.entities.add({
+            polygon: {
+              hierarchy: new Cesium.CallbackProperty(() => _doorHierarchy(), false),
+              perPositionHeight: true,   // 垂直面なので地表に貼らず、そのままの高さで描く
+              material: dSel ? Cesium.Color.fromCssColorString('#F59E0B').withAlpha(0.5)
+                             : col.withAlpha(doors[di].isOpen ? 0.15 : 0.45),
+              outline: true,
+              outlineColor: dSel ? Cesium.Color.fromCssColorString('#F59E0B') : col,
+            },
+          });
+          dEnt._panelDoor = { panelId: pp.id, doorIdx: di };   // ピック時の最小メタ情報
+          v._panelEntities.push(dEnt);
+        }
+      }
+    }
+    // ── 建物内部の機器（floor.icons）──
+    // 【盤と同じ層に入れる】どちらも「建物に付随して地図に出る箱」で、寿命も同じ。
+    // 別配列に分けると、片方だけ消し忘れる事故が起きる。
+    // 幾何は buildingCore の bcIconAnchorGeom が唯一の実装。ここで壁の向きや寸法を再計算しない。
+    // 【単位】bcIconAnchorGeom の z はメートル、x,y はグリッドpx。Cesium の高さはメートルなのでそのまま使う。
+    if (typeof bcIconAnchorGeom === 'function') {
+      for (const b of (buildingsFull || [])) {
+        for (const fl of (b.floors || [])) {
+          for (const ic of (fl.icons || [])) {
+            let g = null;
+            try { g = bcIconAnchorGeom(b, fl, ic); } catch (_) { g = null; }
+            if (!g) continue;
+            // 既定色は建屋エディタ・3次元図と同じ定義（床置き=水色／壁・扉付け=琥珀）。独自色を書かない
+            const colHex = ic.color || (bcIsFloorIcon(ic) ? BC_FLOOR_ICON_DEFAULTS.color : BC_ICON_DEFAULTS.color);
+            const col2 = Cesium.Color.fromCssColorString(colHex);
+            let ent2 = null;
+            if (g.poly && g.poly.length >= 3) {
+              // 床置きも壁・扉付けも同じ箱＝底面の輪郭（poly）を zB〜zT に立ち上げる（2026-09-11）
+              const dg = [];
+              g.poly.forEach(p => { const q = gridToGeo(p.x, p.y); dg.push(q.lng, q.lat); });
+              ent2 = v.entities.add({ polygon: {
+                hierarchy: new Cesium.PolygonHierarchy(Cesium.Cartesian3.fromDegreesArray(dg)),
+                // 【中身が透けない濃さにする】薄いと骨組みだけに見える（2026-08-31 ユーザー指摘）
+                material: col2.withAlpha(0.95), outline: true, outlineColor: Cesium.Color.fromCssColorString('#0F172A'),
+                height: is3d ? baseElev + (g.zB || 0) : undefined,
+                extrudedHeight: is3d ? baseElev + (g.zT || 0) : undefined,
+                heightReference: is3d ? undefined : Cesium.HeightReference.CLAMP_TO_GROUND,
+              } });
+            }
+            if (ent2) { ent2._buildingIconId = ic.id; v._panelEntities.push(ent2); }
+          }
+        }
+      }
+    }
+    if (v.scene) v.scene.requestRender();
+
+    // ══ 診断フック（2026-08-31）══
+    // Cesium はこちら側でヘッドレス検証ができない（Ionトークンが要る）ため、
+    // 実機から状態を1行で取れるようにしておく。コンソールで `__panelDiag()` を呼ぶ。
+    // 【本番の挙動は変えない】参照を置いて読み取るだけ。
+    if (typeof window !== 'undefined') {
+      v._diagMode = modeRef.current;
+      // 「盤が何台あるか」が最重要。これが0なら掴む対象が無いので操作は全部できない
+      v._diagPlaced = (placedPanels || []).map(p => ({
+        id: p.id, 名前: p.instanceName || (p.panelData && p.panelData.name) || null,
+        wx: p.wx, wy: p.wy, wz: p.wz, 寸法mm: p.panelData
+          ? [p.panelData.widthMm, p.panelData.depthMm, p.panelData.heightMm] : null,
+      }));
+      const reg = (window.__cesiumViewers = window.__cesiumViewers || []);
+      if (!reg.includes(v)) reg.push(v);
+    }
+  }, [placedPanels, selectedPlacedPanelId, selectedDoorKey, mode, buildingsFull, panelRebuildTick]);
+
+  // ══ 配置済み配電盤のクリック ══
+  // 扉なら開閉（判定と2段階の作法は App の handleDoorClick が唯一の実装）、盤本体なら選択。
+  // 【既存のクリック処理を壊さない】拾った entity が盤・扉でなければ何もしないで抜ける。
+  // 【必ず destroy する】Cesium のハンドラはコンポーネントの外に残るので、
+  // 後片付けを忘れると盤を開き直すたびにハンドラが積み上がって多重発火する。
+  useEffect(() => {
+    const v = viewerRef.current;
+    if (!v || v.isDestroyed() || !initDoneRef.current) return;
+    if (!onDoorClick && !onSelectPlacedPanel) return;
+    const handler = new Cesium.ScreenSpaceEventHandler(v.scene.canvas);
+    handler.setInputAction((click) => {
+      const picked = v.scene.pick(click.position);
+      const ent = picked && picked.id;
+      if (ent && ent._panelDoor && onDoorClick) {
+        onDoorClick(ent._panelDoor.panelId, ent._panelDoor.doorIdx);
+        v.scene.requestRender();
+        return;
+      }
+      if (ent && ent._placedPanelId && onSelectPlacedPanel) {
+        onSelectPlacedPanel(ent._placedPanelId);
+        v.scene.requestRender();
+        return;
+      }
+      // 【何もない所（または盤以外）をクリックしたら選択解除】2026-09-01
+      //   解除する手段が無く「選択したら外せない」状態だった。
+      //   ドラッグの直後は解除しない（動かした後に選択が消えると掴み直せない）。
+      if (onSelectPlacedPanel && !panelDragMovedRef.current) {
+        onSelectPlacedPanel(null);
+        v.scene.requestRender();
+      }
+      panelDragMovedRef.current = false;
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    return () => handler.destroy();
+  }, [onDoorClick, onSelectPlacedPanel, initDoneRef.current]);
 
   // 建屋追加モード: 3D建物の屋上をクリック → 屋上面=上面、地面=下面の箱を生成
   useEffect(() => {
@@ -1752,6 +2286,8 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
     // 始点スナップ: 画面上20px以内なら始点座標に吸い付く
     const SNAP_PX = 20;
     const snapToStart = (pt, prev, screenPos) => {
+      // 【一時解除】判定は snapGate.js が唯一の実装。ここは1行見るだけ（2026-09-03）
+      if (typeof snapSuppressed === 'function' && snapSuppressed()) return null;
       if (prev.length < 2) return null;
       const first = prev[0];
       // 実際の標高を使用（alt=0では地形高度がある場合にスクリーン座標がずれる）
@@ -1776,6 +2312,9 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
     // 統合スナップ: 直前辺90° + 閉辺90° を同時に考慮
     const computeSnap = (pt, prev) => {
       const result = { target: pt, snap90: false, snapClose90: false };
+      // 【一時解除】判定は snapGate.js が唯一の実装。ここは1行見るだけ（2026-09-03）
+      // 以前は呼び出し側の1箇所だけ isAlt を見ていたが、ホバー中の候補線は素通りしていた
+      if (typeof snapSuppressed === 'function' && snapSuppressed()) return result;
       if (prev.length < 2) return result;
       const pB = prev[prev.length - 1], pA = prev[prev.length - 2], pS = prev[0];
       const cosLat = Math.cos(pB.lat * Math.PI / 180);
@@ -5196,39 +5735,28 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
   // フォーカスノード登録（カメラアイコンクリック時にCesiumMapがそのノードにflyTo）
   useEffect(() => {
     if (!focusNodeRef) return;
-    focusNodeRef.current = (nodeId) => {
+    focusNodeRef.current = (nodeId, radiusM) => {
       const v = viewerRef.current;
       if (!v || v.isDestroyed()) return;
       const pos = allMapPos[nodeId]; if (!pos) return;
       const geo = gridToGeo(pos.x, pos.y);
       const baseElev = v._siteBaseElevation || 0;
       const alt = baseElev + (pos.z || 0);
-      const nodeCart = Cesium.Cartesian3.fromDegrees(geo.lng, geo.lat, alt);
-      // Use flyToBoundingSphere to properly center the node in the window
-      v.camera.flyToBoundingSphere(
-        new Cesium.BoundingSphere(nodeCart, 0),
-        {
-          offset: new Cesium.HeadingPitchRange(v.camera.heading, v.camera.pitch, 300),
-          duration: 1.0,
-        }
-      );
+      cmFlyToFocus(v, Cesium.Cartesian3.fromDegrees(geo.lng, geo.lat, alt), radiusM);
     };
     return () => { if (focusNodeRef) focusNodeRef.current = null; };
   }, [allMapPos, focusNodeRef]);
 
-  // 建屋面カメラアイコン用: グリッド座標でflyTo
+  // 建屋面・配電盤のカメラアイコン用: グリッド座標でflyTo
+  // radiusM を渡すとその大きさに合わせて寄る（渡さなければ従来どおり300m固定）
   useEffect(() => {
     if (!focusPosRef) return;
-    focusPosRef.current = (gx, gy, gz) => {
+    focusPosRef.current = (gx, gy, gz, radiusM) => {
       const v = viewerRef.current;
       if (!v || v.isDestroyed()) return;
       const geo = gridToGeo(gx, gy);
       const baseElev = v._siteBaseElevation || 0;
-      const cart = Cesium.Cartesian3.fromDegrees(geo.lng, geo.lat, baseElev + (gz || 0));
-      v.camera.flyToBoundingSphere(
-        new Cesium.BoundingSphere(cart, 0),
-        { offset: new Cesium.HeadingPitchRange(v.camera.heading, v.camera.pitch, 300), duration: 1.0 }
-      );
+      cmFlyToFocus(v, Cesium.Cartesian3.fromDegrees(geo.lng, geo.lat, baseElev + (gz || 0)), radiusM);
     };
     return () => { if (focusPosRef) focusPosRef.current = null; };
   }, [focusPosRef]);
@@ -5238,6 +5766,11 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
     if (!bldSelected || !onDeleteBuilding) return;
     const onKey = (e) => {
       if (e.key === 'Delete') {
+        // 入力欄フォーカス中は文字消去が本来の意味なので横取りしない（spec 12.4）
+        if (!bcCanHandleDeleteKey()) return;
+        // 地図が最前面のときだけ建屋削除を受け付ける。
+        // これが無いと建物エディタ作業中のDeleteで建屋ごと消える（発生源）
+        if (!fwOwnsKeyboard(mode === '2d' ? 'cesium2d' : 'cesium3d', winState)) return;
         onDeleteBuilding(bldSelected.buildingId);
         setBldSelected(null);
         updateArrowScreen(null);
@@ -5245,7 +5778,7 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [bldSelected, onDeleteBuilding, updateArrowScreen]);
+  }, [bldSelected, onDeleteBuilding, updateArrowScreen, mode, winState]);
 
   // Ctrl+Z / Ctrl+Y: 建物undo/redo — 親コンポーネントで一元管理（2重発火防止）
   // ※ keydownハンドラは親のuseEffectで1つだけ登録する
@@ -6379,11 +6912,18 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
   // ドロップイベント処理
   const handleCesiumDrop = useCallback((e) => {
     e.preventDefault();
+    // 【盤テンプレートを先に見る】単結ノードと配電盤で dataTransfer の形が違う。
+    // 判定条件は App 側の readDroppedPanelTemplate が唯一の実装なので、ここにコピーしない。
+    if (readDroppedPanelTemplate && onDropPanelTemplate && readDroppedPanelTemplate(e)) {
+      const pos = pickGridPos(e.clientX, e.clientY);
+      if (pos) onDropPanelTemplate(e, pos);
+      return;
+    }
     const id = e.dataTransfer?.getData("text/plain");
     if (!id || !onDropNode) return;
     const pos = pickGridPos(e.clientX, e.clientY);
     if (pos) onDropNode(id, pos);
-  }, [onDropNode, pickGridPos]);
+  }, [onDropNode, pickGridPos, readDroppedPanelTemplate, onDropPanelTemplate]);
 
   // Cesium画面座標(Cartesian2)からグリッド座標を取得するヘルパー
   const pickGridFromCartesian2 = useCallback((c2) => {
@@ -6817,7 +7357,9 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
 
   // コールバックをrefで保持（handler再生成を防ぐ）
   const cbRef = useRef({ onAddWp, onMoveWp, onDropWp, onRemoveWp, onMoveNode, onFocusNode, _segWp: segWp, _wpZ: wpZ, _allMapPos: allMapPos, _mapZ: mapZ || {}, setHoverId, setHoverSeg, setWireTip: setWireTip || null, setRouteFilter, routeFilter, _bldSelected: null, _blds: blds, _mode: mode, _hoverSeg: null, _hoverId: null, _sectionOverlays: [], _readyToDrawWire: true });
-  useEffect(() => { cbRef.current = { onAddWp, onMoveWp, onDropWp, onRemoveWp, onMoveNode, onFocusNode, onStartDragNode, onEndDragNode, _segWp: segWp, _wpZ: wpZ, _allMapPos: allMapPos, _mapZ: mapZ || {}, _segs: segs, _nodes: nodes, _routeSegs: routeSegs, setHoverId, setHoverSeg, setWireTip: setWireTip || null, setRouteFilter, routeFilter, _bldSelected: cbRef.current._bldSelected, _blds: blds, _mode: mode, _hoverSeg: hoverSeg, _hoverId: hoverId, _ugWireMode: qualitySettings?.ugWireHighlight ?? null, _sectionOverlays: sectionOverlays, _readyToDrawWire: true }; });
+  useEffect(() => { cbRef.current = { onAddWp, onMoveWp, onDropWp, onRemoveWp, onMoveNode, onFocusNode, onStartDragNode, onEndDragNode, _segWp: segWp, _wpZ: wpZ, _allMapPos: allMapPos, _mapZ: mapZ || {}, _segs: segs, _nodes: nodes, _routeSegs: routeSegs, setHoverId, setHoverSeg, setWireTip: setWireTip || null, setRouteFilter, routeFilter, _bldSelected: cbRef.current._bldSelected, _blds: blds, _mode: mode, _hoverSeg: hoverSeg, _hoverId: hoverId, _ugWireMode: qualitySettings?.ugWireHighlight ?? null, _sectionOverlays: sectionOverlays, _readyToDrawWire: true,
+    // 配置済み配電盤のドラッグ用（実体化と判定は App が唯一の実装）
+    _placedPanels: placedPanels, onMovePlacedPanel, onRotatePlacedPanel }; });
   useEffect(() => { cbRef.current._bldSelected = bldSelected; }, [bldSelected]);
 
   const nodeEntitiesRef = useRef({});
@@ -6844,12 +7386,17 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
     const handler = new Cesium.ScreenSpaceEventHandler(v.scene.canvas);
     handlerRef.current = handler;
 
+    // 【止めると戻すは同じ顔ぶれで】以前は rotate/translate/zoom だけを止めており、
+    //   Shift+左ドラッグ（このアプリでは rotateEventTypes、Cesium既定では lookEventTypes）が
+    //   生き残って「盤も回るがカメラも動く」状態になった。tilt/look まで含めて対称に扱う。
     const disableCamera = () => {
-      v.scene.screenSpaceCameraController.enableRotate = false;
-      v.scene.screenSpaceCameraController.enableTranslate = false;
-      v.scene.screenSpaceCameraController.enableZoom = false;
+      const c = v.scene.screenSpaceCameraController;
+      c.enableRotate = false; c.enableTranslate = false; c.enableZoom = false;
+      c.enableTilt = false; c.enableLook = false;
     };
     const restoreCamera = () => {
+      v.scene.screenSpaceCameraController.enableTilt = true;
+      v.scene.screenSpaceCameraController.enableLook = true;
       v.scene.screenSpaceCameraController.enableRotate = true;
       v.scene.screenSpaceCameraController.enableTranslate = true;
       v.scene.screenSpaceCameraController.enableZoom = true;
@@ -6858,8 +7405,48 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
     const grabOff = () => document.getElementById('__gs')?.remove();
 
     // 左ボタンダウン
-    handler.setInputAction((e) => {
+    // ★修飾キー付きは Cesium では**別チャンネル**（KeyboardEventModifier）。
+    //   `setInputAction(fn, LEFT_DOWN)` だけでは修飾キー押下時に発火せず、既定のカメラ操作が走る。
+    //   さらに Cesium が渡すイベントは {position} だけで **shiftKey/ctrlKey を持たない**ので、
+    //   修飾キーの有無は「どちらのチャンネルで発火したか」で判断する（引数で渡す）。
+    // ★盤の回転に **Ctrl** を使う理由（2026-09-01）:
+    //   Shift+左ドラッグは **この画面のカメラ水平回転に既に割り当て済み**（rotateEventTypes）。
+    //   さらに Cesium 既定の lookEventTypes も Shift+左なので二重に競合し、
+    //   「盤も回るがカメラも動く」状態になった。Ctrl は未使用なので衝突しない。
+    const _onLeftDown = (e, rotModifier) => {
       downPosRef.current = { x: e.position.x, y: e.position.y };
+      // ══ 配置済み配電盤のドラッグ開始（2026-08-31）══
+      // 【ここに置く理由】専用ハンドラを別に立てると、こちらの背景パン(cameraPanRef)が
+      //   同時に走って盤とカメラが一緒に動く。ノード・ギズモと同じこの入口で捌く。
+      // 【判定と実体化はAppが持つ】ここは「画面のどこを掴んだか」を世界座標にするだけ。
+      //   盤のスキーマ（wx,wyが角／rotが絶対角）はこちらに持ち込まない。
+      {
+        const _cbD = cbRef.current;
+        const _picked = v.scene.pick(e.position);
+        const _ppId = _picked && _picked.id && _picked.id._placedPanelId;
+        if (_ppId && (_cbD.onMovePlacedPanel || _cbD.onRotatePlacedPanel)) {
+          const _pp = (_cbD._placedPanels || []).find(p => p.id === _ppId);
+          if (_pp) {
+            const _mpp = (typeof METERS_PER_PX === 'number' && METERS_PER_PX > 0) ? METERS_PER_PX : 0.1;
+            // 掴んだ点は盤の据付高さの水平面で拾う（地面で拾うと高い盤ほどズレる）
+            const _g0 = pickOnHorizontalPlane(e.position, (_pp.wz || 0) * _mpp);
+            if (_g0) {
+              // 回転中心は盤の角(wx,wy)ではなく回転中心。求め方は panelPlacementCore が唯一の実装
+              const _piv = (typeof ppcPivot === 'function') ? ppcPivot(_pp) : { pivWx: _pp.wx, pivWy: _pp.wy };
+              panelDragRef.current = {
+                id: _ppId, mode: rotModifier ? 'rot' : 'move',
+                startWx: _pp.wx, startWy: _pp.wy, startRot: _pp.rot || 0,
+                pivX: _piv.pivWx, pivY: _piv.pivWy,
+                g0x: _g0.x, g0y: _g0.y, zM: (_pp.wz || 0) * _mpp,
+                startScreen: { x: e.position.x, y: e.position.y }, moved: false,
+              };
+              disableCamera();
+              grabOn();
+              return;   // 背景パンを開始させない
+            }
+          }
+        }
+      }
       // ホバー中ノードがあれば即カメラ無効化（drillPickより先）
       if (hoverNodeRef.current) disableCamera();
       // ギズモ軸ヒット: cesiumGizmoSVGRefのスクリーン座標で判定（gizmo entity 廃止済み）
@@ -6947,7 +7534,11 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
         }
         return;
       }
-    }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+    };
+    // 修飾なしと Ctrl の両方へ登録する（修飾キーは別チャンネルなので登録漏れが起きやすい）
+    handler.setInputAction((e) => _onLeftDown(e, false), Cesium.ScreenSpaceEventType.LEFT_DOWN);
+    handler.setInputAction((e) => _onLeftDown(e, true), Cesium.ScreenSpaceEventType.LEFT_DOWN,
+      Cesium.KeyboardEventModifier.CTRL);
 
     // 中ボタンダウン: orbit開始（lookAt不使用 → 画面中央スナップなし）
     handler.setInputAction((click) => {
@@ -6969,7 +7560,34 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
     }, Cesium.ScreenSpaceEventType.MIDDLE_DOWN);
 
     // マウス移動 — グローバルhover + 軸ドラッグ
-    handler.setInputAction((e) => {
+    const _onMouseMove = (e) => {
+      // ══ 配置済み配電盤のドラッグ中（2026-08-31）══
+      // 移動は「掴んだ点からの差分」を盤の開始位置に足す（掴んだ場所が保たれる）。
+      // Shift+ドラッグは回転。角度は盤の中心まわりのカーソル角の差分で決める。
+      if (panelDragRef.current) {
+        const pd = panelDragRef.current;
+        const _cbM = cbRef.current;
+        const _sx = e.endPosition.x, _sy = e.endPosition.y;
+        if (!pd.moved) {
+          const _dx = _sx - pd.startScreen.x, _dy = _sy - pd.startScreen.y;
+          if (_dx * _dx + _dy * _dy < 25) return;   // 5px未満はまだクリック候補（選択を邪魔しない）
+          pd.moved = true;
+        }
+        const g = pickOnHorizontalPlane(new Cesium.Cartesian2(_sx, _sy), pd.zM);
+        if (!g || !isFinite(g.x) || !isFinite(g.y)) return;   // 汚染ガード
+        if (pd.mode === 'rot') {
+          if (_cbM.onRotatePlacedPanel) {
+            // 盤の回転中心まわりのカーソル角の差分。中心は掴んだ時点で固定する
+            const a0 = Math.atan2(pd.g0y - pd.pivY, pd.g0x - pd.pivX);
+            const a1 = Math.atan2(g.y - pd.pivY, g.x - pd.pivX);
+            _cbM.onRotatePlacedPanel(pd.id, pd.startRot + (a1 - a0));
+          }
+        } else if (_cbM.onMovePlacedPanel) {
+          _cbM.onMovePlacedPanel(pd.id, pd.startWx + (g.x - pd.g0x), pd.startWy + (g.y - pd.g0y));
+        }
+        v.scene.requestRender();
+        return;
+      }
       // 中ボタンドラッグ: Quaternion orbit（lookAt不使用 → スナップなし、roll漂流なし）
       if (orbitRef.current) {
         const or = orbitRef.current;
@@ -7000,10 +7618,24 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
         const _tiltAxis = Cesium.Cartesian3.magnitude(_hR) > 0.01
           ? Cesium.Cartesian3.normalize(_hR, _hR)
           : v.camera.right; // 真下向き時はcam.rightを傾き軸として使う
-        // pitch制限: -0.05rad(ほぼ水平)〜-1.55rad(ほぼ真下)。天地逆転防止
-        const _pitchAfter = v.camera.pitch + ddy * 0.007;
-        if (!(_pitchAfter > -0.05 || _pitchAfter < -1.55)) {
-          _rotAround(_tiltAxis, ddy * 0.007);
+        // ══ pitch制限（2026-08-31 全面改修）══
+        // 【直した不具合】面ダブルクリックで視点が飛んだあと、中ボタンの縦回転が効かなくなる。
+        // 旧実装は「窓の外へ出る操作を**棄却**する」だった:
+        //     const _pitchAfter = v.camera.pitch + ddy * 0.007;
+        //     if (!(_pitchAfter > -0.05 || _pitchAfter < -1.55)) { _rotAround(...); }
+        //   飛び先が窓の外（側面=0 / 上面≈-1.55近傍）だと、1イベントの ddy は数px＝0.007rad程度
+        //   しかないので **窓の中まで届かず毎回棄却**され、縦回転が永久に死ぬ。
+        //   水平回転（上の _rotAround）は無条件なので生き残り、「片方向にしか回らない」になる。
+        // 【新実装】棄却ではなく「**悪化したら取り消す**」。
+        //   窓の外から始まっても、窓へ近づく操作は必ず通るので自力で復帰できる。
+        //   さらに予測（pitch + ddy*0.007）ではなく**回してから実測**するので、
+        //   回転角と pitch の符号の対応を仮定しない（仮定すると逆向きのとき両方向とも死ぬ）。
+        const _pitchOut = (p) => Math.max(0, CM_PITCH_MIN - p, p - CM_PITCH_MAX); // 窓外へのはみ出し量
+        const _pitchBefore = v.camera.pitch;
+        const _tiltAng = ddy * 0.007;
+        _rotAround(_tiltAxis, _tiltAng);
+        if (_pitchOut(v.camera.pitch) > _pitchOut(_pitchBefore) + 1e-9) {
+          _rotAround(_tiltAxis, -_tiltAng);   // はみ出しが増えたので取り消す
         }
 
         v.scene.requestRender();
@@ -7165,7 +7797,11 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
           if (cb.setWireTip) cb.setWireTip(null);
         }
       }
-    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+    };
+    // Ctrl を押したままドラッグすると move/up も CTRL チャンネルへ流れる。両方に登録する
+    handler.setInputAction(_onMouseMove, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+    handler.setInputAction(_onMouseMove, Cesium.ScreenSpaceEventType.MOUSE_MOVE,
+      Cesium.KeyboardEventModifier.CTRL);
 
     // 中ボタン離す: orbit終了
     handler.setInputAction(() => {
@@ -7174,7 +7810,31 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
     }, Cesium.ScreenSpaceEventType.MIDDLE_UP);
 
     // 左ボタン離す
-    handler.setInputAction((e) => {
+    const _onLeftUp = (e) => {
+      // ══ ボタンを離したらカメラ操作は必ず通常に戻す（2026-08-31）══
+      // 【直した穴】LEFT_DOWN の disableCamera() は「ノードにホバーしていれば無条件」で走るのに、
+      //   復帰は「実際にドラッグが始まったとき」だけだった。
+      //   途中には `if (!wp) return;` / `if (!pos) return;` や背景パス（cameraPanRef を置いて抜ける）
+      //   など**復帰を通らない離脱経路**が複数あり、enableRotate/Translate/Zoom が false のまま残る。
+      //   enableTilt は触らないので中ボタンだけ生き残り「片方向にしか回らない」状態になっていた。
+      //   ＝ 無効化が無条件なら、復帰も無条件でなければ釣り合わない。
+      // 【方位キューブは別経路】あれはDOMオーバーレイなので canvas の LEFT_UP は飛ばない。
+      //   ここで戻しても、キューブのドラッグ中の抑止は壊さない。
+      restoreCamera();
+      // 配置済み配電盤のドラッグ完了
+      if (panelDragRef.current) {
+        const pd = panelDragRef.current;
+        panelDragRef.current = null;
+        // 動かした直後の LEFT_CLICK では選択解除しない（掴み直せなくなるため）
+        panelDragMovedRef.current = !!pd.moved;
+        grabOff();
+        // ドラッグ中は作り直しを止めていたので、離した時点で一度作り直させる。
+        // 選択の強調色などはエフェクト側で決まるため、ここで反映させないと古い見た目が残る
+        setPanelRebuildTick(t => t + 1);
+        // 動かしていなければクリック扱い。選択は LEFT_CLICK 側の実装に任せる（二重管理しない）
+        downPosRef.current = null;
+        return;
+      }
       // ノードフリードラッグ完了
       if (draggingNodeRef.current) {
         const dn = draggingNodeRef.current;
@@ -7261,7 +7921,10 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
       // hoverNodeRef経由の先行disableCamera解除（ノードドラッグ以外でクリックした場合も必ず復元）
       restoreCamera();
       downPosRef.current = null;
-    }, Cesium.ScreenSpaceEventType.LEFT_UP);
+    };
+    handler.setInputAction(_onLeftUp, Cesium.ScreenSpaceEventType.LEFT_UP);
+    handler.setInputAction(_onLeftUp, Cesium.ScreenSpaceEventType.LEFT_UP,
+      Cesium.KeyboardEventModifier.CTRL);
 
     // 右クリック: 折れ点削除 or ルートフィルタ切替
     handler.setInputAction((e) => {
@@ -7314,73 +7977,137 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
     v.screenSpaceEventHandler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
 
     // ダブルクリック: 選択中の面に垂直な視点へ flyTo
+    // 視点の計算は cmFaceFlyTarget が唯一の実装（DOM側の onDoubleClick と同じものを使う）。
+    // ここに式をコピーし直さないこと。2026-08-31までコピーが2つあり、
+    // 真上視点で中ボタンが効かなくなる不具合が両方に入っていた。
     handler.setInputAction(() => {
       const sel = cbRef.current._bldSelected;
       if (!sel) return;
       const blk = (cbRef.current._blds || [])[sel.entIdx];
       if (!blk) return;
-      const baseElev = v._siteBaseElevation || 0;
-
-      // 法線ベクトルを決定（solid面 or 通常面 or 上下面）
-      let nx = 0, ny = 0, nz = 0;
-      let cx, cy, cz;
-
-      if (sel._solidNormal && sel._faceCenterX != null) {
-        // solid面: _solidNormalを使用
-        const sn = sel._solidNormal;
-        const len = Math.sqrt(sn.nx**2 + sn.ny**2 + sn.nz**2) || 1;
-        nx = sn.nx/len; ny = sn.ny/len; nz = sn.nz/len;
-        cx = sel._faceCenterX; cy = sel._faceCenterY; cz = sel._faceCenterZ;
-      } else if (sel.face === 'zTop') {
-        // 上面: 真上から
-        nx = 0; ny = 0; nz = 1;
-        const pts = blk.points;
-        cx = pts.reduce((s,p)=>s+p.x,0)/pts.length;
-        cy = pts.reduce((s,p)=>s+p.y,0)/pts.length;
-        cz = (blk.zTop || 40);
-      } else if (sel.face === 'zBottom') {
-        // 底面: 真下から
-        nx = 0; ny = 0; nz = -1;
-        const pts = blk.points;
-        cx = pts.reduce((s,p)=>s+p.x,0)/pts.length;
-        cy = pts.reduce((s,p)=>s+p.y,0)/pts.length;
-        cz = (blk.zBottom || 0);
-      } else if (typeof sel.face === 'number') {
-        // 通常の側面: エッジから外向き法線を計算
-        const pts = blk.points, n = pts.length;
-        const fi = sel.face;
-        const p0 = pts[fi], p1 = pts[(fi+1)%n];
-        const ex = p1.x-p0.x, ey = p1.y-p0.y, elen = Math.sqrt(ex**2+ey**2) || 1;
-        let gnx = ey/elen, gny = -ex/elen;
-        const cx0 = pts.reduce((s,p)=>s+p.x,0)/n, cy0 = pts.reduce((s,p)=>s+p.y,0)/n;
-        const mx = (p0.x+p1.x)/2, my = (p0.y+p1.y)/2;
-        if ((mx-cx0)*gnx+(my-cy0)*gny < 0) { gnx=-gnx; gny=-gny; }
-        nx = gnx; ny = gny; nz = 0;
-        cx = mx; cy = my; cz = ((blk.zTop||40)+(blk.zBottom||0))/2;
-      } else { return; }
-
-      // 建屋サイズから視点距離を決定
-      const bldSize = Math.max(
-        (blk.pxMaxX||0)-(blk.pxMinX||0), (blk.pxMaxY||0)-(blk.pxMinY||0),
-        ((blk.zTop||40)-(blk.zBottom||0))/METERS_PER_PX
-      );
-      const dist = Math.max(80, bldSize * 1.8);
-
-      const camGX = cx + nx*dist, camGY = cy + ny*dist;
-      const camGZm = baseElev + (cz + nz*dist) * METERS_PER_PX;
-      const geo = gridToGeo(camGX, camGY);
-      const destination = Cesium.Cartesian3.fromDegrees(geo.lng, geo.lat, camGZm);
-
-      // heading: カメラが法線逆向きを向く
-      // グリッドX=東, グリッドY=南 → north=-ny
-      const heading = Math.atan2(-nx, ny);
-      const pitch = -Math.asin(Math.max(-1, Math.min(1, nz)));
-
-      v.camera.flyTo({ destination, orientation: { heading, pitch, roll: 0 }, duration: 1.0 });
+      cmFlyToFace(v, blk, sel, v._siteBaseElevation || 0);
     }, Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
 
     return () => { handler.destroy(); handlerRef.current = null; };
   }, [initDoneRef.current, pickOnEllipsoid]);
+
+  // ===== 床スラブ描画（建物内部 Phase A・buildingCore.js）=====
+  // 床は solid.faces に混ぜない（_rebuildAllWalls が非wall面を外周壁生成の
+  // 入力に使うため、混ぜると余計な壁が生える）。
+  // buildings(floors) から bcFloorSlabGeoms で毎回導出して独立エンティティで描く。
+  useEffect(() => {
+    const v = viewerRef.current;
+    if (!v || v.isDestroyed()) return;
+    (v._floorEntities || []).forEach(e => { if (e && v.entities.contains(e)) v.entities.remove(e); });
+    v._floorEntities = [];
+    const baseElev = v._siteBaseElevation || sharedBaseElev || 0;
+    // 押し出しボックスを1つ追加する共通ヘルパー（床・仕切り・扉・部屋で共用）
+    const addBox = (pts, zB, zT, material, outlineColor, info) => {
+      if (!pts || pts.length < 3) return;
+      const flat = pts.flatMap(p => { const geo = gridToGeo(p.x, p.y); return [geo.lng, geo.lat]; });
+      const ent = v.entities.add({
+        polygon: {
+          hierarchy: Cesium.Cartesian3.fromDegreesArray(flat),
+          height: baseElev + zB,
+          extrudedHeight: baseElev + zT,
+          material,
+          outline: !!outlineColor,
+          ...(outlineColor ? { outlineColor } : {}),
+        },
+        ...info,
+      });
+      v._floorEntities.push(ent);
+    };
+    (buildingsFull || []).forEach(bld => {
+      if (!bld.floors || bld.floors.length === 0) return;
+      // 床スラブ
+      bcFloorSlabGeoms(bld).forEach(g => {
+        g.polys.forEach(poly => {
+          addBox(poly.points, poly.zBottom, poly.zTop,
+            Cesium.Color.fromCssColorString('#8B9AAB').withAlpha(0.9),
+            Cesium.Color.fromCssColorString('#4B5563'),
+            { _floorInfo: { buildingId: bld.id, floorId: g.floorId } });
+        });
+      });
+      // 仕切り（壁=不透明・透明仕切り=見た目だけ透明。機能は同一: spec 7.2）
+      // ＋扉（壁面上の色分け矩形）＋部屋オーバーレイ（認識結果の可視化）
+      for (const floor of bld.floors) {
+        bcPartitionGeoms(bld, floor).forEach(g => {
+          const isClear = g.part.kind === 'clear';
+          addBox(g.poly, g.zB, g.zT,
+            Cesium.Color.fromCssColorString(g.part.color || (isClear ? '#7DD3FC' : '#C8CFDA')).withAlpha(isClear ? 0.15 : 0.95),
+            Cesium.Color.fromCssColorString(isClear ? '#38BDF8' : '#6B7280'),
+            { _partitionInfo: { buildingId: bld.id, floorId: floor.id, partId: g.part.id } });
+        });
+        bcDoorGeoms(bld, floor).forEach(g => {
+          addBox(g.poly, g.zB, g.zT,
+            Cesium.Color.fromCssColorString('#B45309').withAlpha(0.9),
+            Cesium.Color.fromCssColorString('#78350F'),
+            { _doorInfo: { buildingId: bld.id, floorId: floor.id, doorId: g.door.id } });
+        });
+        // 部屋: 仕切りが1枚以上ある階だけ描く（仕切りゼロで全床が1部屋色に塗られるのを避ける）
+        if ((floor.partitions || []).length > 0) {
+          bcDeriveRooms(bld, floor, plantNorthAngle).forEach(room => {
+            room.cells.forEach(c => {
+              addBox(
+                c.corners, // PN回転後は軸平行でないため4隅頂点をそのまま使う
+                floor.levelZ + 0.03, floor.levelZ + 0.06,
+                Cesium.Color.fromCssColorString(room.color).withAlpha(0.35),
+                null,
+                { _roomInfo: { buildingId: bld.id, floorId: floor.id, roomKey: room.key } });
+            });
+          });
+        }
+      }
+    });
+    v.scene.requestRender();
+  }, [buildingsFull, mode, localBaseElev, sharedBaseElev]);
+
+  // ===== 壁追加モード（建物内部 Phase B）=====
+  // 床上を2点クリック → 軸平行スナップして仕切りを作成。右クリックで終了。
+  // クリック→グリッド座標変換は建屋追加モードと同じレイ・平面交点方式
+  useEffect(() => {
+    const v = viewerRef.current;
+    if (!v || v.isDestroyed() || !wallAddMode) return;
+    const handler = new Cesium.ScreenSpaceEventHandler(v.scene.canvas);
+    const pickGrid = (pos) => {
+      const ray = v.camera.getPickRay(pos);
+      if (!ray) return null;
+      const baseElev = v._siteBaseElevation || 0;
+      // クリック平面は対象階の床標高に置く（床の上をなぞって引けるように）
+      const bld = (buildingsFull || []).find(b => b.id === wallAddMode.buildingId);
+      const floor = bld && (bld.floors || []).find(f => f.id === wallAddMode.floorId);
+      const planeZ = baseElev + (floor ? floor.levelZ : 0);
+      const _cg = gridToGeo(TW / 2, TH / 2);
+      const _cc = Cesium.Cartesian3.fromDegrees(_cg.lng, _cg.lat, planeZ);
+      const _n = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(_cc);
+      const _plane = Cesium.Plane.fromPointNormal(_cc, _n);
+      const _hit = Cesium.IntersectionTests.rayPlane(ray, _plane);
+      if (!_hit) return null;
+      const c = Cesium.Cartographic.fromCartesian(_hit);
+      const g = geoToGrid(Cesium.Math.toDegrees(c.latitude), Cesium.Math.toDegrees(c.longitude));
+      return { x: g.x, y: g.y };
+    };
+    handler.setInputAction((click) => {
+      const wm = wallAddModeRef.current;
+      if (!wm) return;
+      const p = pickGrid(click.position);
+      if (!p) return;
+      if (wm.pts.length === 0) {
+        setWallAddMode({ ...wm, pts: [p] });
+      } else {
+        const a = wm.pts[0];
+        // 軸平行スナップ: 大きい変位の軸に沿わせる
+        const b = Math.abs(p.x - a.x) >= Math.abs(p.y - a.y) ? { x: p.x, y: a.y } : { x: a.x, y: p.y };
+        const err = onAddPartition ? onAddPartition(wm.buildingId, wm.floorId, a, b, wm.kind) : '未接続';
+        setFloorMsg(err);
+        // 連続して引けるようptsだけリセットしてモード維持
+        setWallAddMode({ ...wm, pts: [] });
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    handler.setInputAction(() => { setWallAddMode(null); setFloorMsg(null); }, Cesium.ScreenSpaceEventType.RIGHT_CLICK);
+    return () => handler.destroy();
+  }, [wallAddMode, buildingsFull, onAddPartition]);
 
   return (
     <div ref={gizmoContRef} style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -7392,50 +8119,39 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
             const gc = 40, cs = 12, arL = 24;
             const { h, p } = cubeOrient;
             const pnR = (typeof plantNorthAngle === 'number' ? plantNorthAngle : 0) * Math.PI / 180;
-            // Plant(a=X, b=Y=PN方向, c=Z) → スクリーン投影
-            const proj = (a, b, c) => {
-              const e = a * Math.cos(pnR) + b * Math.sin(pnR);
-              const n = -a * Math.sin(pnR) + b * Math.cos(pnR);
-              const u = c;
-              const ch = Math.cos(h), sh = Math.sin(h);
-              const cp = Math.cos(p), sp = Math.sin(p);
-              return {
-                sx: gc + (e * ch - n * sh) * cs,
-                sy: gc + (e * sh * sp + n * ch * sp - u * cp) * cs,
-                depth: e * sh * cp + n * ch * cp + u * sp,
-              };
-            };
-            const verts = [
-              proj(-1,-1,-1), proj(+1,-1,-1), proj(-1,+1,-1), proj(+1,+1,-1),
-              proj(-1,-1,+1), proj(+1,-1,+1), proj(-1,+1,+1), proj(+1,+1,+1),
-            ];
-            const faceDefs = [
-              { vi:[1,3,7,5], bright:'#EF4444', dark:'#991B1B', label:'X'  },
-              { vi:[0,4,6,2], bright:'#7F1D1D', dark:'#450A0A', label:'-X' },
-              { vi:[2,3,7,6], bright:'#22C55E', dark:'#14532D', label:'PN' },
-              { vi:[0,1,5,4], bright:'#166534', dark:'#052E16', label:'-PN'},
-              { vi:[4,5,7,6], bright:'#3B82F6', dark:'#1E3A8A', label:'Z'  },
-              { vi:[0,1,3,2], bright:'#1E3A8A', dark:'#0F172A', label:'-Z' },
-            ];
-            const faces = faceDefs.map(f => ({
-              ...f,
-              depth: f.vi.reduce((s,i) => s + verts[i].depth, 0) / 4,
-              pts: f.vi.map(i => `${verts[i].sx.toFixed(1)},${verts[i].sy.toFixed(1)}`).join(' '),
-              cxF: f.vi.reduce((s,i) => s + verts[i].sx, 0) / 4,
-              cyF: f.vi.reduce((s,i) => s + verts[i].sy, 0) / 4,
-            })).sort((a,b) => b.depth - a.depth);
-            const minD = Math.min(...faces.map(f => f.depth));
-            const maxD = Math.max(...faces.map(f => f.depth));
-            const midD = (minD + maxD) / 2;
-            // 軸方向（スクリーン）
-            const nrm = (dx,dy) => { const l = Math.sqrt(dx*dx+dy*dy) || 1; return [dx/l, dy/l]; };
-            const po = proj(0,0,0), px = proj(1,0,0), py = proj(0,1,0), pz = proj(0,0,1);
-            // 真北 N: ENU(0,1,0) → Plant(-sin(pnR), cos(pnR), 0)
-            const pNorth = proj(-Math.sin(pnR), Math.cos(pnR), 0);
-            const [ax,ay] = nrm(px.sx - po.sx, px.sy - po.sy);
-            const [bx,by] = nrm(py.sx - po.sx, py.sy - po.sy);
-            const [zx,zy] = nrm(pz.sx - po.sx, pz.sy - po.sy);
-            const [nxN,nyN] = nrm(pNorth.sx - po.sx, pNorth.sy - po.sy);
+            // ══ 幾何は orientationCubeCore.js（唯一の実装）へ寄せた・2026-09-01 ══
+            // ここは4つ目の重複だった（App.jsxの4ビュー / OrientationCube.jsx / ここ）。
+            // 【引数変換】この画面は heading/pitch、コアは az/el。採用は **(−pn, +heading, pitch)**。
+            //
+            // 【旧実装は左右が逆だった・2026-09-01 ユーザー実機報告】
+            //   「2D/3Dどちらもキューブの左右の動きが逆」。他ビュー（App.jsx側）は正常。
+            //   切り分け: **キューブをドラッグせず**中ボタン等でカメラを回しても逆
+            //   → ドラッグ側（newH = startH − dx·sens）ではなく**描画側の符号**が原因と確定。
+            //
+            //   移植そのものは忠実だった（checks/cube_parity4_selfcheck.cjs）:
+            //     ①手写しは git HEAD の原文と同値（72/72）
+            //     ②(−pn, −heading, pitch) なら旧実装と頂点960/960・4方向160/160一致
+            //   つまり**旧実装が元から逆**で、忠実に移すとバグごと引き継ぐ状態だった。
+            //
+            // 【なぜ符号1つで直るのか】heading=0 では ±0 で同じ絵になり、
+            //   回すほど左右が開いていく。報告された「左右の"動き"が逆」と正確に一致する。
+            //   静止時の見た目（面の並び・矢印の位置）は変わらない。
+            //   ※ここは旧実装と**意図的に挙動を変えている**。cube_parity4 の
+            //     「(−pn,−heading,pitch) で960/960一致」は"旧実装の記録"であって、正ではない。
+            // 【明暗】コアの深さ規約は「大きいほど手前」。以前ここは `depth < midD` で
+            //   判定していたが、規約が逆になるので **必ず ocIsNear を使う**（自前で書き直さない）。
+            //   実測の差は引き分け5件のみで、いずれも面が真横＝画面上の面積0なので見た目に影響しない。
+            // 【並び順】コアの faces は既に奥→手前。ここで sort し直さない。
+            const _cc = ocCubeFaces(-pnR, h, p, gc, cs);
+            const midD = _cc.midD;
+            // 下のJSXが使っている名前（bright/dark/cxF/cyF）へ合わせるだけの詰め替え
+            const faces = _cc.faces.map(f => ({ ...f, bright: f.b, dark: f.dk, cxF: f.cx, cyF: f.cy }));
+            // 軸方向（スクリーン）。真北の式もコアが持つ（Cesium版が正だったのでそちらに揃えてある）
+            const _cd = ocAxisDirs(-pnR, h, p);
+            const [ax,ay] = _cd.x;
+            const [bx,by] = _cd.pn;
+            const [zx,zy] = _cd.z;
+            const [nxN,nyN] = _cd.n;
             const arrHead = (dx,dy,col) => {
               const hx = gc + dx, hy = gc + dy;
               const l = Math.sqrt(dx*dx+dy*dy) || 1, ux = dx/l, uy = dy/l;
@@ -7460,8 +8176,8 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
               >
                 {faces.map((f,i) => (
                   <g key={i}>
-                    <polygon points={f.pts} fill={f.depth < midD ? f.bright : f.dark} stroke="rgba(0,0,0,0.4)" strokeWidth={0.7} opacity={0.9} />
-                    {f.label && f.depth < midD && (
+                    <polygon points={f.pts} fill={ocIsNear(f.depth, midD) ? f.bright : f.dark} stroke="rgba(0,0,0,0.4)" strokeWidth={0.7} opacity={0.9} />
+                    {f.label && ocIsNear(f.depth, midD) && (
                       <text x={f.cxF} y={f.cyF} fill="#FFF" fontSize={7} textAnchor="middle" dominantBaseline="middle" fontWeight="700">{f.label}</text>
                     )}
                   </g>
@@ -8364,54 +9080,13 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
         };
 
         // ── 選択中の面に垂直な視点へ flyTo ──
+        // 視点の計算は cmFaceFlyTarget が唯一の実装（canvas の LEFT_DOUBLE_CLICK と同じものを使う）
         const flyToSelectedFace = () => {
           const v = viewerRef.current;
           if (!v || v.isDestroyed() || !bldSelected) return;
           const blk = (blds || [])[bldSelected.entIdx];
           if (!blk) return;
-          const baseElev = v._siteBaseElevation || 0;
-          let nx = 0, ny = 0, nz = 0, cx, cy, cz;
-          if (bldSelected._solidNormal && bldSelected._faceCenterX != null) {
-            const sn = bldSelected._solidNormal;
-            const len = Math.sqrt(sn.nx**2 + sn.ny**2 + sn.nz**2) || 1;
-            nx = sn.nx/len; ny = sn.ny/len; nz = sn.nz/len;
-            cx = bldSelected._faceCenterX; cy = bldSelected._faceCenterY; cz = bldSelected._faceCenterZ;
-          } else if (bldSelected.face === 'zTop') {
-            nx = 0; ny = 0; nz = 1;
-            const pts = blk.points;
-            cx = pts.reduce((s,p)=>s+p.x,0)/pts.length;
-            cy = pts.reduce((s,p)=>s+p.y,0)/pts.length;
-            cz = (blk.zTop || 40);
-          } else if (bldSelected.face === 'zBottom') {
-            nx = 0; ny = 0; nz = -1;
-            const pts = blk.points;
-            cx = pts.reduce((s,p)=>s+p.x,0)/pts.length;
-            cy = pts.reduce((s,p)=>s+p.y,0)/pts.length;
-            cz = (blk.zBottom || 0);
-          } else if (typeof bldSelected.face === 'number') {
-            const pts = blk.points, n = pts.length;
-            const fi = bldSelected.face;
-            const p0 = pts[fi], p1 = pts[(fi+1)%n];
-            const ex = p1.x-p0.x, ey = p1.y-p0.y, elen = Math.sqrt(ex**2+ey**2) || 1;
-            let gnx = ey/elen, gny = -ex/elen;
-            const cx0 = pts.reduce((s,p)=>s+p.x,0)/n, cy0 = pts.reduce((s,p)=>s+p.y,0)/n;
-            const mx = (p0.x+p1.x)/2, my = (p0.y+p1.y)/2;
-            if ((mx-cx0)*gnx+(my-cy0)*gny < 0) { gnx=-gnx; gny=-gny; }
-            nx = gnx; ny = gny; nz = 0;
-            cx = mx; cy = my; cz = ((blk.zTop||40)+(blk.zBottom||0))/2;
-          } else { return; }
-          const bldSize = Math.max(
-            (blk.pxMaxX||0)-(blk.pxMinX||0), (blk.pxMaxY||0)-(blk.pxMinY||0),
-            ((blk.zTop||40)-(blk.zBottom||0))/METERS_PER_PX
-          );
-          const dist = Math.max(80, bldSize * 1.8);
-          const camGX = cx + nx*dist, camGY = cy + ny*dist;
-          const camGZm = baseElev + (cz + nz*dist) * METERS_PER_PX;
-          const geo = gridToGeo(camGX, camGY);
-          const destination = Cesium.Cartesian3.fromDegrees(geo.lng, geo.lat, camGZm);
-          const heading = Math.atan2(-nx, ny);
-          const pitch = -Math.asin(Math.max(-1, Math.min(1, nz)));
-          v.camera.flyTo({ destination, orientation: { heading, pitch, roll: 0 }, duration: 1.0 });
+          cmFlyToFace(v, blk, bldSelected, v._siteBaseElevation || 0);
         };
 
         // 入力フォームのスタイル
@@ -9967,7 +10642,125 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
         const blk = _blds[bldSelected.entIdx];
         const zT = blk ? (blk.zTop != null ? blk.zTop : blk.height) : '?';
         const zB = blk ? (blk.zBottom || 0) : '?';
+        // ===== 階パネル（建物内部 Phase A）: 選択中構造体の階の一覧・追加・削除 =====
+        const _floorBld = (buildingsFull || []).find(b => b.id === (blk && blk.buildingId));
+        const _floors = _floorBld ? bcSortedFloors(_floorBld) : [];
         return (
+          <>
+          {floorPanelOpen && _floorBld && (
+            <div style={{
+              position: 'absolute', bottom: 58, left: 4, width: 300, maxHeight: 220, overflowY: 'auto',
+              background: 'rgba(30,41,59,0.92)', color: '#fff',
+              fontSize: 11, padding: '6px 8px', borderRadius: 3,
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                <b>{_floorBld.label} の階</b>
+                <label style={{ cursor: 'pointer', fontSize: 10 }}>
+                  <input type="checkbox" checked={!!floorFollow}
+                    onChange={() => { if (onToggleFloorFollow) onToggleFloorFollow(); }}
+                    style={{ verticalAlign: 'middle', marginRight: 3 }} />
+                  変形に追従
+                </label>
+              </div>
+              {_floors.length === 0 && <div style={{ opacity: 0.7 }}>階はまだありません</div>}
+              {_floors.map(f => {
+                const _parts = f.partitions || [];
+                const _doors = f.doors || [];
+                const _rooms = _parts.length > 0 ? bcDeriveRooms(_floorBld, f, plantNorthAngle) : [];
+                const _wam = wallAddMode && wallAddMode.floorId === f.id ? wallAddMode : null;
+                return (
+                <div key={f.id} style={{ marginBottom: 4, borderBottom: '1px solid rgba(255,255,255,0.12)', paddingBottom: 3 }}>
+                <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 2 }}>
+                  <span style={{ width: 34 }}>{bcFloorLabel(_floorBld, f)}</span>
+                  <span>床標高</span>
+                  <input type="number" step="0.1" defaultValue={f.levelZ}
+                    onBlur={(e) => {
+                      const nv = parseFloat(e.target.value);
+                      if (!isFinite(nv) || nv === f.levelZ) return;
+                      const err = onUpdateFloor ? onUpdateFloor(_floorBld.id, f.id, { levelZ: nv }) : null;
+                      setFloorMsg(err); if (err) e.target.value = f.levelZ;
+                    }}
+                    style={{ width: 48, fontSize: 10 }} />
+                  <span>階高</span>
+                  <input type="number" step="0.1" defaultValue={f.heightM}
+                    onBlur={(e) => {
+                      const nv = parseFloat(e.target.value);
+                      if (!isFinite(nv) || nv <= 0 || nv === f.heightM) return;
+                      const err = onUpdateFloor ? onUpdateFloor(_floorBld.id, f.id, { heightM: nv }) : null;
+                      setFloorMsg(err);
+                    }}
+                    style={{ width: 42, fontSize: 10 }} />
+                  <button onClick={() => { if (onDeleteFloor) onDeleteFloor(_floorBld.id, f.id); setFloorMsg(null); }}
+                    style={{ background: 'rgba(239,68,68,0.8)', color: '#fff', border: 'none', borderRadius: 2, padding: '0 5px', cursor: 'pointer', fontSize: 10 }}>×</button>
+                </div>
+                {/* Phase B: 壁・透明仕切りの追加と一覧、部屋数 */}
+                <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginLeft: 34, marginBottom: 2 }}>
+                  <button onClick={() => { setWallAddMode(_wam && _wam.kind === 'wall' ? null : { buildingId: _floorBld.id, floorId: f.id, kind: 'wall', pts: [] }); setFloorMsg(null); }}
+                    style={{ background: _wam && _wam.kind === 'wall' ? 'rgba(0,180,255,0.9)' : 'rgba(255,255,255,0.25)', color: '#fff', border: 'none', borderRadius: 2, padding: '0 6px', cursor: 'pointer', fontSize: 10 }}>壁＋</button>
+                  <button onClick={() => { setWallAddMode(_wam && _wam.kind === 'clear' ? null : { buildingId: _floorBld.id, floorId: f.id, kind: 'clear', pts: [] }); setFloorMsg(null); }}
+                    style={{ background: _wam && _wam.kind === 'clear' ? 'rgba(0,180,255,0.9)' : 'rgba(255,255,255,0.25)', color: '#fff', border: 'none', borderRadius: 2, padding: '0 6px', cursor: 'pointer', fontSize: 10 }}>透明仕切り＋</button>
+                  {_parts.length > 0 && <span style={{ opacity: 0.85 }}>部屋: {_rooms.length}</span>}
+                </div>
+                {_wam && (
+                  <div style={{ marginLeft: 34, color: '#7DD3FC', marginBottom: 2 }}>
+                    床上を2点クリックで{_wam.kind === 'wall' ? '壁' : '透明仕切り'}を作成（軸平行スナップ・右クリックで終了）
+                    {_wam.pts.length === 1 && ' — 始点OK、終点をクリック'}
+                  </div>
+                )}
+                {_parts.map((p, pi) => (
+                  <div key={p.id} style={{ display: 'flex', gap: 4, alignItems: 'center', marginLeft: 34, marginBottom: 1 }}>
+                    <span style={{ width: 84 }}>{p.kind === 'wall' ? '壁' : '透明仕切り'} {pi + 1}（{bcPartitionLenM(p).toFixed(1)}m）</span>
+                    <button title="壁⇔透明仕切りを切替（透明にするとその仕切りの扉は消えます）"
+                      onClick={() => { if (onUpdatePartition) onUpdatePartition(_floorBld.id, f.id, p.id, { kind: p.kind === 'wall' ? 'clear' : 'wall' }); }}
+                      style={{ background: 'rgba(255,255,255,0.25)', color: '#fff', border: 'none', borderRadius: 2, padding: '0 5px', cursor: 'pointer', fontSize: 10 }}>⇄</button>
+                    {p.kind === 'wall' && (
+                      <button title="この壁の中央に扉を追加"
+                        onClick={() => { const err = onAddDoor ? onAddDoor(_floorBld.id, f.id, p.id) : '未接続'; setFloorMsg(err); }}
+                        style={{ background: 'rgba(180,83,9,0.85)', color: '#fff', border: 'none', borderRadius: 2, padding: '0 5px', cursor: 'pointer', fontSize: 10 }}>扉＋</button>
+                    )}
+                    <span style={{ opacity: 0.75 }}>扉{_doors.filter(d => d.partitionId === p.id).length}</span>
+                    <button onClick={() => { if (onDeletePartition) onDeletePartition(_floorBld.id, f.id, p.id); }}
+                      style={{ background: 'rgba(239,68,68,0.8)', color: '#fff', border: 'none', borderRadius: 2, padding: '0 5px', cursor: 'pointer', fontSize: 10 }}>×</button>
+                  </div>
+                ))}
+                {_doors.map((d, di) => (
+                  <div key={d.id} style={{ display: 'flex', gap: 4, alignItems: 'center', marginLeft: 46, marginBottom: 1, opacity: 0.9 }}>
+                    <span style={{ width: 96 }}>扉 {di + 1}（幅{d.widthM}m）</span>
+                    <span>位置</span>
+                    <input type="number" step="0.1" defaultValue={d.uM.toFixed(1)}
+                      onBlur={(e) => {
+                        const nv = parseFloat(e.target.value);
+                        if (!isFinite(nv)) return;
+                        const nd = (f.doors || []).map(x => x.id === d.id ? { ...x, uM: nv } : x);
+                        if (onUpdateFloor) onUpdateFloor(_floorBld.id, f.id, { doors: nd });
+                      }}
+                      style={{ width: 44, fontSize: 10 }} />
+                    <span>m</span>
+                    <button onClick={() => { if (onDeleteDoor) onDeleteDoor(_floorBld.id, f.id, d.id); }}
+                      style={{ background: 'rgba(239,68,68,0.8)', color: '#fff', border: 'none', borderRadius: 2, padding: '0 5px', cursor: 'pointer', fontSize: 10 }}>×</button>
+                  </div>
+                ))}
+                </div>
+                );
+              })}
+              <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginTop: 5, borderTop: '1px solid rgba(255,255,255,0.25)', paddingTop: 4 }}>
+                <span>床標高</span>
+                <input type="number" step="0.1" value={floorAddZ}
+                  onChange={(e) => setFloorAddZ(e.target.value)} style={{ width: 48, fontSize: 10 }} />
+                <span>階高</span>
+                <input type="number" step="0.1" value={floorAddH}
+                  onChange={(e) => setFloorAddH(e.target.value)} style={{ width: 42, fontSize: 10 }} />
+                <button onClick={() => {
+                  const z = parseFloat(floorAddZ), h = parseFloat(floorAddH);
+                  if (!isFinite(z) || !isFinite(h) || h <= 0) { setFloorMsg('数値を入力してください'); return; }
+                  const err = onAddFloor ? onAddFloor(_floorBld.id, z, h) : '未接続';
+                  setFloorMsg(err);
+                  if (!err) setFloorAddZ(String(Math.round((z + h) * 10) / 10)); // 次の階の床標高を先回り入力
+                }} style={{ background: 'rgba(0,180,255,0.8)', color: '#fff', border: 'none', borderRadius: 2, padding: '1px 8px', cursor: 'pointer', fontSize: 10 }}>階を追加</button>
+              </div>
+              {floorMsg && <div style={{ color: '#FCA5A5', marginTop: 3 }}>{floorMsg}</div>}
+            </div>
+          )}
           <div style={{
             position: 'absolute', bottom: 30, left: 4, right: 4,
             background: 'rgba(59,130,246,0.85)', color: '#fff',
@@ -9977,6 +10770,13 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
             <span>{bldSelected.label} | 高さ:{zB}～{zT}m | 面:{
               bldSelected.face === 'zTop' ? '上' : bldSelected.face === 'zBottom' ? '下' : `辺${bldSelected.face}`
             } (矢印をドラッグで移動)</span>
+            <span style={{ display: 'flex', gap: 4 }}>
+            {_floorBld && (
+              <button onClick={() => { setFloorPanelOpen(o => !o); setFloorMsg(null); }} style={{
+                background: floorPanelOpen ? 'rgba(0,180,255,0.9)' : 'rgba(255,255,255,0.3)', color: '#fff', border: 'none',
+                borderRadius: 2, padding: '1px 6px', cursor: 'pointer', fontSize: 10,
+              }}>階 ({(_floorBld.floors || []).length})</button>
+            )}
             <button onClick={() => {
               setBldSelected(null);
               const v = viewerRef.current;
@@ -9994,7 +10794,9 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
               background: 'rgba(255,255,255,0.3)', color: '#fff', border: 'none',
               borderRadius: 2, padding: '1px 6px', cursor: 'pointer', fontSize: 10,
             }}>解除</button>
+            </span>
           </div>
+          </>
         );
       })()}
       {/* 座標バー */}
@@ -10043,13 +10845,44 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
                 cursor: 'pointer', fontSize: 11, fontFamily: 'sans-serif',
               }}
             >構造体追加</button>
+            {onOpenBuildingEditor && (
+              <button onClick={() => onOpenBuildingEditor()} style={{
+                background: 'rgba(99,102,241,0.85)', color: '#fff',
+                border: 'none', borderRadius: 2, padding: '1px 8px',
+                cursor: 'pointer', fontSize: 11, fontFamily: 'sans-serif',
+              }}>建物エディタ</button>
+            )}
+            {/* 建物内部 Phase A: 建物データのjson保存/読込（spec 7.6） */}
+            {onExportBuildings && (
+              <button onClick={() => onExportBuildings()} style={{
+                background: 'rgba(16,185,129,0.7)', color: '#fff',
+                border: 'none', borderRadius: 2, padding: '1px 8px',
+                cursor: 'pointer', fontSize: 11, fontFamily: 'sans-serif',
+              }}>建物保存</button>
+            )}
+            {onImportBuildings && (
+              <button onClick={() => { if (bldImportInputRef.current) bldImportInputRef.current.click(); }} style={{
+                background: 'rgba(16,185,129,0.7)', color: '#fff',
+                border: 'none', borderRadius: 2, padding: '1px 8px',
+                cursor: 'pointer', fontSize: 11, fontFamily: 'sans-serif',
+              }}>建物読込</button>
+            )}
+            <input ref={bldImportInputRef} type="file" accept=".json,application/json" style={{ display: 'none' }}
+              onChange={(e) => {
+                const f = e.target.files && e.target.files[0];
+                if (!f) return;
+                const reader = new FileReader();
+                reader.onload = () => {
+                  const err = onImportBuildings ? onImportBuildings(String(reader.result)) : '未接続';
+                  if (err) console.warn('[BLD_IMPORT] ' + err);
+                };
+                reader.readAsText(f);
+                e.target.value = '';
+              }} />
             {getSavedFieldPolygon() && (
               <button
                 onClick={() => {
-                  localStorage.removeItem('field_polygon');
-                  localStorage.removeItem('geo_origin');
-                  try { localStorage.removeItem(getElevCacheKey()); } catch (_) {}
-                  location.reload();
+                  clearFieldPolygon();
                 }}
                 style={{
                   background: 'rgba(239,68,68,0.7)', color: '#fff',

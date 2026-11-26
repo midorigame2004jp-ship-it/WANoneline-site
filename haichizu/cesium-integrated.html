@@ -17,8 +17,18 @@
 <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
 
+<!-- 診断ツール（常時は無効。必要になったらコメントを外す。Reactより後・アプリ本体より前）
+     nan-probe.js  : SVG座標にNaNが入った瞬間に key と発生源を出す
+     panel-perf.js : 配電盤描画とrAFのコスト計測（__PANEL_PERF__ / __RAF_PERF__）
+<script src="nan-probe.js"></script>
+<script src="panel-perf.js"></script>
+-->
+
 <!-- Babel Standalone (JSX変換) -->
 <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+<!-- 起動時の変換結果を貯めておく（2回目以降は Babel を通さない）・2026-10-18。
+     入口HTMLは2つあるので、中身は共有ファイル1つに置く -->
+<script src="bootCache.js"></script>
 
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -60,55 +70,168 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 // ?solo=<winId> で指定した FloatWin だけをフルスクリーン表示するモード
 window.SOLO_WIN = new URLSearchParams(location.search).get('solo') || '';
 
+// 読み込んだコードから import / export を「構文として」落とす（正規表現だと文字列やコメントで壊れる）。
+// 連結して1つのスコープで実行するローダーなので、モジュール構文は残せない。
+// ※ 入口HTMLは2つある（cesium-integrated.html / floating-three-view_3Dmap.html）。片方だけ直さないこと。
+// 同時に、そのファイルがトップレベルで宣言した名前を集める（名前の重複検出と、モデルの公開に使う）
+function stripModuleSyntax(code, filename) {
+  const names = [];
+  const stripPlugin = () => ({
+    visitor: {
+      Program(p) {
+        p.node.body.forEach(node => {
+          const d = node.type === 'ExportNamedDeclaration' ? node.declaration : node;
+          if (!d) return;
+          if (d.type === 'VariableDeclaration') d.declarations.forEach(v => { if (v.id?.name) names.push(v.id.name); });
+          else if ((d.type === 'FunctionDeclaration' || d.type === 'ClassDeclaration') && d.id) names.push(d.id.name);
+        });
+      },
+      ImportDeclaration(p) { p.remove(); },
+      ExportNamedDeclaration(p) { if (p.node.declaration) p.replaceWith(p.node.declaration); else p.remove(); },
+      ExportDefaultDeclaration(p) {
+        const d = p.node.declaration;
+        if (d && (d.type === 'FunctionDeclaration' || d.type === 'ClassDeclaration') && d.id) p.replaceWith(d);
+        else p.remove();
+      },
+      ExportAllDeclaration(p) { p.remove(); },
+    },
+  });
+  const out = Babel.transform(code, {
+    plugins: [stripPlugin],
+    presets: ['react'],   // .jsx も解析できるようにする（後段の変換は済んだコードには何もしない）
+    sourceType: 'module',
+    filename: filename || 'file.js',
+    compact: false,
+  }).code;
+  return { code: out, names };
+}
+
+// 全ファイルを1つのスコープへ連結するので、同じ名前の宣言が2つあると実行時に落ちる。
+// 連結前に名前の重複を見つけて、どのファイル同士かを出す。
+function reportDuplicateNames(nameMap) {
+  const seen = new Map(), dups = [];
+  for (const [file, names] of nameMap) {
+    for (const n of names) {
+      if (seen.has(n)) dups.push(`${n}: ${seen.get(n)} と ${file}`);
+      else seen.set(n, file);
+    }
+  }
+  window.__loaderDuplicateNames = dups;
+  if (dups.length) console.error('[loader] 宣言名の重複:', dups);
+  return dups;
+}
+
 // 分割ファイルを順番に読み込み・結合してBabel変換・実行
 async function loadApp() {
   const srcFiles = [
+    // 機器モデル（jsx/src/models・全モジュール共通の唯一のスキーマ。server.js の /models/ から配る）
+    'models/equipmentMaster.js',
+    'models/equipmentRecord.js',
+    'models/connectionSchema.js',
     'src/constants.js',
+    'src/snapGate.js',
     'solidModel.js',
+    // ソリッドの組み立て（プリミティブ＋ブーリアン）。manifold(WASM) を動的に読む（2026-09-26）
+    'csgCore.js',
+    'src/buildingCore.js',
     'src/geometry.js',
     'src/panel/panelChambers.js',
     'src/panel/panelSolid.js',
     'src/panel/panelDrawCore.js',
+    'src/panel/boxDrawOrder.js',
+    'src/panel/panelPlacementCore.js',
+    'src/panel/panelPaintCore.js',
+    'src/panel/panelGeometry.js',
+    'src/buildingDrawCore.js',
+    'src/panel/orientationCubeCore.js',
+    'src/panel/OrientationCube.jsx',
+    'src/panel/BuildingPreview3D.jsx',
+    'src/panel/BuildingEditor.jsx',
+    // 立体エディタ（プリミティブを組み合わせて形を作る・2026-09-27）
+    'src/panel/BodyEditor.jsx',
     'src/terrain.js',
+    'src/terrainGL.js',
+    'src/gsiTiles.js',
     'src/cesiumUtils.js',
     'src/mapPosStore.js',
     'src/FloatWin.jsx',
     'src/CesiumMap.jsx',
+    'src/GsiMap.jsx', 'src/ZenodoPanel.jsx',
     'App.jsx',
   ];
 
   try {
-    const ts = Date.now();
     let combined = `const { useState, useRef, useCallback, useEffect, useMemo, useLayoutEffect } = React;\n`;
+    const nameMap = [];        // [ファイル名, そのファイルがトップレベルで宣言した名前]
+    const modelNames = [];     // 機器モデルが宣言した名前
 
-    for (const f of srcFiles) {
-      const res = await fetch(f + '?t=' + ts);
+    // 【並列で取る・2026-10-18 実測】直列だと1ファイルごとの往復がそのまま足し算になり、
+    //   28ファイルで約1.8秒かかっていた（1ファイルの転送自体は数ミリ秒）。
+    //   結合する順番は srcFiles のままでなければならないので、**取得だけ**並列にして
+    //   組み立ては順番どおりに回す。
+    // 【?t=<毎回違う数> をやめた】URL が毎回変わるとブラウザのキャッシュが一度も効かない。
+    //   サーバーは .js/.jsx に Cache-Control: no-cache ＋ ETag を返すので、
+    //   **毎回必ず検証はするが、変わっていなければ本文は送られない**（304）。
+    //   編集したファイルはその場で新しいものが来る（開発中の取りこぼしは起きない）。
+    // 【起動の内訳を残す・2026-10-18】「遅い」と言われたときに取得・変換・実行・描画の
+    //   どれが効いているかを測り直さずに出せるようにする（window.__bootTimes）
+    const _bt = { 開始: Math.round(performance.now()) };
+    const _t取得 = performance.now();
+    const texts = await Promise.all(srcFiles.map(async (f) => {
+      const res = await fetch(f);
       if (!res.ok) throw new Error(`Failed to load ${f}: ${res.status}`);
-      let code = await res.text();
-      // react import を削除（グローバルから使うため）
-      code = code.replace(/^import\s+\{[^}]+\}\s+from\s+["']react["'];?\s*\n?/gm, '');
-      combined += `\n// ===== ${f} =====\n` + code + '\n';
+      return res.text();
+    }));
+    _bt.取得 = Math.round(performance.now() - _t取得);
+
+    // 【貯めてあるなら組み立てごと飛ばす・2026-10-18】strip は1ファイルごとに Babel を呼ぶ
+    const _結果 = await bootBuild(texts, () => {
+    for (let i = 0; i < srcFiles.length; i++) {
+      const f = srcFiles[i];
+      let code = texts[i];
+      // App.jsx の既定エクスポートだけ先に window.App へ変換してから、残りの import/export を構文で落とす
+      code = code.replace('export default function App()', 'window.App = function App()');
+      const stripped = stripModuleSyntax(code, f);
+      nameMap.push([f, stripped.names]);
+      if (f.startsWith('models/')) modelNames.push(...stripped.names);
+      combined += `\n// ===== ${f} =====\n` + stripped.code + '\n';
+    }
+    reportDuplicateNames(nameMap);
+    // 機器モデルの名前は window にも出す（入口によって script 実行 / eval 実行で見え方が変わるため）
+    if (modelNames.length) {
+      combined += `\nwindow.__models = { ${modelNames.join(', ')} };\n`;
+      combined += modelNames.map(n => `window.${n} = ${n};`).join('\n') + '\n';
     }
 
-    // export default → window.App（App.jsx側で変換済みだが念のため）
-    combined = combined.replace('export default function App()', 'window.App = function App()');
-
-    // Babel でJSX変換
-    const transformed = Babel.transform(combined, {
-      presets: ['react'],
-      filename: 'app.jsx',
-    }).code;
+      return combined;
+    }, Babel);
+    const transformed = _結果.code;
+    _bt.組み立て = _結果.組み立てms;
+    _bt.変換 = _結果.変換ms;
+    _bt.貯め読み = _結果.貯め読みms;
+    _bt.貯めから = _結果.貯めから;
+    _bt.文字数 = transformed.length;
 
     // 実行
+    const _t実行 = performance.now();
     const script = document.createElement('script');
     script.textContent = transformed;
     document.body.appendChild(script);
+    _bt.実行 = Math.round(performance.now() - _t実行);
 
     // Reactアプリをマウント
+    const _t描画 = performance.now();
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(React.createElement(window.App));
+    _bt.描画 = Math.round(performance.now() - _t描画);
+    _bt.合計 = Math.round(performance.now());
+    window.__bootTimes = _bt;
 
-    console.log('App loaded successfully');
+    console.log('[起動] 取得 ' + _bt.取得 + 'ms ／ 貯め読み ' + _bt.貯め読み
+      + 'ms ／ 組み立て ' + _bt.組み立て + 'ms ／ 変換 ' + _bt.変換 + 'ms ／ 実行 '
+      + _bt.実行 + 'ms ／ 描画 ' + _bt.描画 + 'ms ／ ここまで ' + _bt.合計 + 'ms'
+      + '（' + Math.round(_bt.文字数 / 1024) + 'KB'
+      + (_bt.貯めから ? '・変換は貯めてあったものを使用' : '・初回なので変換した') + '）');
   } catch (e) {
     console.error('App load error:', e);
     document.getElementById('root').innerHTML =

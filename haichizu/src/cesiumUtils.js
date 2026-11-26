@@ -15,24 +15,39 @@ function saveFieldPolygon(pts) {
   try { localStorage.setItem('field_polygon', JSON.stringify(pts)); } catch (_) {}
 }
 
+// ── フィールド多角形 → 図面の原点と縮尺（この式はここ1か所・2026-11-22 advisor監査）──
+// 【なぜ1か所か】同じ式が「読み込み時の初期化」と「Cesium のフィールド確定」(CesiumMap.jsx) に
+//   手書きで2つあり、国土地理院の窓が3つ目になるところだった。四角（2点で作る4点）も
+//   多角形として同じここを通す＝形で分岐しない。
+// 【意味】図面（TW×TH グリッド）がその多角形の外接矩形の 90% に収まるよう縮尺を決め、
+//   図面の中心が多角形の中心に重なるよう原点（南西の角）を逆算する。
+function fieldFrameFromPolygon(poly) {
+  if (!Array.isArray(poly) || poly.length < 3) return null;
+  const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
+  const centerLat = (Math.min(...lats) + Math.max(...lats)) / 2;
+  const centerLng = (Math.min(...lngs) + Math.max(...lngs)) / 2;
+  const mPerDegLng = 111320 * Math.cos(centerLat * Math.PI / 180);
+  const bboxW = (Math.max(...lngs) - Math.min(...lngs)) * mPerDegLng;
+  const bboxH = (Math.max(...lats) - Math.min(...lats)) * M_PER_DEG_LAT;
+  const mpp = Math.max(bboxW / (TW * 0.9), bboxH / (TH * 0.9), 0.001);
+  return {
+    origin: {
+      lat: centerLat - (TH / 2) * mpp / M_PER_DEG_LAT,
+      lng: centerLng - (TW / 2) * mpp / mPerDegLng,
+    },
+    mpp,
+    mPerDegLng,
+  };
+}
+
 // GEO_ORIGIN & METERS_PER_PX: フィールドポリゴンから毎回再計算（TW/TH変更に対応）
 let GEO_ORIGIN, METERS_PER_PX, M_PER_DEG_LNG;
 (() => {
-  const poly = getSavedFieldPolygon();
-  if (poly && poly.length >= 3) {
-    const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
-    const centerLat = (Math.min(...lats) + Math.max(...lats)) / 2;
-    const centerLng = (Math.min(...lngs) + Math.max(...lngs)) / 2;
-    const mPerDegLng = 111320 * Math.cos(centerLat * Math.PI / 180);
-    const bboxW = (Math.max(...lngs) - Math.min(...lngs)) * mPerDegLng;
-    const bboxH = (Math.max(...lats) - Math.min(...lats)) * M_PER_DEG_LAT;
-    const mpp = Math.max(bboxW / (TW * 0.9), bboxH / (TH * 0.9), 0.001);
-    // GEO_ORIGINをフィールド中心から逆算（グリッド中心=フィールド中心）
-    const originLat = centerLat - (TH / 2) * mpp / M_PER_DEG_LAT;
-    const originLng = centerLng - (TW / 2) * mpp / mPerDegLng;
-    GEO_ORIGIN = { lat: originLat, lng: originLng };
-    METERS_PER_PX = mpp;
-    M_PER_DEG_LNG = mPerDegLng;
+  const fr = fieldFrameFromPolygon(getSavedFieldPolygon());
+  if (fr) {
+    GEO_ORIGIN = fr.origin;
+    METERS_PER_PX = fr.mpp;
+    M_PER_DEG_LNG = fr.mPerDegLng;
     // localStorageも更新
     try { localStorage.setItem('geo_origin', JSON.stringify(GEO_ORIGIN)); } catch (_) {}
   } else {
@@ -51,6 +66,28 @@ function updateGeoOrigin(lat, lng) {
   GEO_ORIGIN = { lat, lng };
   M_PER_DEG_LNG = 111320 * Math.cos(lat * Math.PI / 180);
   try { localStorage.setItem('geo_origin', JSON.stringify(GEO_ORIGIN)); } catch (_) {}
+}
+
+// ── フィールドを確定する唯一の書き手（2026-11-22）──
+// Cesium の多角形クリックも、国土地理院の窓の「3次元範囲を設定」（2点の四角）も、必ずここを通る。
+// 【再読込する理由】GEO_ORIGIN・METERS_PER_PX・FIELD_POLY_GRID は読み込み時に1回だけ決まる
+//   派生値で、読み手（App.jsx の useMemo 多数・geometry.js）が依存配列に入れていない。
+//   既存の Cesium 側も location.reload() で合わせている。再読込しない反映は別の段で直す（負債）。
+function commitFieldPolygon(poly, opts) {
+  const fr = fieldFrameFromPolygon(poly);
+  if (!fr) return false;
+  saveFieldPolygon(poly);
+  updateGeoOrigin(fr.origin.lat, fr.origin.lng);
+  if (!(opts && opts.noReload)) location.reload();
+  return true;
+}
+
+// フィールドの解除も同じ場所に置く（記録を消す所を散らさない）
+function clearFieldPolygon(opts) {
+  try { localStorage.removeItem('field_polygon'); } catch (_) {}
+  try { localStorage.removeItem('geo_origin'); } catch (_) {}
+  try { localStorage.removeItem(getElevCacheKey()); } catch (_) {}
+  if (!(opts && opts.noReload)) location.reload();
 }
 
 // ── キャッシュ & パフォーマンス ──
@@ -156,13 +193,18 @@ function installTileProxy() {
 }
 // プロキシサーバー稼働判定（/proxy が使えるか）
 function detectAndInstallProxy() {
+  // 国土地理院のタイルも同じ判定を使う（プロキシがあれば貯めが効く／無ければ直接取る）
+  const 知らせる = (ok) => { try { if (typeof gsiSetProxyAvailable === 'function') gsiSetProxyAvailable(ok); } catch (_) {} };
   fetch('/stats').then(r => {
     if (r.ok) {
       installTileProxy();
+      知らせる(true);
     } else {
+      知らせる(false);
       console.log('[TileProxy] プロキシサーバー未検出、直接接続モード');
     }
   }).catch(() => {
+    知らせる(false);
     console.log('[TileProxy] プロキシサーバー未検出、直接接続モード');
   });
 }

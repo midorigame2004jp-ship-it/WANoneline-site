@@ -1,0 +1,199 @@
+{
+  "generators": [],
+  "breakers": [],
+  "groundSymbols": [],
+  "staticElectricalSymbols": [],
+  "bladeBreakers": [],
+  "disconnectSwitches": [
+    {
+      "id": "dxf-symbol-1",
+      "svg": "<g id=\"dxf-symbol-1\" class=\"jis-template-instance dxf-symbol-instance disconnect-switch-group\" data-template-id=\"dxf-symbol-01\" data-symbol-name=\"DXF 01 断路器\" data-x=\"540\" data-y=\"270\" data-width=\"40\" data-height=\"60\" data-grid-unit=\"10\" data-rotation=\"0\" data-orientation=\"vertical\" data-anchors=\"{&quot;top&quot;:[30,10],&quot;bottom&quot;:[30,50]}\" data-placement-snap-anchor=\"\" data-symbol-family=\"disconnectSwitch\" data-interaction-bounds=\"null\" data-rotation-center-x=\"30\" data-rotation-center-y=\"30\" data-states=\"[{&quot;id&quot;:&quot;off&quot;,&quot;label&quot;:&quot;開&quot;,&quot;angle&quot;:-11,&quot;conductive&quot;:false,&quot;conductivePairs&quot;:[],&quot;sourceTerminals&quot;:[]},{&quot;id&quot;:&quot;on&quot;,&quot;label&quot;:&quot;閉&quot;,&quot;angle&quot;:6.96,&quot;conductive&quot;:true,&quot;conductivePairs&quot;:[[&quot;top&quot;,&quot;bottom&quot;]],&quot;sourceTerminals&quot;:[]}]\" data-state=\"off\" data-toggle-enabled=\"true\" data-blade-index=\"2\" data-blade-member-indices=\"[2]\" data-on-angle=\"6.96\" data-off-angle=\"-11\" data-top-element-count=\"2\" data-blade-pivot=\"[30,40]\" data-propagation-fill-indices=\"[]\" data-element-signal-rules=\"[[],[],[],[]]\" data-explicit-element-signal-rules=\"false\" data-terminal-top=\"30,10\" data-terminal-bottom=\"30,50\" data-disconnected-outline-color=\"#808080\" data-connected-outline-color=\"#ffff00\" data-element-terminal-names=\"[null,null,null,null]\" transform=\"translate(540, 270) rotate(0 30 30)\" data-power-resolved-flags=\"[false,false]\" data-grounded=\"false\" data-ground-fault-flags=\"[false,false]\" data-ground-fault=\"false\" style=\"cursor: default;\" data-equipment-id=\"EQ-mwoqr6ej-otx1g5\"><rect x=\"15\" y=\"10\" width=\"30\" height=\"40\" stroke=\"#000\" fill=\"none\" stroke-width=\"1\" stroke-linejoin=\"miter\" class=\"disconnect-switch-enclosure jis-switch-enclosure\" stroke-dasharray=\"8 3 1 3\" pointer-events=\"none\"></rect><line x1=\"30\" y1=\"10\" x2=\"30\" y2=\"20\" stroke=\"none\" fill=\"none\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" data-disconnected-outline-color=\"#808080\" data-outline-color-mode=\"connection\" data-element-index=\"0\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" class=\"dxf-symbol-outline switch-terminal-outline\" pointer-events=\"none\" style=\"stroke-linecap: round !important;\"></line><line x1=\"25\" y1=\"20\" x2=\"35\" y2=\"20\" stroke=\"none\" fill=\"none\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" data-disconnected-outline-color=\"#808080\" data-outline-color-mode=\"connection\" data-element-index=\"1\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" class=\"dxf-symbol-outline\" pointer-events=\"none\"></line><line x1=\"19\" y1=\"18\" x2=\"30\" y2=\"40\" stroke=\"none\" fill=\"none\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" data-disconnected-outline-color=\"#808080\" data-outline-color-mode=\"connection\" data-element-index=\"2\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" class=\"dxf-symbol-outline\" pointer-events=\"none\" transform=\"rotate(-11 30 40)\"></line><line x1=\"30\" y1=\"40\" x2=\"30\" y2=\"50\" stroke=\"none\" fill=\"none\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" data-disconnected-outline-color=\"#808080\" data-outline-color-mode=\"connection\" data-element-index=\"3\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" class=\"dxf-symbol-outline switch-terminal-outline\" pointer-events=\"none\" style=\"stroke-linecap: round !important;\"></line><line x1=\"30\" y1=\"10\" x2=\"30\" y2=\"20\" stroke=\"black\" stroke-width=\"2\" stroke-linecap=\"round\" data-element-index=\"0\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" data-base-stroke=\"#000\" data-base-fill=\"none\" class=\"disconnect-switch-main\"></line><line x1=\"25\" y1=\"20\" x2=\"35\" y2=\"20\" stroke=\"black\" stroke-width=\"2\" stroke-linecap=\"round\" data-element-index=\"1\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" data-base-stroke=\"#000\" data-base-fill=\"none\" class=\"disconnect-switch-main\"></line><line x1=\"19\" y1=\"18\" x2=\"30\" y2=\"40\" stroke=\"black\" stroke-width=\"2\" stroke-linecap=\"round\" data-element-index=\"2\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" data-base-stroke=\"#000\" data-base-fill=\"none\" class=\"disconnect-switch-main\" transform=\"rotate(-11 30 40)\"></line><line x1=\"30\" y1=\"40\" x2=\"30\" y2=\"50\" stroke=\"black\" stroke-width=\"2\" stroke-linecap=\"round\" data-element-index=\"3\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" data-base-stroke=\"#000\" data-base-fill=\"none\" class=\"disconnect-switch-main\"></line><rect x=\"20\" y=\"10\" width=\"20\" height=\"40\" fill=\"transparent\" pointer-events=\"all\" class=\"disconnect-switch-hit\"></rect><text x=\"48\" y=\"30\" dy=\"0.35em\" text-anchor=\"start\" font-size=\"14\" font-family=\"Arial, sans-serif\" fill=\"black\" pointer-events=\"all\" data-text-rotation=\"0\" class=\"breaker-label equipment-tag\" style=\"cursor: default; user-select: none;\">DS</text></g>"
+    },
+    {
+      "id": "dxf-symbol-2",
+      "svg": "<g id=\"dxf-symbol-2\" class=\"jis-template-instance dxf-symbol-instance disconnect-switch-group\" data-template-id=\"dxf-symbol-01\" data-symbol-name=\"DXF 01 断路器\" data-x=\"540\" data-y=\"510\" data-width=\"40\" data-height=\"60\" data-grid-unit=\"10\" data-rotation=\"0\" data-orientation=\"vertical\" data-anchors=\"{&quot;top&quot;:[30,10],&quot;bottom&quot;:[30,50]}\" data-placement-snap-anchor=\"\" data-symbol-family=\"disconnectSwitch\" data-interaction-bounds=\"null\" data-rotation-center-x=\"30\" data-rotation-center-y=\"30\" data-states=\"[{&quot;id&quot;:&quot;off&quot;,&quot;label&quot;:&quot;開&quot;,&quot;angle&quot;:-11,&quot;conductive&quot;:false,&quot;conductivePairs&quot;:[],&quot;sourceTerminals&quot;:[]},{&quot;id&quot;:&quot;on&quot;,&quot;label&quot;:&quot;閉&quot;,&quot;angle&quot;:6.96,&quot;conductive&quot;:true,&quot;conductivePairs&quot;:[[&quot;top&quot;,&quot;bottom&quot;]],&quot;sourceTerminals&quot;:[]}]\" data-state=\"off\" data-toggle-enabled=\"true\" data-blade-index=\"2\" data-blade-member-indices=\"[2]\" data-on-angle=\"6.96\" data-off-angle=\"-11\" data-top-element-count=\"2\" data-blade-pivot=\"[30,40]\" data-propagation-fill-indices=\"[]\" data-element-signal-rules=\"[[],[],[],[]]\" data-explicit-element-signal-rules=\"false\" data-terminal-top=\"30,10\" data-terminal-bottom=\"30,50\" data-disconnected-outline-color=\"#808080\" data-connected-outline-color=\"#ffff00\" data-element-terminal-names=\"[null,null,null,null]\" transform=\"translate(540, 510) rotate(0 30 30)\" data-power-resolved-flags=\"[false,false]\" data-grounded=\"false\" data-ground-fault-flags=\"[false,false]\" data-ground-fault=\"false\" style=\"cursor: default;\" data-equipment-id=\"EQ-mwoqr7sv-7fbv48\"><rect x=\"15\" y=\"10\" width=\"30\" height=\"40\" stroke=\"#000\" fill=\"none\" stroke-width=\"1\" stroke-linejoin=\"miter\" class=\"disconnect-switch-enclosure jis-switch-enclosure\" stroke-dasharray=\"8 3 1 3\" pointer-events=\"none\"></rect><line x1=\"30\" y1=\"10\" x2=\"30\" y2=\"20\" stroke=\"none\" fill=\"none\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" data-disconnected-outline-color=\"#808080\" data-outline-color-mode=\"connection\" data-element-index=\"0\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" class=\"dxf-symbol-outline switch-terminal-outline\" pointer-events=\"none\" style=\"stroke-linecap: round !important;\"></line><line x1=\"25\" y1=\"20\" x2=\"35\" y2=\"20\" stroke=\"none\" fill=\"none\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" data-disconnected-outline-color=\"#808080\" data-outline-color-mode=\"connection\" data-element-index=\"1\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" class=\"dxf-symbol-outline\" pointer-events=\"none\"></line><line x1=\"19\" y1=\"18\" x2=\"30\" y2=\"40\" stroke=\"none\" fill=\"none\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" data-disconnected-outline-color=\"#808080\" data-outline-color-mode=\"connection\" data-element-index=\"2\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" class=\"dxf-symbol-outline\" pointer-events=\"none\" transform=\"rotate(-11 30 40)\"></line><line x1=\"30\" y1=\"40\" x2=\"30\" y2=\"50\" stroke=\"none\" fill=\"none\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" data-disconnected-outline-color=\"#808080\" data-outline-color-mode=\"connection\" data-element-index=\"3\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" class=\"dxf-symbol-outline switch-terminal-outline\" pointer-events=\"none\" style=\"stroke-linecap: round !important;\"></line><line x1=\"30\" y1=\"10\" x2=\"30\" y2=\"20\" stroke=\"black\" stroke-width=\"2\" stroke-linecap=\"round\" data-element-index=\"0\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" data-base-stroke=\"#000\" data-base-fill=\"none\" class=\"disconnect-switch-main\"></line><line x1=\"25\" y1=\"20\" x2=\"35\" y2=\"20\" stroke=\"black\" stroke-width=\"2\" stroke-linecap=\"round\" data-element-index=\"1\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" data-base-stroke=\"#000\" data-base-fill=\"none\" class=\"disconnect-switch-main\"></line><line x1=\"19\" y1=\"18\" x2=\"30\" y2=\"40\" stroke=\"black\" stroke-width=\"2\" stroke-linecap=\"round\" data-element-index=\"2\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" data-base-stroke=\"#000\" data-base-fill=\"none\" class=\"disconnect-switch-main\" transform=\"rotate(-11 30 40)\"></line><line x1=\"30\" y1=\"40\" x2=\"30\" y2=\"50\" stroke=\"black\" stroke-width=\"2\" stroke-linecap=\"round\" data-element-index=\"3\" data-visible-states=\"[&quot;off&quot;,&quot;on&quot;]\" data-base-stroke=\"#000\" data-base-fill=\"none\" class=\"disconnect-switch-main\"></line><rect x=\"20\" y=\"10\" width=\"20\" height=\"40\" fill=\"transparent\" pointer-events=\"all\" class=\"disconnect-switch-hit\"></rect><text x=\"48\" y=\"30\" dy=\"0.35em\" text-anchor=\"start\" font-size=\"14\" font-family=\"Arial, sans-serif\" fill=\"black\" pointer-events=\"all\" data-text-rotation=\"0\" class=\"breaker-label equipment-tag\" style=\"cursor: default; user-select: none;\">DS</text></g>"
+    }
+  ],
+  "loadBreakSwitches": [],
+  "bladeSwitchVariants": [],
+  "groupMiniBoxes": [],
+  "wires": [
+    {
+      "id": "wire0",
+      "x": 570,
+      "y": 320,
+      "length": 200,
+      "angle": 0,
+      "connection": {
+        "start": {
+          "x": 570,
+          "y": 320,
+          "targetType": "disconnectSwitch",
+          "targetId": "dxf-symbol-1",
+          "point": "bottom"
+        },
+        "end": {
+          "x": 570,
+          "y": 520,
+          "targetType": "disconnectSwitch",
+          "targetId": "dxf-symbol-2",
+          "point": "top"
+        }
+      },
+      "name": "",
+      "labelVisible": false
+    }
+  ],
+  "groups": [],
+  "connections": {
+    "_id": "connectionState-instance-cavws6mc0",
+    "wire0": {
+      "start": {
+        "x": 570,
+        "y": 320,
+        "targetType": "disconnectSwitch",
+        "targetId": "dxf-symbol-1",
+        "point": "bottom"
+      },
+      "end": {
+        "x": 570,
+        "y": 520,
+        "targetType": "disconnectSwitch",
+        "targetId": "dxf-symbol-2",
+        "point": "top"
+      }
+    }
+  },
+  "terminalConnections": [
+    {
+      "id": "disconnectSwitch:dxf-symbol-1:bottom|wire:wire0:start",
+      "a": {
+        "componentId": "wire0",
+        "componentType": "wire",
+        "typeKey": "wires",
+        "pointName": "start",
+        "x": 570,
+        "y": 320
+      },
+      "b": {
+        "componentId": "dxf-symbol-1",
+        "componentType": "disconnectSwitch",
+        "typeKey": "disconnectSwitches",
+        "pointName": "bottom",
+        "x": 570,
+        "y": 320
+      }
+    },
+    {
+      "id": "disconnectSwitch:dxf-symbol-2:top|wire:wire0:end",
+      "a": {
+        "componentId": "wire0",
+        "componentType": "wire",
+        "typeKey": "wires",
+        "pointName": "end",
+        "x": 570,
+        "y": 520
+      },
+      "b": {
+        "componentId": "dxf-symbol-2",
+        "componentType": "disconnectSwitch",
+        "typeKey": "disconnectSwitches",
+        "pointName": "top",
+        "x": 570,
+        "y": 520
+      }
+    },
+    {
+      "id": "disconnectSwitch:dxf-symbol-1:bottom|wire:wire0:body:dxf-symbol-1:bottom",
+      "a": {
+        "componentId": "dxf-symbol-1",
+        "componentType": "disconnectSwitch",
+        "typeKey": "disconnectSwitches",
+        "pointName": "bottom",
+        "x": 570,
+        "y": 320
+      },
+      "b": {
+        "componentId": "wire0",
+        "componentType": "wire",
+        "typeKey": "wires",
+        "pointName": "body:dxf-symbol-1:bottom",
+        "x": 570,
+        "y": 320
+      }
+    },
+    {
+      "id": "disconnectSwitch:dxf-symbol-2:top|wire:wire0:body:dxf-symbol-2:top",
+      "a": {
+        "componentId": "dxf-symbol-2",
+        "componentType": "disconnectSwitch",
+        "typeKey": "disconnectSwitches",
+        "pointName": "top",
+        "x": 570,
+        "y": 520
+      },
+      "b": {
+        "componentId": "wire0",
+        "componentType": "wire",
+        "typeKey": "wires",
+        "pointName": "body:dxf-symbol-2:top",
+        "x": 570,
+        "y": 520
+      }
+    }
+  ],
+  "equipmentRecords": [
+    {
+      "equipmentId": "EQ-mwoqr6ej-otx1g5",
+      "typeKey": "disconnectSwitches",
+      "domId": "dxf-symbol-1",
+      "state": "off",
+      "placement": null
+    },
+    {
+      "equipmentId": "EQ-mwoqr7sv-7fbv48",
+      "typeKey": "disconnectSwitches",
+      "domId": "dxf-symbol-2",
+      "state": "off",
+      "placement": null
+    }
+  ],
+  "impedanceSegments": {},
+  "selectionState": {
+    "generatorIds": [],
+    "ctrlGeneratorIds": [],
+    "breakerIds": [],
+    "ctrlBreakerIds": [],
+    "groundSymbolIds": [],
+    "ctrlGroundSymbolIds": [],
+    "staticElectricalSymbolIds": [],
+    "ctrlStaticElectricalSymbolIds": [],
+    "bladeBreakerIds": [],
+    "ctrlBladeBreakerIds": [],
+    "disconnectSwitchIds": [],
+    "ctrlDisconnectSwitchIds": [],
+    "loadBreakSwitchIds": [],
+    "ctrlLoadBreakSwitchIds": [],
+    "bladeSwitchVariantIds": [],
+    "ctrlBladeSwitchVariantIds": [],
+    "groupMiniBoxIds": [],
+    "ctrlGroupMiniBoxIds": [],
+    "wireIds": [],
+    "wireSets": [],
+    "wireSetHandlePositions": {},
+    "handleSnapshot": [],
+    "ctrlWireIds": [],
+    "currentWireSet": null,
+    "currentWireId": "wire0",
+    "copySourceIds": null,
+    "currentGeneratorId": null,
+    "currentBreakerId": null,
+    "currentGroundSymbolId": null,
+    "currentStaticElectricalSymbolId": null,
+    "currentBladeBreakerId": null,
+    "currentDisconnectSwitchId": null,
+    "currentLoadBreakSwitchId": null,
+    "currentBladeSwitchVariantId": null,
+    "currentMiniBoxId": null
+  }
+}

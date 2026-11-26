@@ -1,6 +1,8 @@
 ﻿// ===== 計算関数（純粋関数） =====
-function snap(x, y) { return { x: Math.round(x / MINOR) * MINOR, y: Math.round(y / MINOR) * MINOR }; }
-function snapV(v) { return Math.round(v / MINOR) * MINOR; }
+// 格子への丸め。Alt 押下中（snapGate.js の判定）は丸めずに素の値を返す
+function _snapOff() { return typeof snapSuppressed === 'function' && snapSuppressed(); }
+function snap(x, y) { if (_snapOff()) return { x, y }; return { x: Math.round(x / MINOR) * MINOR, y: Math.round(y / MINOR) * MINOR }; }
+function snapV(v) { if (_snapOff()) return v; return Math.round(v / MINOR) * MINOR; }
 // zoom依存スナップ: 画面上1pxが1ステップになるよう縮尺に追従
 function snapStep(zoom) {
   const z = zoom || 1;
@@ -8,8 +10,31 @@ function snapStep(zoom) {
   if (z >= 0.75) return MINOR / 2;  // 中間zoom
   return MINOR;                      // 縮小時は標準グリッド
 }
-function snapFineV(v, zoom) { const s = snapStep(zoom || 1); return Math.round(v / s) * s; }
-function snapFine(x, y, zoom) { const s = snapStep(zoom || 1); return { x: Math.round(x / s) * s, y: Math.round(y / s) * s }; }
+function snapFineV(v, zoom) { if (_snapOff()) return v; const s = snapStep(zoom || 1); return Math.round(v / s) * s; }
+function snapFine(x, y, zoom) { if (_snapOff()) return { x, y }; const s = snapStep(zoom || 1); return { x: Math.round(x / s) * s, y: Math.round(y / s) * s }; }
+// ── 矢視（断面）作図のスナップ刻み ──
+// 固定グリッド(MINOR=0.72m相当)では配電盤(幅600mm程度)より粗く、拡大しても小さい範囲を作れない。
+// そこで「実寸できりのよい候補」から、画面上で SNAP_TARGET_PX 以上になる最小のものを選ぶ。
+// 拡大するほど細かい刻みが選ばれ、縮小すれば粗くなる（画面上の操作感は一定に保たれる）。
+const SNAP_TARGET_PX = 8;
+// 【候補の下限を粗くしない】0.05m始まりだと等倍では1m刻みまで飛んでしまい、
+// 矢視図の枠のような細かい調整ができない。1cm刻みまで選べるようにしておく。
+const SNAP_STEPS_M = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10];
+// targetPx: 刻み1つが画面上でこの長さ以上になる候補を選ぶ。小さいほど細かく刻める。
+function snapStepForZoom(zoom, targetPx) {
+  const z = (Number.isFinite(zoom) && zoom > 0) ? zoom : 1;
+  const mpp = (typeof METERS_PER_PX === 'number' && METERS_PER_PX > 0) ? METERS_PER_PX : 0.1;
+  const t = (Number.isFinite(targetPx) && targetPx > 0) ? targetPx : SNAP_TARGET_PX;
+  for (const m of SNAP_STEPS_M) {
+    const stepPx = m / mpp;                       // 実寸m → グリッドpx
+    if (stepPx * z >= t) return stepPx;
+  }
+  return SNAP_STEPS_M[SNAP_STEPS_M.length - 1] / mpp;
+}
+function snapAtZoom(x, y, zoom, targetPx) {
+  const s = snapStepForZoom(zoom, targetPx);
+  return { x: Math.round(x / s) * s, y: Math.round(y / s) * s };
+}
 function lerp2(a, b, t) { return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: (a.z || 0) + ((b.z || 0) - (a.z || 0)) * t }; }
 function projSeg(p, a, b) { const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy; if (l2 === 0) return 0; return Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2)); }
 function calcInitPan(az, el, zoom, blds) {
@@ -32,17 +57,77 @@ function calcInitPan(az, el, zoom, blds) {
   const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
   return { x: CAB_W / 2 - cx, y: CAB_H / 2 - cy };
 }
-function project3D(wx, wy, wz, az, el, zoom, panX, panY) {
-  // z（高さ）をメートルからグリッドpxに変換（x,yと同一スケールに統一）
+// ══ 投影の係数を1回だけ作る・2026-11-24 ══
+// 【なぜ要るか】地形は面ごとに4点を投影する。面40000 で16万回、細かさ401 なら64万回。
+//   project3D は呼ぶたびに Math.cos/sin を4回計算するので、同じカメラで何万点も投影するときは
+//   係数を使い回した方が速い。**式はここ1本**（project3D もこれを使う）。
+// 使い方: const P = makeProjector(az, el, zoom, panX, panY); P(wx, wy, wz)
+function makeProjector(az, el, zoom, panX, panY) {
   const mpp = (typeof METERS_PER_PX === 'number' && METERS_PER_PX > 0) ? METERS_PER_PX : 1;
-  const cx = wx - TW / 2, cy = -(wy - TH / 2), cz = (wz || 0) / mpp; // Y反転: 画面下→3D手前
   const cosA = Math.cos(az), sinA = Math.sin(az);
-  const rx = cx * cosA - cy * sinA;
-  const ry = cx * sinA + cy * cosA;
-  const sx = rx * zoom + (panX || 0);
-  const sy = (-ry * Math.sin(el) - cz * Math.cos(el)) * zoom + (panY || 0);
-  const depth = ry * Math.cos(el) - cz * Math.sin(el);
-  return { x: sx + CAB_W / 2, y: sy + CAB_H / 2, depth };
+  const sinE = Math.sin(el), cosE = Math.cos(el);
+  const px = (panX || 0) + CAB_W / 2, py = (panY || 0) + CAB_H / 2;
+  const hw = TW / 2, hh = TH / 2;
+  return function (wx, wy, wz) {
+    const cx = wx - hw, cy = -(wy - hh), cz = (wz || 0) / mpp;   // Y反転: 画面下→3D手前
+    const rx = cx * cosA - cy * sinA;
+    const ry = cx * sinA + cy * cosA;
+    return { x: rx * zoom + px,
+             y: (-ry * sinE - cz * cosE) * zoom + py,
+             depth: ry * cosE - cz * sinE };
+  };
+}
+// ══ 同じ投影を 4×4 行列にする（WebGL 用）・2026-11-24 ══
+// 【式を2つ作らない】makeProjector と**同じ係数**から作る。向こうを直したらここも直す。
+//   平行投影（アフィン）なので行列で厳密に表せる（検査 terrain_webgl.cjs で代表点を突き合わせる）。
+// 【入力】wx, wy はグリッド座標、wz は**グリッドpx**（makeProjector と同じ約束）。
+// 【出力】列優先の16要素。gl_Position = M * vec4(wx, wy, wz, 1) が **そのまま NDC**。
+// 【画面への写り方】CAB 座標（CAB_W×CAB_H）を letterbox（sc・ox・oy）で canvas へ、
+//   さらに NDC（中心原点・y上向き・-1..1）へ直す。ここを落とすと図が伸びる／上下が逆になる。
+// 【depth】3次元図は depth が小さいほど手前。WebGL の既定（LESS）と向きは合うので、
+//   [zNear, zFar] で -1..1 に正規化するだけ。範囲は呼ぶ側が地形の外接箱から毎フレーム出す。
+function makeProjMatrix(az, el, zoom, panX, panY, opts) {
+  const o = opts || {};
+  const mpp = (typeof METERS_PER_PX === 'number' && METERS_PER_PX > 0) ? METERS_PER_PX : 1;
+  const cosA = Math.cos(az), sinA = Math.sin(az);
+  const sinE = Math.sin(el), cosE = Math.cos(el);
+  const hw = TW / 2, hh = TH / 2;
+  const px = (panX || 0) + CAB_W / 2, py = (panY || 0) + CAB_H / 2;
+  // letterbox（canvas の大きさと CAB の比）。省略なら CAB そのまま
+  const cw = Number.isFinite(o.cw) ? o.cw : CAB_W, ch = Number.isFinite(o.ch) ? o.ch : CAB_H;
+  const sc = Math.min(cw / CAB_W, ch / CAB_H);
+  const ox = (cw - CAB_W * sc) / 2, oy = (ch - CAB_H * sc) / 2;
+  const zN = Number.isFinite(o.zNear) ? o.zNear : -10000;
+  const zF = Number.isFinite(o.zFar) ? o.zFar : 10000;
+  // ── CAB 座標（makeProjector と同じ）──
+  //   rx =  (wx-hw)*cosA + (wy-hh)*sinA          ← cy = -(wy-hh) なので符号に注意
+  //   ry =  (wx-hw)*sinA - (wy-hh)*cosA
+   //   X  =  rx*zoom + px
+   //   Y  = (-ry*sinE - (wz/mpp)*cosE)*zoom + py
+   //   D  =  ry*cosE - (wz/mpp)*sinE
+  const Xx = zoom * cosA, Xy = zoom * sinA, Xz = 0;
+  const X0 = px - zoom * (hw * cosA + hh * sinA);
+  // Y = -zoom*sinE*ry - zoom*cosE*(wz/mpp) + py。ry の定数項は -(hw*sinA - hh*cosA)
+  const Yx = -zoom * sinE * sinA, Yy = zoom * sinE * cosA, Yz = -zoom * cosE / mpp;
+  const Y0b = py + zoom * sinE * (hw * sinA - hh * cosA);
+  const Dx = cosE * sinA, Dy = -cosE * cosA, Dz = -sinE / mpp;
+  const D0 = -cosE * (hw * sinA - hh * cosA);
+  // ── 画面（canvas 画素）へ ──  sx = X*sc + ox,  sy = Y*sc + oy
+  // ── NDC へ ──  ndcX = sx/cw*2 - 1,  ndcY = 1 - sy/ch*2
+  const ax = 2 * sc / cw, bx = (2 * ox / cw) - 1;
+  const ay = -2 * sc / ch, by = 1 - (2 * oy / ch);
+  // ── depth を -1..1 へ ──  ndcZ = (D - zN)/(zF - zN)*2 - 1
+  const az2 = 2 / ((zF - zN) || 1), bz = -2 * zN / ((zF - zN) || 1) - 1;
+  // 列優先（gl.uniformMatrix4fv の既定 transpose=false）
+  return new Float32Array([
+    ax * Xx, ay * Yx, az2 * Dx, 0,
+    ax * Xy, ay * Yy, az2 * Dy, 0,
+    ax * Xz, ay * Yz, az2 * Dz, 0,
+    ax * X0 + bx, ay * Y0b + by, az2 * D0 + bz, 1,
+  ]);
+}
+function project3D(wx, wy, wz, az, el, zoom, panX, panY) {
+  return makeProjector(az, el, zoom, panX, panY)(wx, wy, wz);
 }
 // 3次元図のズーム・パンを自動計算（地面+建物がウィンドウにフィット）
 function calcAutoFit(az, el, blds) {
@@ -124,7 +209,8 @@ function rayHitPlacedPanel(ray, pp) {
   const u0 = (ray.ox - pivWx) / PPM, v0 = (ray.oy - pivWy) / PPM;
   const ox = u0 * cos + v0 * sin + W / 2;
   const oy = u0 * sin - v0 * cos + D / 2;
-  const oz = ray.ozM * 1000; // m → mm
+  // 据付高さ(pp.wz, グリッドpx)ぶん盤が持ち上がっている場合はレイ側を下げて相殺する
+  const oz = ray.ozM * 1000 - (Number.isFinite(pp.wz) ? pp.wz : 0) * mpp * 1000; // m → mm
   // レイ方向も同じ変換（平行移動は不要、線形部分のみ）
   const du = ray.dx / PPM, dv = ray.dy / PPM;
   const dxL = du * cos + dv * sin, dyL = du * sin - dv * cos, dzL = ray.dzM * 1000;
@@ -215,4 +301,54 @@ function cabScreenToGroundPoint(screenX, screenY, az, el, zoom, panX, panY) {
 function panForPivot(pivX, pivY, pivZM, az, el, zoom, anchorX, anchorY) {
   const p = project3D(pivX, pivY, pivZM || 0, az, el, zoom, 0, 0);
   return { panX: anchorX - p.x, panY: anchorY - p.y };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 2Dビュー（平面図・断面図・側面図・矢視図・追加平面図）の座標変換
+//
+// これらのビューのコンテンツdivには、同一要素に CSS の
+//   zoom: <倍率>  /  transform: rotate(<deg>deg)  /  transformOrigin: <ox>px <oy>px
+// が掛かっている。マウスのclient座標をコンテンツ座標へ戻すとき、回転を無視して
+//   (clientX - rect.left) / zoom
+// と書くと、回転時にまったく別の点を指す（回転後のrectは軸並行バウンディングボックスに
+// 変わるため、left/top はコンテンツ原点の像ではない）。
+//
+// 【一本化の原則】client↔コンテンツの変換は必ずこの2関数を通すこと。
+// 各所で個別に (clientX - r.left)/z と書き下すのは禁止（2026-08-25 一本化）。
+//
+// 【数学的根拠】矩形を任意のtransformOriginで回転しても、回転後のAABBの中心は
+// 「矩形中心を同じ変換で写した点」に一致する（4頂点の対称性による）。よって
+// transformOrigin を知らなくても、rectの中心とコンテンツ中心(W/2, H/2)を
+// 対応付ければ逆変換できる。
+// ══════════════════════════════════════════════════════════════════════════
+
+// client座標 → コンテンツ座標（回転・zoom対応）
+//   rect : 要素の getBoundingClientRect()（回転後AABB）
+//   W, H : コンテンツの論理サイズ（回転前・zoom前のpx。例: 平面図なら TW, TH）
+//   zoom : 要素に掛けたCSS zoom
+//   deg  : 要素に掛けた rotate() の角度（度。CSSと同じ符号＝時計回りが正）
+function clientToContentRect(clientX, clientY, rect, W, H, zoom, deg) {
+  const z = (Number.isFinite(zoom) && zoom > 0) ? zoom : 1;
+  // 無回転なら rect.left/top がそのままコンテンツ原点の像。W/Hに依存しない式を使う
+  // （中心基準の式と数学的には等価だが、W/Hの取り違えに影響されない分こちらが安全）。
+  if (!deg) return { x: (clientX - rect.left) / z, y: (clientY - rect.top) / z };
+  const dx = clientX - (rect.left + rect.width / 2);
+  const dy = clientY - (rect.top + rect.height / 2);
+  const r = -deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r); // 逆回転
+  return { x: W / 2 + (dx * c - dy * s) / z, y: H / 2 + (dx * s + dy * c) / z };
+}
+
+// コンテンツ座標 → 回転後のコンテンツ座標（順変換。スクロール位置の算出に使う）
+// rotate(deg) を transformOrigin(ox, oy) 中心に掛けたとき、点(cx, cy)がどこへ写るか。
+// clientToContentRect と対で管理すること（片方だけ符号を変えると必ず壊れる）。
+function contentRotatePoint(cx, cy, deg, ox, oy) {
+  if (!deg) return { x: cx, y: cy };
+  const r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
+  return { x: ox + (cx - ox) * c - (cy - oy) * s, y: oy + (cx - ox) * s + (cy - oy) * c };
+}
+
+// タッチ/マウス両対応で client 座標を取り出す
+function eventClientXY(e) {
+  const t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || e;
+  return { clientX: t.clientX, clientY: t.clientY };
 }

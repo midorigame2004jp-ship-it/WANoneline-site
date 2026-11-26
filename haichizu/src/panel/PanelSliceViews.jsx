@@ -294,6 +294,16 @@ function PanelSliceViews({ panel, selectedPartitionId, onSelect, updatePartition
                   }
                 };
 
+                // 扉に載せたアイコンは盤ローカル座標(wx/wy/wz)を持たない。位置は扉の4隅から
+                // 決まるため、3次元図・エディタ3Dビューと同じ共通コア pdcDoorIconPlacements で解決する
+                // （扉アイコン配置の唯一の正。開扉110°の回転もここに含まれる）。
+                const doorIconPos = new Map(); // iconId → {wx,wy,wz,s,t}
+                if (typeof pdcDoorIconPlacements === 'function') {
+                  for (const [, arr] of pdcDoorIconPlacements(panel, panel.iconLayouts)) {
+                    for (const { icon: _ic, pos } of arr) doorIconPos.set(_ic.id, pos);
+                  }
+                }
+
                 // 投影後の2D矩形でグループ化（異なるY深度でも前面投影が同じなら同グループ）
                 const boxGroups = new Map(); // projKey → {pb, icons:[]}
                 for (const icon of (panel.placedIcons || [])) {
@@ -329,7 +339,12 @@ function PanelSliceViews({ panel, selectedPartitionId, onSelect, updatePartition
                 const dispMode = (icon.iconDisplayMode === 'flat' || icon.iconDisplayMode === 'box')
                   ? icon.iconDisplayMode : panelDispMode;
                 const half = Math.min(W, H, D) / 16;
-                const { wx, wy, wz, cellBox } = icon;
+                const { cellBox } = icon;
+                // 扉アイコンは扉由来の座標を優先（doorIdを持つなら盤ローカル座標より扉配置が正）
+                const _dp = icon.doorId ? doorIconPos.get(icon.id) : null;
+                const wx = _dp ? _dp.wx : icon.wx;
+                const wy = _dp ? _dp.wy : icon.wy;
+                const wz = _dp ? _dp.wz : icon.wz;
                 const lbl = icon.name || '';
                 const fs = Math.min(fW, fH) * 0.06;
                 const isSel = icon.id === selectedIconId || icon.id === hoveredIconId;
@@ -368,6 +383,11 @@ function PanelSliceViews({ panel, selectedPartitionId, onSelect, updatePartition
                     </g>
                   );
                 }
+
+                // flatモードは盤ローカル座標(wx/wy/wz)を前提に描く。扉に載せたアイコンは
+                // 位置が扉側のアフィン写像で決まるためこの座標を持たず、そのまま計算すると
+                // 座標がNaNになる。panelDrawCore（座標を持つアイコンだけ扱う）と同じ規則で除外する。
+                if (!Number.isFinite(wx) || !Number.isFinite(wy) || !Number.isFinite(wz)) return null;
 
                 // flatモード: 点アイコン（従来）
                 switch (id) {

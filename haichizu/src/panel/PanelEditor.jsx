@@ -775,6 +775,131 @@ function PanelEditor({ state }) {
 
   const locked = activePanel ? activePanel.locked : false;
 
+  // 一覧で名前を直接編集中の盤ID（ダブルクリックで開始 / Enter・フォーカス外れで確定 / Escで取消）
+  const [renamingId, setRenamingId] = useState(null);
+  // カーソルが乗っている行のID（配置済みの📍を📷に切り替えるため）
+  const [hoverRowId, setHoverRowId] = useState(null);
+
+  // ── 配電盤テンプレートのドラッグ開始（HTML5ネイティブD&D）──
+  // 同一オリジンなので iframe から親ウィンドウへドロップできる。親側は各ウィンドウの
+  // onDrop でこのデータを受け取り、そのビュー固有の逆変換でワールド座標へ直して配置する。
+  // MIMEを独自にするのは、他のドラッグ（ファイル等）と取り違えないため。text/plain は保険。
+  const PANEL_DND_MIME = 'application/x-wanoneline-panel';
+  const _panelDragStart = (e, p) => {
+    if (!e.dataTransfer) return;
+    const payload = JSON.stringify({ __kind: 'panelTemplate', panel: JSON.parse(JSON.stringify(p)) });
+    e.dataTransfer.setData(PANEL_DND_MIME, payload);
+    e.dataTransfer.setData('text/plain', payload);
+    e.dataTransfer.effectAllowed = 'copy';
+    // ドラッグ中の見た目（盤名のラベル）。既定のDOMコピーだと一覧全体が写り込むため差し替える。
+    try {
+      const g = document.createElement('div');
+      g.textContent = '📦 ' + (p.name || '配電盤');
+      g.style.cssText = 'position:fixed;top:-1000px;left:-1000px;padding:3px 10px;border-radius:4px;'
+        + 'font:700 11px "Segoe UI",sans-serif;color:#fff;white-space:nowrap;border:2px solid #FFF;'
+        + 'background:' + (p.color || '#4A90D9');
+      document.body.appendChild(g);
+      e.dataTransfer.setDragImage(g, 10, 10);
+      setTimeout(() => g.remove(), 0);
+    } catch (_) { /* setDragImage未対応でもドラッグ自体は成立する */ }
+  };
+
+  // ── 配電盤一覧の1行 ──
+  // テンプレートと配置済み実体で共用し、差分だけ分岐する。
+  // ・配置済み(placedId あり)は「配置」ボタンを出さない（実体をさらに配置はできない）
+  // ・配置済みの削除は3次元図側が持ち主なので、ここでは削除ボタンを出さない
+  // ・シリアル番号は名前を変えても失われないよう、名前とは別項目として表示する
+  const renderPanelRow = (p) => {
+    const isPlaced = !!p.placedId;
+    const editing = renamingId === p.id;
+    return (
+      <div key={p.id}
+        onClick={() => setActivePanelId(p.id)}
+        onMouseEnter={() => setHoverRowId(p.id)}
+        onMouseLeave={() => setHoverRowId(pr => pr === p.id ? null : pr)}
+        // 一覧の行をそのまま配置図の各ウィンドウへドラッグ＆ドロップできる（テンプレートのみ）。
+        // 配置済みの実体は「さらに配置」できないためドラッグ不可。
+        draggable={!isPlaced}
+        onDragStart={!isPlaced ? (e) => _panelDragStart(e, p) : undefined}
+        style={{
+          padding: '4px 8px', borderRadius: 4, cursor: 'pointer',
+          fontSize: 12, marginBottom: 2,
+          background: p.id === activePanelId ? '#DBEAFE' : 'transparent',
+          color: p.id === activePanelId ? '#1D4ED8' : '#334155',
+          border: p.id === activePanelId ? '1px solid #BFDBFE' : '1px solid transparent',
+          display: 'flex', gap: 4, alignItems: 'center',
+        }}
+      >
+        {/* 配置済みの📍は、行にカーソルを乗せると📷に変わり、押すと3次元図がその盤へ寄る。
+            テンプレートは置き場所を持たないので通常のアイコンのまま。 */}
+        {isPlaced && !p.locked ? (
+          <span
+            onClick={(e) => {
+              e.stopPropagation();
+              if (window.parent !== window) {
+                window.parent.postMessage({ type: 'FOCUS_PLACED_PANEL', placedId: p.placedId }, '*');
+              }
+            }}
+            title={hoverRowId === p.id ? 'この盤に注目（3次元図のカメラを移動）' : ''}
+            style={{ fontSize: 10, cursor: hoverRowId === p.id ? 'pointer' : 'default', flexShrink: 0 }}
+          >{hoverRowId === p.id ? '📷' : '📍'}</span>
+        ) : (
+          <span style={{ fontSize: 10 }}>{p.locked ? '🔒' : '📦'}</span>
+        )}
+        {editing ? (
+          // 名前の直接編集。従来は「パネルプロパティ」の折りたたみの奥にしか無く、
+          // 実質たどり着けなかったため、一覧から直接変えられるようにする。
+          <input
+            autoFocus
+            defaultValue={p.name || ''}
+            disabled={p.locked}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={(e) => {
+              const v = e.target.value.trim();
+              if (v && v !== p.name) updatePanel(p.id, { name: v });
+              setRenamingId(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') e.target.blur();
+              else if (e.key === 'Escape') { e.target.value = p.name || ''; e.target.blur(); }
+            }}
+            style={{ flex: 1, minWidth: 0, fontSize: 12, padding: '1px 4px',
+              border: '1px solid #3B82F6', borderRadius: 3, outline: 'none' }}
+          />
+        ) : (
+          <span
+            onDoubleClick={(e) => { e.stopPropagation(); if (!p.locked) setRenamingId(p.id); }}
+            title={p.locked ? 'ロック中は名前を変更できません' : 'ダブルクリックで名前を変更'}
+            style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}
+          >{p.name}</span>
+        )}
+        {isPlaced && (
+          <span title={`テンプレート: ${p.templateName || '不明'} / 通し番号 ${p.serialNo}`}
+            style={{ fontSize: 9, color: '#059669', background: '#ECFDF5', border: '1px solid #A7F3D0',
+              borderRadius: 3, padding: '0 4px', flexShrink: 0 }}>
+            No.{p.serialNo}
+          </span>
+        )}
+        {p.id === activePanelId && !isPlaced && (<>
+          <button
+            // 【重要】ここに mousedown で親へ postMessage する旧方式を復活させてはいけない。
+            // 旧方式は親側で iframe の pointer-events を切るため、ブラウザがドラッグ開始と
+            // 判定する前にこのボタンがマウス入力を失い、ネイティブD&Dが起動しなくなる。
+            // その結果「3次元図にしか置けない」（旧方式は3次元図専用だった）状態に戻る。
+            draggable
+            onDragStart={(e) => { e.stopPropagation(); _panelDragStart(e, p); }}
+            style={{ fontSize: 9, padding: '1px 5px', background: '#059669', color: '#fff', border: 'none', borderRadius: 3, cursor: 'grab', flexShrink: 0 }}
+            title="配置図の各ウィンドウへドラッグして配置"
+          >配置</button>
+          <button
+            onClick={(e) => { e.stopPropagation(); if (window.confirm(`「${p.name}」を削除しますか？`)) deletePanel(p.id); }}
+            style={{ fontSize: 9, padding: '1px 5px', background: '#EF4444', color: '#fff', border: 'none', borderRadius: 3, cursor: 'pointer', flexShrink: 0 }}
+          >盤削除</button>
+        </>)}
+      </div>
+    );
+  };
+
   return (
     <div style={{ display: 'flex', height: '100%', overflow: 'hidden' }}>
 
@@ -797,48 +922,36 @@ function PanelEditor({ state }) {
           </div>
         )}
 
-        {/* === パネル一覧 === */}
         <div style={{ padding: '8px 8px 0', borderBottom: '1px solid #E2E8F0' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
-            <span style={{ fontSize: 11, fontWeight: 700, color: '#475569' }}>配電盤一覧</span>
+            <span style={{ fontSize: 11, fontWeight: 700, color: '#475569' }}>
+              配電盤一覧
+              <span style={{ fontSize: 9, fontWeight: 400, color: '#94A3B8', marginLeft: 6 }}>
+                名前はダブルクリックで変更
+              </span>
+            </span>
             <button onClick={addPanel} style={panelBtnStyle('#3B82F6')}>＋新規</button>
           </div>
-          <div style={{ maxHeight: 120, overflowY: 'auto', marginBottom: 8 }}>
+          <div style={{ maxHeight: 200, overflowY: 'auto', marginBottom: 8 }}>
             {panels.length === 0 && (
               <div style={{ fontSize: 11, color: '#94A3B8', padding: '4px 0' }}>（なし）</div>
             )}
-            {panels.map(p => (
-              <div key={p.id}
-                onClick={() => setActivePanelId(p.id)}
-                style={{
-                  padding: '4px 8px', borderRadius: 4, cursor: 'pointer',
-                  fontSize: 12, marginBottom: 2,
-                  background: p.id === activePanelId ? '#DBEAFE' : 'transparent',
-                  color: p.id === activePanelId ? '#1D4ED8' : '#334155',
-                  border: p.id === activePanelId ? '1px solid #BFDBFE' : '1px solid transparent',
-                  display: 'flex', gap: 4, alignItems: 'center',
-                }}
-              >
-                <span style={{ fontSize: 10 }}>{p.locked ? '🔒' : '📦'}</span>
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{p.name}</span>
-                {p.id === activePanelId && (<>
-                  <button
-                    onMouseDown={(e) => {
-                      e.stopPropagation();
-                      if (window.parent !== window) {
-                        window.parent.postMessage({ type: 'PANEL_DRAG_START', panel: JSON.parse(JSON.stringify(p)) }, '*');
-                      }
-                    }}
-                    style={{ fontSize: 9, padding: '1px 5px', background: '#059669', color: '#fff', border: 'none', borderRadius: 3, cursor: 'grab', flexShrink: 0 }}
-                    title="配置図の3次元図へドラッグして配置"
-                  >配置</button>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); if (window.confirm(`「${p.name}」を削除しますか？`)) deletePanel(p.id); }}
-                    style={{ fontSize: 9, padding: '1px 5px', background: '#EF4444', color: '#fff', border: 'none', borderRadius: 3, cursor: 'pointer', flexShrink: 0 }}
-                  >盤削除</button>
-                </>)}
-              </div>
-            ))}
+            {/* テンプレート（配置前の雛形）と 配置済み（3次元図の実体）を2区画に分けて表示。
+                実体は placedId を持つものだけ。区画見出しは中身があるときだけ出す。 */}
+            {(() => {
+              const _tpl = panels.filter(p => !p.placedId);
+              const _ins = panels.filter(p => p.placedId);
+              const _head = (t, c) => (
+                <div style={{ fontSize: 9, fontWeight: 700, color: c, letterSpacing: '0.05em',
+                  padding: '4px 2px 2px', borderBottom: `1px solid ${c}33`, marginBottom: 3 }}>{t}</div>
+              );
+              return (<>
+                {_tpl.length > 0 && _head('テンプレート', '#475569')}
+                {_tpl.map(p => renderPanelRow(p))}
+                {_ins.length > 0 && _head(`配置済み（3次元図） ${_ins.length}`, '#059669')}
+                {_ins.map(p => renderPanelRow(p))}
+              </>);
+            })()}
           </div>
         </div>
 
@@ -1191,9 +1304,58 @@ function PanelEditor({ state }) {
                       </>
                     )}
                   </div>
-                  {chambers.map((ch, i) => {
-                    const key = chamberStableKey(ch);
-                    const icons = (activePanel.placedIcons || []).filter(ic => ic.chamberKey === key);
+                  {/* 機器一覧のグループ単位は「容器」= 区画 or 扉。
+                      扉アイコンは chamberKey を持たない（座標を持たず扉4隅から導出する）ため、
+                      区画前提のままだと一覧に出ず選択もできない。ここで容器へ一般化している。 */}
+                  {[
+                    ...chambers.map((ch, i) => ({
+                      rowKey: ch.id,
+                      layoutKey: chamberStableKey(ch),
+                      label: `区画 ${i + 1}`,
+                      chipColor: ch.color,
+                      hoverChamberId: ch.id,
+                      checkTitle: 'この区画の機器を全選択/解除',
+                      colorTitle: `区画${i + 1}の全機器を一括色変更`,
+                      // doorId を持つものは扉グループ側で出す（壊れたデータで二重表示しない）
+                      icons: (activePanel.placedIcons || []).filter(ic => !ic.doorId && ic.chamberKey === chamberStableKey(ch)),
+                    })),
+                    ...(activePanel.doors || []).map((d, i) => ({
+                      rowKey: d.id,
+                      layoutKey: `door:${d.id}`,   // PanelCanvas3D 側が読む扉レイアウトのキーと同一
+                      label: `扉 ${i + 1}（${PDC_FACE_JP[d.face] || d.face}）`,
+                      chipColor: '#F59E0B',
+                      hoverChamberId: null,        // 扉アイコンのhoverで区画ハイライトは出さない
+                      checkTitle: 'この扉の機器を全選択/解除',
+                      colorTitle: `扉${i + 1}の全機器を一括色変更`,
+                      icons: (activePanel.placedIcons || []).filter(ic => ic.doorId === d.id),
+                    })),
+                    // ── 所属不明（孤児）──
+                    // 実在しない扉/区画を指す、あるいはどちらも持たないアイコン。
+                    // 描画側は「盤中心へフォールバックさせない」ので画面に出ず、扉/区画グループにも
+                    // 載らないため、ここで拾わないと「件数にだけ居て触れないゾンビ」になる。
+                    // 救済（区画へ寄せる等）はせず、見える化して手で消せるだけにする。
+                    ...(() => {
+                      const doorIds = new Set((activePanel.doors || []).map(d => d.id));
+                      const chamberKeys = new Set(chambers.map(ch => chamberStableKey(ch)));
+                      const orphans = (activePanel.placedIcons || []).filter(ic =>
+                        ic.doorId ? !doorIds.has(ic.doorId)
+                                  : (ic.chamberKey ? !chamberKeys.has(ic.chamberKey) : true));
+                      if (!orphans.length) return [];
+                      return [{
+                        rowKey: '__orphan__',
+                        layoutKey: '__orphan__',
+                        label: '所属不明',
+                        chipColor: '#EF4444',
+                        hoverChamberId: null,
+                        checkTitle: '所属不明の機器を全選択/解除',
+                        colorTitle: '所属不明の機器を一括色変更',
+                        icons: orphans,
+                        noLayout: true,   // 整列レイアウトの選択肢は出さない
+                      }];
+                    })(),
+                  ].map((g) => {
+                    const key = g.layoutKey;
+                    const icons = g.icons;
                     if (!icons.length) return null;
                     const N = icons.length;
                     const layoutOpts = N === 2
@@ -1208,7 +1370,7 @@ function PanelEditor({ state }) {
                     const allChChecked = icons.length > 0 && icons.every(ic => selectedIconIds.has(ic.id));
                     const someChChecked = icons.some(ic => selectedIconIds.has(ic.id));
                     return (
-                      <div key={ch.id}>
+                      <div key={g.rowKey}>
                         <div style={{
                           display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2,
                           borderRadius: 3, padding: '1px 4px',
@@ -1228,10 +1390,10 @@ function PanelEditor({ state }) {
                               setSelectedIconId(null);
                             }}
                             onClick={(e) => e.stopPropagation()}
-                            title="この区画の機器を全選択/解除"
+                            title={g.checkTitle}
                           />
-                          <span style={{ width: 10, height: 10, borderRadius: 2, flexShrink: 0, background: ch.color, border: '1px solid #CBD5E1' }} />
-                          <span style={{ fontSize: 10, color: isSelectedChamber ? '#B45309' : '#475569', fontWeight: 600 }}>区画 {i + 1}</span>
+                          <span style={{ width: 10, height: 10, borderRadius: 2, flexShrink: 0, background: g.chipColor, border: '1px solid #CBD5E1' }} />
+                          <span style={{ fontSize: 10, color: isSelectedChamber ? '#B45309' : '#475569', fontWeight: 600 }}>{g.label}</span>
                           <ColorInput
                             defaultValue={icons[0]?.iconColor || '#1D4ED8'}
                             style={{ width:18, height:12, padding:0, border:'none', cursor:'pointer', borderRadius:2, marginLeft:'auto' }}
@@ -1242,7 +1404,7 @@ function PanelEditor({ state }) {
                               });
                             }}
                             onClick={(e) => e.stopPropagation()}
-                            title={`区画${i+1}の全機器を一括色変更`}
+                            title={g.colorTitle}
                           />
                         </div>
                         {icons.map(ic => {
@@ -1253,7 +1415,7 @@ function PanelEditor({ state }) {
                             onClick={(e) => {
                               setSelectedIconId(ic.id); setSelectedPartIds([]); setSelectedDoorId(null);
                             }}
-                            onMouseEnter={() => { setHoveredIconId(ic.id); setHoverChamberId(ch.id); }}
+                            onMouseEnter={() => { setHoveredIconId(ic.id); setHoverChamberId(g.hoverChamberId); }}
                             onMouseLeave={() => { setHoveredIconId(null); setHoverChamberId(null); }}
                             style={{
                               display: 'flex', alignItems: 'center', gap: 4, borderRadius: 3,
@@ -1348,7 +1510,7 @@ function PanelEditor({ state }) {
                             >×</button>
                           </div>
                         );})}
-                        {layoutOpts.length > 0 && !locked && (
+                        {layoutOpts.length > 0 && !locked && !g.noLayout && (
                           <div style={{ paddingLeft: 14, marginTop: 3, display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                             {layoutOpts.map(([lk, lbl]) => {
                               const isActive = currentLayout === lk || (lk === 'h' && currentLayout === 'auto' && N === 2);
@@ -1808,6 +1970,24 @@ iconVisMode={iconVisMode}
                 );
               }
               updatePanel(activePanel.id, { placedIcons: updated }, { forceNew: true });
+            }}
+            onDropIconOnDoor={(doorId, iconData) => {
+              // 扉アイコンは座標を持たない（扉4隅＋グループ内の順番＋総数から毎回導出する）。
+              // 扉は開閉で110°回転するため、絶対座標を保存するとアイコンだけ空中に取り残される。
+              const _unitN = (activePanel.placedIcons || []).length + 1;
+              const { wx, wy, wz, chamberKey, cellBox, face, ...rest } = iconData || {};
+              const newIcon = { id: 'icon_' + Date.now(), name: '機器' + _unitN, doorId, ...rest };
+              updatePanel(activePanel.id, {
+                placedIcons: [...(activePanel.placedIcons || []), newIcon],
+              }, { forceNew: true });
+            }}
+            onMoveIconToDoor={(iconId, doorId) => {
+              // 扉→扉の移動は doorId の張り替えだけ。位置は移動先の扉の4隅から再導出される
+              updatePanel(activePanel.id, {
+                placedIcons: (activePanel.placedIcons || []).map(ic =>
+                  ic.id === iconId ? { ...ic, doorId } : ic
+                ),
+              }, { forceNew: true });
             }}
             onMoveIcon={(iconId, chamberId, chamberKey, wx, wy, wz, cellBox, face) => {
               updatePanel(activePanel.id, {

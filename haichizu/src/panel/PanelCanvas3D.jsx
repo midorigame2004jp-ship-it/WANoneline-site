@@ -135,6 +135,9 @@ function _getSnapTargets(dragAxis, panel, partitionId) {
 
 // snap閾値内の候補に吸い付かせる
 function _applySnap(value, targets, thresholdMm) {
+  // 【一時解除】判定は snapGate.js が唯一の実装。ここは1行見るだけ（2026-09-03）
+  // 仕切り・扉・機器・配線の位置スナップが全部ここを通る
+  if (typeof snapSuppressed === 'function' && snapSuppressed()) return value;
   let best = null, bestDist = thresholdMm;
   for (const t of targets) {
     const d = Math.abs(value - t);
@@ -566,43 +569,46 @@ function _slotLabel(slot) {
   return `${slot.depthIdx + 1}層目`;
 }
 
-// 同一区画・同一面に複数アイコンがある場合のグリッド配置位置を計算（レンダリング専用）
-// layoutName: 'h'=横並び, 'v'=縦並び, 't1b2'=上1下2(N=3), 't2b1'=上2下1(N=3), その他=auto
-function _computeGroupLayout(N, layoutName, cb, face) {
-  let a1min, a1max, a2min, a2max, mkPos, mkSub;
+// 面ごとの「面内2軸(a1,a2)」と、そこから3D座標/サブcellBoxを作る関数を返す
+function _faceAxisMapper(cb, face) {
   if (face === 'left' || face === 'right') {
-    a1min=cb.yMin; a1max=cb.yMax; a2min=cb.zMin; a2max=cb.zMax;
-    const wx=(cb.xMin+cb.xMax)/2;
-    mkPos=(a1,a2)=>({wx,wy:a1,wz:a2});
-    mkSub=(s1n,s1x,s2n,s2x)=>({xMin:cb.xMin,xMax:cb.xMax,yMin:s1n,yMax:s1x,zMin:s2n,zMax:s2x});
-  } else if (face === 'top' || face === 'bottom') {
-    a1min=cb.xMin; a1max=cb.xMax; a2min=cb.yMin; a2max=cb.yMax;
-    const wz=(cb.zMin+cb.zMax)/2;
-    mkPos=(a1,a2)=>({wx:a1,wy:a2,wz});
-    mkSub=(s1n,s1x,s2n,s2x)=>({xMin:s1n,xMax:s1x,yMin:s2n,yMax:s2x,zMin:cb.zMin,zMax:cb.zMax});
-  } else { // front/back
-    a1min=cb.xMin; a1max=cb.xMax; a2min=cb.zMin; a2max=cb.zMax;
-    const wy=(cb.yMin+cb.yMax)/2;
-    mkPos=(a1,a2)=>({wx:a1,wy,wz:a2});
-    mkSub=(s1n,s1x,s2n,s2x)=>({xMin:s1n,xMax:s1x,yMin:cb.yMin,yMax:cb.yMax,zMin:s2n,zMax:s2x});
+    const wx = (cb.xMin + cb.xMax) / 2;
+    return { a1min: cb.yMin, a1max: cb.yMax, a2min: cb.zMin, a2max: cb.zMax,
+      mkPos: (a1, a2) => ({ wx, wy: a1, wz: a2 }),
+      mkSub: (s1n, s1x, s2n, s2x) => ({ xMin: cb.xMin, xMax: cb.xMax, yMin: s1n, yMax: s1x, zMin: s2n, zMax: s2x }) };
   }
-  const at=(col,row,cols,rows)=>{
-    const s1n=a1min+col*(a1max-a1min)/cols,     s1x=a1min+(col+1)*(a1max-a1min)/cols;
-    const s2n=a2min+row*(a2max-a2min)/rows,     s2x=a2min+(row+1)*(a2max-a2min)/rows;
-    return { ...mkPos((s1n+s1x)/2,(s2n+s2x)/2), subCellBox:mkSub(s1n,s1x,s2n,s2x) };
-  };
-  if (layoutName==='h') return Array.from({length:N},(_,i)=>at(i,0,N,1));
-  if (layoutName==='v') return Array.from({length:N},(_,i)=>at(0,i,1,N));
-  if (N===3 && layoutName==='t1b2') return [
-    { ...mkPos((a1min+a1max)/2, a2min+0.25*(a2max-a2min)), subCellBox:mkSub(a1min,a1max,a2min,a2min+0.5*(a2max-a2min)) },
-    at(0,1,2,2), at(1,1,2,2),
-  ];
-  if (N===3 && layoutName==='t2b1') return [
-    at(0,0,2,2), at(1,0,2,2),
-    { ...mkPos((a1min+a1max)/2, a2min+0.75*(a2max-a2min)), subCellBox:mkSub(a1min,a1max,a2min+0.5*(a2max-a2min),a2max) },
-  ];
-  const cols=Math.ceil(Math.sqrt(N)), rows=Math.ceil(N/cols);
-  return Array.from({length:N},(_,i)=>at(i%cols,Math.floor(i/cols),cols,rows));
+  if (face === 'top' || face === 'bottom') {
+    const wz = (cb.zMin + cb.zMax) / 2;
+    return { a1min: cb.xMin, a1max: cb.xMax, a2min: cb.yMin, a2max: cb.yMax,
+      mkPos: (a1, a2) => ({ wx: a1, wy: a2, wz }),
+      mkSub: (s1n, s1x, s2n, s2x) => ({ xMin: s1n, xMax: s1x, yMin: s2n, yMax: s2x, zMin: cb.zMin, zMax: cb.zMax }) };
+  }
+  // front/back
+  const wy = (cb.yMin + cb.yMax) / 2;
+  return { a1min: cb.xMin, a1max: cb.xMax, a2min: cb.zMin, a2max: cb.zMax,
+    mkPos: (a1, a2) => ({ wx: a1, wy, wz: a2 }),
+    mkSub: (s1n, s1x, s2n, s2x) => ({ xMin: s1n, xMax: s1x, yMin: cb.yMin, yMax: cb.yMax, zMin: s2n, zMax: s2x }) };
+}
+
+// 同一区画・同一面に複数アイコンがある場合のグリッド配置位置を計算（レンダリング専用）
+// 整列パターン自体は共通コアの pdcLayoutSlotRects が持つ（扉側と共通・3次元図からも使うため）。
+// ここは面→軸の写像のみ担う。
+function _computeGroupLayout(N, layoutName, cb, face) {
+  const m = _faceAxisMapper(cb, face);
+  const r1 = m.a1max - m.a1min, r2 = m.a2max - m.a2min;
+  return pdcLayoutSlotRects(N, layoutName).map(s => {
+    const s1n = m.a1min + s.c0 * r1 / s.cols, s1x = m.a1min + s.c1 * r1 / s.cols;
+    const s2n = m.a2min + s.r0 * r2 / s.rows, s2x = m.a2min + s.r1 * r2 / s.rows;
+    return { ...m.mkPos((s1n + s1x) / 2, (s2n + s2x) / 2), subCellBox: m.mkSub(s1n, s1x, s2n, s2x) };
+  });
+}
+
+// アイコンが属する「整列グループ」のキー。容器（扉 / 区画+面 / 単独）を一本化して表す。
+// 保存データの chamberKey 形式は変えない（既存レイアウトの互換のため）。
+// containerKey（別容器へ移ったかの判定用）は iconGroupRef 側に別途持たせる。
+function _iconGroupKey(icon, face) {
+  if (icon.doorId) return `door:${icon.doorId}`;
+  return icon.chamberKey ? `${icon.chamberKey}:${face}` : `__solo__:${icon.id}`;
 }
 
 // 選択仕切りの前後距離情報を計算（前後の仕切り or 親箱面との clear span）
@@ -831,6 +837,30 @@ function _rasterLine(d, zb, W, H, p0, p1, r, g, b, bias = 0) {
   }
 }
 
+// 線の「見えている所」だけを低解像度マスクに書く（色は書かない）。
+// _rasterLine と同じ深度テストだが、出力は alpha のみ。フル解像度で描いた線を
+// このマスクで切り抜くことで、可視判定は低解像度のまま線だけ鮮鋭にできる。
+// フル解像度の線幅（約1〜2px）を覆えるよう、低解像度側では1画素ぶん太らせる。
+function _rasterLineMask(mask, zb, W, H, p0, p1, bias = 0) {
+  const dx = p1.x - p0.x, dy = p1.y - p0.y;
+  const steps = Math.max(Math.abs(dx), Math.abs(dy), 1) | 0;
+  for (let t = 0; t <= steps; t++) {
+    const frac = t / steps;
+    const cx = Math.round(p0.x + dx * frac);
+    const cy = Math.round(p0.y + dy * frac);
+    if (cx < -1 || cx > W || cy < -1 || cy > H) continue;
+    const depth = p0.depth + (p1.depth - p0.depth) * frac;
+    if (cx >= 0 && cx < W && cy >= 0 && cy < H && depth <= zb[cy * W + cx] + bias) continue; // 隠れている
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const x = cx + ox, y = cy + oy;
+        if (x < 0 || x >= W || y < 0 || y >= H) continue;
+        mask[((y * W + x) << 2) + 3] = 255;
+      }
+    }
+  }
+}
+
 let _lastDragCellBoxKey = null; // [DEBUG] ドラッグログ重複抑制用
 
 function PanelCanvas3D({
@@ -846,6 +876,8 @@ function PanelCanvas3D({
   hoverChamberId = null,
   onHoverChamber = null,
   onDropIcon = null,
+  onDropIconOnDoor = null,   // (doorId, iconData) 扉へのドロップ（座標は持たせない）
+  onMoveIconToDoor = null,   // (iconId, doorId) 扉アイコンを別の扉へ移す（doorIdの張り替えのみ）
   onMoveIcon = null,
   selectedIconId = null,
   selectedIconIds = null,
@@ -923,7 +955,22 @@ function PanelCanvas3D({
   const iconMoveDragRef = useRef(null);                     // 選択済みアイコンのドラッグ移動 {icon, x0, y0, groupKey, originalSlotIdx}
   const _iconDragCursorRef = useRef(null);                  // アイコンドラッグ中カーソル {sx, sy}
   const [iconDragPreview, setIconDragPreview] = useState(null); // ドラッグ移動中の候補座標 {wx,wy,wz} or null
-  const iconGroupRef = useRef(new Map());                   // groupKey -> {slotPositions, iconIds, chamberKey, face}
+  const iconGroupRef = useRef(new Map());                   // groupKey -> {slotPositions, iconIds, chamberKey, face, containerKey}
+  // アイコンをドラッグ中か: null / 'chamber' / 'door'。
+  // ドラッグ中に出してよい合図は「移動先プレビュー」だけ。移動元セル枠・区画amberハイライトは
+  // 出さない（置けない位置では何も出さないことで「置けない」が伝わる）。
+  // 旧実装は iconDragPreview の有無だけで抑止していたため、配置計算が一瞬 null になると
+  // 移動元枠とホバー区画枠が同時に復活し、オレンジ枠が2つ見える不具合になっていた。
+  const _iconDragKindRef = useRef(null);
+  // 扉アイコンのドラッグ中、カーソルが別の扉の上にあるときの移動先扉（プレビュー表示用）
+  const _doorDropTargetRef = useRef(null);
+  const _doorVisibleIdsRef = useRef(new Set()); // 実際に描画された扉のid（＝ドロップを受け付ける扉）
+  const _silCvsRef = useRef(null);      // 仕切り面シルエット（フル解像度ストローク）
+  const _silMaskCvsRef = useRef(null);  // その可視マスク（低解像度）
+  const _silZbRef = useRef(null);
+  const _silVisRef = useRef(null);
+  const _doorWireCvsRef = useRef(null);      // 扉の辺をフル解像度でストロークする作業用canvas
+  const _doorWireMaskCvsRef = useRef(null);  // その可視マスク（低解像度）
   const iconReorderPreviewRef = useRef(null);               // {groupKey, fromIdx, toIdx}
   const [iconReorderPreview, setIconReorderPreview] = useState(null); // 同一グループ内リオーダープレビュー
   const altCycleRef = useRef(0);                            // Alt層サイクル: 0=手前,1=奥,...
@@ -1012,14 +1059,11 @@ function PanelCanvas3D({
     _drawRafRef.current = requestAnimationFrame(() => {
     _drawRafRef.current = null;
     const _isCameraMoving = _isCamMovingRef.current || _isZoomingRef.current;
-    // 半減前提条件: 扉表示中 かつ (boxアイコン有 かつ 配線表示中) のときのみ重い → 半減効果あり
-    const _panelDispMode0 = panel.iconDisplayMode || 'flat';
-    const _hasBoxIconsForHR = (panel.placedIcons || []).some(ic => {
-      const m = (ic.iconDisplayMode === 'flat' || ic.iconDisplayMode === 'box') ? ic.iconDisplayMode : _panelDispMode0;
-      return m === 'box' && ic.wx != null;
-    });
-    const _needsLowRes = doorsVisible && _hasBoxIconsForHR && cablesVisible && (cables && cables.length > 0);
-    const _isCameraDragging = _isCameraMoving && _needsLowRes;
+    // 低解像度化はカメラが動いている間つねに適用する。
+    // 旧実装は「扉表示中 かつ boxアイコン有 かつ 配線表示中 かつ 配線1本以上」を前提条件にしていたが、
+    // その結果ほとんどの盤で dragResolution 設定が完全に無視されていた（実測: lowRes=false / 1フレーム56〜133ms）。
+    // 低解像度パスは Wr/Hr/projR/_scaleR に統一されており、配線0本・扉非表示でも成立する。
+    const _isCameraDragging = _isCameraMoving && dragResolution < 1;
     // 解像度半減: ドラッグ中は Wr×Hr(=W/2×H/2)でラスタライズ → ctx.drawImage で2倍拡大
     // projR: proj結果(W×H座標)を0.5倍スケールダウン → Wr×Hrバッファに正しく収まる
     const _scaleR = _isCameraDragging ? dragResolution : 1;
@@ -1030,6 +1074,7 @@ function PanelCanvas3D({
       : proj;
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const _perfT0 = (typeof window !== 'undefined' && window.__PANEL_PERF) ? performance.now() : 0;
     try {
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, W, H);
@@ -1131,10 +1176,12 @@ function PanelCanvas3D({
 
       // ── アイコン表示位置確定（グループ整列）: ZバッファパスとCanvas描画で共有 ──
       const _dispPos = new Map();
+      const _doorIconDisp = new Map();  // doorId -> [{icon, pos}]（扉描画直後のラベル描画で使う）
       {
         const _PW = panel.widthMm, _PH = panel.heightMm, _PD = panel.depthMm;
         const groups = {};
         (panel.placedIcons || []).forEach(icon => {
+          if (icon.doorId) return;   // 扉アイコンは後段の専用ループで処理（座標を持たず扉4隅から導出するため）
           if (icon.wx == null) return;
           const face = icon.face || (() => {
             const d = [
@@ -1144,9 +1191,7 @@ function PanelCanvas3D({
             ];
             return d.reduce((a,b)=>a[1]<b[1]?a:b)[0];
           })();
-          const gk = icon.chamberKey
-            ? `${icon.chamberKey}:${face}`
-            : `__solo__:${icon.id}`;
+          const gk = _iconGroupKey(icon, face);
           if (!groups[gk]) groups[gk] = { face, chamberKey: icon.chamberKey, icons: [] };
           groups[gk].icons.push(icon);
         });
@@ -1173,6 +1218,7 @@ function PanelCanvas3D({
             slotPositions: positions.map(p => ({ ...p, screenX: 0, screenY: 0 })),
             iconIds: g.icons.map(ic => ic.id),
             chamberKey: g.chamberKey, face: g.face,
+            containerType: 'chamber', containerKey: `chamber:${g.chamberKey}:${g.face}`,
           });
           const rp = iconReorderPreview;
           const originalOrderIds = g.icons.map(ic => ic.id);
@@ -1188,6 +1234,69 @@ function PanelCanvas3D({
             const ic = g.icons.find(x => x.id === id);
             if (ic) _dispPos.set(id, positions[i]);
           });
+        }
+        // ── 扉アイコン（doorIdを持つ）: 座標は毎回 扉4隅 から導出する ──
+        // 扉には仕切りが無くサブ区画が存在しないため「1つの扉 = 必ず1つの整列グループ」。
+        // 位置は「扉矩形＋グループ内の順番＋総数」で一意に決まるので個別座標を保存しない。
+        {
+          // 素の配置は共通コアが唯一の正（3次元図も同じ関数を使う）。
+          // 並び替え・扉間移動のプレビューはこの戻り値を後段で差し替える。
+          const _placements = pdcDoorIconPlacements(panel, iconLayouts);
+          const byDoor = {};
+          for (const [doorId, lst] of _placements) byDoor[doorId] = lst.map(e => e.icon);
+          for (const [doorId, entries] of _placements) {
+            const icons = entries.map(e => e.icon);
+            const positions = entries.map(e => e.pos);
+            const gk = _iconGroupKey(icons[0]);
+            const _door = (panel.doors || doors || []).find(d => d.id === doorId);
+            newGroupInfo.set(gk, {
+              slotPositions: positions.map(p => ({ ...p, screenX: 0, screenY: 0 })),
+              iconIds: icons.map(ic => ic.id),
+              chamberKey: null, face: _door ? _door.face : null,
+              containerType: 'door', containerKey: `door:${doorId}`, doorId,
+            });
+            // 並び替えプレビュー（区画側と同じ規約: fromIdx の要素を toIdx へ差し込む）
+            const rp = iconReorderPreview;
+            let orderedIds = icons.map(ic => ic.id);
+            if (rp && rp.groupKey === gk && rp.fromIdx !== rp.toIdx) {
+              const reord = [...orderedIds];
+              const [mv] = reord.splice(rp.fromIdx, 1);
+              reord.splice(rp.toIdx, 0, mv);
+              orderedIds = reord;
+            }
+            const lst = [];
+            orderedIds.forEach((id, i) => {
+              const ic = icons.find(x => x.id === id);
+              if (!ic) return;
+              _dispPos.set(id, positions[i]);
+              lst.push({ icon: ic, pos: positions[i] });
+            });
+            _doorIconDisp.set(doorId, lst);
+          }
+          // ── 扉→扉の移動プレビュー（描画だけを差し替える）──
+          // 「移動したらこうなる」をそのまま見せる: 移動元は抜けた並び、移動先は足した並びで整列し直す。
+          // ※ ここで newGroupInfo（＝当たり判定・並び替えの土台）は書き換えない。
+          //   以前は byDoor 自体を組み替えていたため、移動元グループが空になって消滅
+          //   → 次のmousemoveで移動先判定ができずプレビュー解除 → また成立…を往復し、
+          //   画面がチラついていた。「見せ方」と「当たり判定の土台」を分離するのが正。
+          const _dragIc = (_iconDragKindRef.current === 'door' && iconMoveDragRef.current)
+            ? iconMoveDragRef.current.icon : null;
+          const _tgtDoorId = _dragIc ? _doorDropTargetRef.current : null;
+          if (_tgtDoorId && _dragIc && _tgtDoorId !== _dragIc.doorId) {
+            const _relayout = (doorId, icons) => {
+              const door = (panel.doors || doors || []).find(d => d.id === doorId);
+              if (!door) return;
+              if (!icons.length) { _doorIconDisp.set(doorId, []); return; }
+              const lname = (iconLayouts || {})[`door:${doorId}`] || 'auto';
+              const pos = pdcDoorSlotPositions(door, panel, icons.length, lname);
+              if (!pos.length) return;
+              const lst = [];
+              icons.forEach((ic, i) => { _dispPos.set(ic.id, pos[i]); lst.push({ icon: ic, pos: pos[i] }); });
+              _doorIconDisp.set(doorId, lst);
+            };
+            _relayout(_dragIc.doorId, (byDoor[_dragIc.doorId] || []).filter(ic => ic.id !== _dragIc.id));
+            _relayout(_tgtDoorId, [...(byDoor[_tgtDoorId] || []), _dragIc]);
+          }
         }
         for (const [, info] of newGroupInfo) {
           info.slotPositions.forEach(sp => {
@@ -1339,6 +1448,7 @@ function PanelCanvas3D({
         }
 
         (panel.placedIcons || []).forEach(icon => {
+          if (icon.doorId) return;   // doorIdが正: 壊れたデータ（座標も持つ）でも扉アイコンとして扱う
           if (icon.wx == null) return;
           const _iMode = (icon.iconDisplayMode === 'flat' || icon.iconDisplayMode === 'box')
             ? icon.iconDisplayMode : _panelDispMode;
@@ -1525,13 +1635,15 @@ function PanelCanvas3D({
           _cvMaskCvsRef.current = _cvMaskCvs;
         } else { _cvMaskCvs.width = Wr; }
         _cvMaskCvsRef.current.getContext('2d').putImageData(new ImageData(cableVis, Wr, Hr), 0, 0);
+        // 配線も「線」なので常にフル解像度でストロークする（面だけ低解像度）。
+        // 可視判定マスク（cableVis）は低解像度のままなので、Zバッファ計算量は増えない。
         let _cvSmthCvs = _cvSmthCvsRef.current;
-        if (!_cvSmthCvs || _cvSmthCvs.width !== Wr || _cvSmthCvs.height !== Hr) {
+        if (!_cvSmthCvs || _cvSmthCvs.width !== W || _cvSmthCvs.height !== H) {
           _cvSmthCvs = typeof OffscreenCanvas !== 'undefined'
-            ? new OffscreenCanvas(Wr, Hr)
-            : Object.assign(document.createElement('canvas'), {width:Wr,height:Hr});
+            ? new OffscreenCanvas(W, H)
+            : Object.assign(document.createElement('canvas'), {width:W,height:H});
           _cvSmthCvsRef.current = _cvSmthCvs;
-        } else { _cvSmthCvs.width = Wr; }
+        } else { _cvSmthCvs.width = W; }
         const _cvSmthCtx = _cvSmthCvs.getContext('2d');
         _cvSmthCtx.lineJoin='round'; _cvSmthCtx.lineCap='round'; _cvSmthCtx.setLineDash([]);
         const _skipCIdSmth = (_wpDragRef.current && _cableEditModeRef.current) ? _cableEditModeRef.current.cableId : null;
@@ -1542,15 +1654,22 @@ function PanelCanvas3D({
           if (filtered.length > 0) _drawGroups.set(root, filtered);
         }
         // チェーン構築・パス生成・二重ストロークは共通コアが唯一の正（pdcBuildCableChains / pdcPaintCableChains）
-        // 半解像度キャンバス上での線幅は _scaleR 倍して、スケールアップ後に正しい太さになるようにする
+        // フル解像度キャンバスなので線幅のスケール補正（_scaleR倍）は不要。
+        // ただし経路の2D座標は projR（低解像度）で作られているため、描画時に 1/_scaleR で戻す。
+        _cvSmthCtx.save();
+        if (_scaleR !== 1) _cvSmthCtx.scale(1 / _scaleR, 1 / _scaleR);
         for (const members of _drawGroups.values()) {
           pdcPaintCableChains(_cvSmthCtx, pdcBuildCableChains(members), pdcCableStyle(members[0].cable),
             { widthScale: _scaleR * _cableWidthFactor, alpha: PDC_CABLE_STROKE_ALPHA });
         }
+        _cvSmthCtx.restore();
         // cableVis: Zバッファ（仕切り＋アイコンBox深度）でテストしたピクセルのみ残す
         // → アイコンBoxより手前にある配線のみ描画される（真のZ位置関係）
         _cvSmthCtx.globalCompositeOperation='destination-in'; _cvSmthCtx.globalAlpha=1;
-        _cvSmthCtx.drawImage(_cvMaskCvsRef.current,0,0); _cvSmthCtx.globalCompositeOperation='source-over';
+        _cvSmthCtx.imageSmoothingEnabled = false;   // 低解像度マスクの拡大でにじませない
+        _cvSmthCtx.drawImage(_cvMaskCvsRef.current, 0, 0, W, H);
+        _cvSmthCtx.imageSmoothingEnabled = true;
+        _cvSmthCtx.globalCompositeOperation='source-over';
         _cvSmthCvsForDraw = _cvSmthCvs;
       }
       // _iconOnlyMode: アイコンBoxをスナップショットcanvasにGPU-to-GPUコピーして保存
@@ -1570,16 +1689,23 @@ function PanelCanvas3D({
         _iconBoxSnapshot = snapC;
       }
 
+      // ドラッグ中の低解像度バッファは「補間なし（最近傍）」で拡大する。
+      // 補間するとボケて見え、これが「画質が落ちた」という見えの正体だった。
+      // 線はすでにフル解像度で描いているので、面がブロック状になっても輪郭は鮮鋭に保たれる。
+      const _paintSil = () => {};
+
       if (!_iconOnlyMode) {
         // ═══ opaqueモード（機器不透過）: 従来ロジックのまま（回帰防止のため一切変更しない）═══
         if (transparency > 0) {
           // 外箱の透明度に反比例: 外箱が99%不透明なら仕切りも1%しか見えない（共通コア）
           ctx.globalAlpha = pdcInteriorAlpha(transparency, solidAlpha);
           ctx.drawImage(offscreen, 0, 0, W, H);
+          _paintSil();
           ctx.globalAlpha = 1;
         } else if (!doorsVisible) {
           // 扉非表示+透明度0%: クリップなしで内部全体を表示
           ctx.drawImage(offscreen, 0, 0, W, H);
+          _paintSil();
         } else if (openDoorOpenings.length > 0) {
           // 透明度0%: 開扉の開口部だけにクリップして100%で合成
           ctx.save();
@@ -1591,9 +1717,11 @@ function PanelCanvas3D({
           }
           ctx.clip();
           ctx.drawImage(offscreen, 0, 0, W, H);
+          _paintSil();
           ctx.restore();
         } else if (!_cableXrayMode) {
           ctx.drawImage(offscreen, 0, 0, W, H);
+          _paintSil();
         }
         // _cableXrayMode で密閉（透明度0・扉表示中・開扉なし）のときは何も描かない。
         // 配線のためだけにbig-ifへ入っているので、仕切りを100%で描くと密閉箱が透けて見える回帰になる
@@ -1696,7 +1824,7 @@ function PanelCanvas3D({
       }
 
       // ホバー区画ハイライト: amber枠 + 白半透明フィル（ドラッグ中・ケーブルモード中は非表示）
-      if (hoverChamberId && !iconDragPreview && !_cableModeActive && chambers.length > 0) {
+      if (hoverChamberId && !iconDragPreview && !_cableModeActive && !_iconDragKindRef.current && chambers.length > 0) {
         const hch = chambers.find(c => c.id === hoverChamberId);
         if (hch) {
           for (const wall of visWalls) {
@@ -1709,7 +1837,7 @@ function PanelCanvas3D({
               for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
               ctx.closePath(); ctx.fill();
               ctx.globalAlpha = 1;
-              ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 2;
+              ctx.strokeStyle = PDC_ICON_BOX_SELECT.color; ctx.lineWidth = PDC_ICON_BOX_SELECT.lineWidth;
               ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
               for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
               ctx.closePath(); ctx.stroke();
@@ -1731,13 +1859,18 @@ function PanelCanvas3D({
           proj(iCell.xMax,iCell.yMax,iCell.zMax), proj(iCell.xMin,iCell.yMax,iCell.zMax),
         ];
         const edges12 = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
-        ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 2; ctx.globalAlpha = 1;
+        ctx.strokeStyle = PDC_ICON_BOX_SELECT.color; ctx.lineWidth = PDC_ICON_BOX_SELECT.lineWidth; ctx.globalAlpha = 1;
         for (const [a,b] of edges12) {
           ctx.beginPath(); ctx.moveTo(bc[a].x, bc[a].y); ctx.lineTo(bc[b].x, bc[b].y); ctx.stroke();
         }
       };
-      if (selectedIconId && !iconDragPreview) _drawIconCellBox(selectedIconId);
-      if (hoveredIconId && hoveredIconId !== selectedIconId && !iconDragPreview) _drawIconCellBox(hoveredIconId);
+      // アイコンのドラッグ中は「移動元の住処セル枠」を描かない。出してよいのは移動先プレビューだけ。
+      // （旧実装は !iconDragPreview だけで抑止していたため、配置計算が一瞬nullになると
+      //   移動元枠とホバー区画枠が同時に出て、オレンジ枠が2つ見えていた）
+      if (!_iconDragKindRef.current) {
+        if (selectedIconId && !iconDragPreview) _drawIconCellBox(selectedIconId);
+        if (hoveredIconId && hoveredIconId !== selectedIconId && !iconDragPreview) _drawIconCellBox(hoveredIconId);
+      }
 
       // ── ドラッグ中の移動先セルワイヤーフレーム（配置計算が決定したcellBoxを直接使用）──
       if (iconDragPreview && iconDragPreview.cellBox) {
@@ -1803,21 +1936,28 @@ function PanelCanvas3D({
           _edgeMaskCvsRef.current = _eMaskCvs;
         }
         _eMaskCvs.getContext('2d').putImageData(new ImageData(_eVis, Wr, Hr), 0, 0);
+        // ── 線は常にフル解像度で描く（面だけ低解像度）──
+        // 回転中の「画質が落ちた」という見えは、面ではなく**線がボケる**ことで生じる。
+        // そこで重い部分（Zバッファ＝可視判定）は低解像度 Wr×Hr のまま、
+        // ストロークだけ W×H で行い、低解像度マスクを拡大して destination-in で切り抜く。
+        // 隠線の切れ目の粒度は低解像度のままだが、線そのものは鮮鋭に保たれる。
         let _eCvs = _edgeStrokeCvsRef.current;
-        if (!_eCvs || _eCvs.width !== Wr || _eCvs.height !== Hr) {
+        if (!_eCvs || _eCvs.width !== W || _eCvs.height !== H) {
           _eCvs = typeof OffscreenCanvas !== 'undefined'
-            ? new OffscreenCanvas(Wr, Hr)
-            : Object.assign(document.createElement('canvas'), { width: Wr, height: Hr });
+            ? new OffscreenCanvas(W, H)
+            : Object.assign(document.createElement('canvas'), { width: W, height: H });
           _edgeStrokeCvsRef.current = _eCvs;
-        } else { _eCvs.width = Wr; } // 前フレームの内容をリセット
+        } else { _eCvs.width = W; } // 前フレームの内容をリセット
         const _eCtx = _eCvs.getContext('2d');
-        pdcPaintPartitionEdges(_eCtx, solids, _edgeViewR, 1);
+        pdcPaintPartitionEdges(_eCtx, solids, pdcView, 1);   // ← フル解像度のview（線幅もCSS px基準）
         _eCtx.globalCompositeOperation = 'destination-in';
         _eCtx.globalAlpha = 1;
-        _eCtx.drawImage(_eMaskCvs, 0, 0);
+        _eCtx.imageSmoothingEnabled = false;  // マスクの拡大でにじませない（切れ目をぼかさない）
+        _eCtx.drawImage(_eMaskCvs, 0, 0, W, H);
+        _eCtx.imageSmoothingEnabled = true;
         _eCtx.globalCompositeOperation = 'source-over';
         ctx.globalAlpha = _edgeAlpha;
-        ctx.drawImage(_eCvs, 0, 0, W, H);
+        ctx.drawImage(_eCvs, 0, 0);
         ctx.globalAlpha = 1;
       } else {
         // 万一 partOnlyZb が無ければ従来動作（マスクなし）にフォールバック
@@ -1861,14 +2001,18 @@ function PanelCanvas3D({
       // transparency=0: Z-buffer描画（仕切りと同方式）→ 外箱面との正確な前後関係
       // transparency>0: Painter's Algorithm（半透明）
       const doorHits = [];
+      const _doorIconHits = [];         // 扉アイコンの当たり判定（後で iconHitRef に合流させる）
+      _doorVisibleIdsRef.current = new Set();
       if (doorsVisible) {
         // 収集・ソートは共通コア。ptsR（低解像度rasterizer用）はエディタ固有なので後付け
         const { doorHits: _pdcDoorHits, doorRenderList } = pdcCollectDoors(panel, pdcView);
         doorHits.push(..._pdcDoorHits);
+        // 実際に描かれた扉だけをドロップ対象にする（閉扉かつ裏向きは収集時点で除外済み）
+        _doorVisibleIdsRef.current = new Set(doorRenderList.map(it => it.door.id));
         for (const it of doorRenderList) {
           it.ptsR = it.corners.map(([x,y,z]) => projR(x,y,z)); // rasterizer用(Wr×Hr)
         }
-        const _doorCol = panel.color || '#4A90D9';
+        const _doorCol = pdcPanelColor(panel);   // 盤の色は共通コアから（直書き禁止）
         const [_dr0, _dg0, _db0] = _hexToRGB(_doorCol);
 
         if (transparency === 0 && outerZb) {
@@ -1901,9 +2045,13 @@ function PanelCanvas3D({
           const _zbForWire = partOnlyZb || partZb;
           if (_zbForWire) { for (let _i = 0; _i < wireZb.length; _i++) { if (_zbForWire[_i] > wireZb[_i]) wireZb[_i] = _zbForWire[_i]; } }
           const _zbDummy = new Uint8ClampedArray(Wr * Hr * 4);
+          // 扉の辺: 可視判定（低解像度Zバッファ）と実際のストローク（フル解像度）を分離する。
+          // 回転中の「画質が落ちた」という見えは面ではなく線のボケなので、線だけ常にW×Hで描く。
+          const _doorWireMask = new Uint8ClampedArray(Wr * Hr * 4); // 見える所だけ alpha=255
+          const _doorWireSegs = [];                                  // [[p0,p1], ...] フル解像度座標
           // fill → wireframe → wireZb更新 を扉ごとにインターリーブ
           // （奥→手前の順なので手前fill描画後にwireZbを更新すれば次の扉には影響しない）
-          for (const { door: dItem, ptsR } of doorRenderList) {
+          for (const { door: dItem, ptsR, pts: ptsF } of doorRenderList) {
             const n = ptsR.length;
             // 1. fill描画
             const mountN = _DOOR_MOUNT_NORMALS[dItem.face] || {nx:0,ny:-1,nz:0};
@@ -1927,12 +2075,15 @@ function PanelCanvas3D({
               const hingeEdgeIdx = effSideO === 'right' ? 1 : 3;
               for (let i = 0; i < n; i++) {
                 const bias = i === hingeEdgeIdx ? -2 : 1.0;
-                _rasterLine(doorImgData.data, wireZb, Wr, Hr, ptsR[i], ptsR[(i + 1) % n], 100, 150, 255, bias);
+                // 可視判定だけ低解像度Zで行い、線そのものは後段でフル解像度ストロークする
+                _rasterLineMask(_doorWireMask, wireZb, Wr, Hr, ptsR[i], ptsR[(i + 1) % n], bias);
+                _doorWireSegs.push([ptsF[i], ptsF[(i + 1) % n]]);
               }
             } else {
               // 閉扉: 取り付け面除外のouterZbを使用（同一面上でwireframeが通過できる）
               for (let i = 0; i < n; i++) {
-                _rasterLine(doorImgData.data, outerZb, Wr, Hr, ptsR[i], ptsR[(i + 1) % n], 100, 150, 255, 0);
+                _rasterLineMask(_doorWireMask, outerZb, Wr, Hr, ptsR[i], ptsR[(i + 1) % n], 0);
+                _doorWireSegs.push([ptsF[i], ptsF[(i + 1) % n]]);
               }
             }
             // 3. wireZbにこの扉のfill深度を積算（以降の扉はこの扉のfillで遮蔽される）
@@ -1941,16 +2092,86 @@ function PanelCanvas3D({
             }
           }
           offCtx.putImageData(doorImgData, 0, 0);
-          ctx.drawImage(offscreen, 0, 0, W, H);
+          ctx.drawImage(offscreen, 0, 0, W, H);   // 面（低解像度→拡大）
+          // 辺: フル解像度でストロークし、低解像度の可視マスクで切り抜いて重ねる
+          if (_doorWireSegs.length) {
+            let _dwCvs = _doorWireCvsRef.current;
+            if (!_dwCvs || _dwCvs.width !== W || _dwCvs.height !== H) {
+              _dwCvs = typeof OffscreenCanvas !== 'undefined'
+                ? new OffscreenCanvas(W, H)
+                : Object.assign(document.createElement('canvas'), { width: W, height: H });
+              _doorWireCvsRef.current = _dwCvs;
+            } else { _dwCvs.width = W; }
+            const _dwCtx = _dwCvs.getContext('2d');
+            _dwCtx.strokeStyle = PDC_DOOR_WIRE.css;
+            _dwCtx.lineWidth = PDC_DOOR_WIRE.lineWidth;
+            _dwCtx.beginPath();
+            for (const [a, b] of _doorWireSegs) { _dwCtx.moveTo(a.x, a.y); _dwCtx.lineTo(b.x, b.y); }
+            _dwCtx.stroke();
+            let _dwMask = _doorWireMaskCvsRef.current;
+            if (!_dwMask || _dwMask.width !== Wr || _dwMask.height !== Hr) {
+              _dwMask = typeof OffscreenCanvas !== 'undefined'
+                ? new OffscreenCanvas(Wr, Hr)
+                : Object.assign(document.createElement('canvas'), { width: Wr, height: Hr });
+              _doorWireMaskCvsRef.current = _dwMask;
+            }
+            _dwMask.getContext('2d').putImageData(new ImageData(_doorWireMask, Wr, Hr), 0, 0);
+            _dwCtx.globalCompositeOperation = 'destination-in';
+            _dwCtx.imageSmoothingEnabled = false;   // 切れ目をぼかさない
+            _dwCtx.drawImage(_dwMask, 0, 0, W, H);
+            _dwCtx.globalCompositeOperation = 'source-over';
+            ctx.drawImage(_dwCvs, 0, 0);
+          }
         } else {
           // 半透明: Painter's Algorithm（panelDrawCore.js 共通コア）
           pdcPaintDoorsTranslucent(ctx, doorRenderList, panel.color, solidAlpha, pdcView);
         }
 
+        // ── 扉に貼られたアイコン: ラベルのみ描画（アイコンBoxは描かない）──
+        // doorRenderList は遠→近ソート済み。閉扉かつ裏向きの扉は収集時点で除外されているため
+        // 「正面（外側）に貼られている」＝裏から見たときにラベルが出ない、が自動的に成立する。
+        // 区画のflatアイコンと同じ「小さな四角＋ラベル」で描く（見た目・掴む場所を共通化）。
+        // 四角の角は区画アイコンと同じ形式で iconHitRef へ流し、選択・ドラッグ並び替えの
+        // 既存機構（mousedownの最前面アイコン判定 → iconMoveDragRef → 最近傍スロット）に合流させる。
+        for (const { door: dItem } of doorRenderList) {
+          const lst = _doorIconDisp.get(dItem.id);
+          if (!lst) continue;
+          for (const { icon, pos } of lst) {
+            const isSel = icon.id === selectedIconId || icon.id === hoveredIconId;
+            const isReord = iconReorderPreview && icon.id === selectedIconId;
+            // 別の扉へ運んでいる最中の当人はゴースト表示（移動後にここへ入る、という合図）
+            const isGhost = _doorDropTargetRef.current === dItem.id
+              && iconMoveDragRef.current && iconMoveDragRef.current.icon.id === icon.id;
+            // 四角＋ラベルの見た目は共通コアが唯一の正（3次元図も同じ関数を呼ぶ）
+            const corners = pdcPaintDoorIcon(ctx, dItem, panel, pdcView, icon, pos,
+              { isSel, isGhost: isGhost || isReord });
+            if (!corners) continue;
+            if (!isGhost) _doorIconHits.push({ icon, corners }); // ゴーストは掴む対象にしない
+          }
+        }
+
+        // ── 扉アイコンを「別の扉」へ運んでいる最中のプレビュー ──
+        // 移動先の扉を amber で囲み、追加されたときに入る位置へゴーストの四角を描く。
+        // 位置は既存のスロット計算（pdcDoorSlotPositions）をそのまま使う（独自計算をしない）。
+        if (_doorDropTargetRef.current) {
+          const tgt = doorRenderList.find(it => it.door.id === _doorDropTargetRef.current);
+          if (tgt) {
+            ctx.save();
+            ctx.globalAlpha = 1; ctx.setLineDash([]);
+            ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 2.5;
+            ctx.beginPath(); ctx.moveTo(tgt.pts[0].x, tgt.pts[0].y);
+            for (let i = 1; i < tgt.pts.length; i++) ctx.lineTo(tgt.pts[i].x, tgt.pts[i].y);
+            ctx.closePath(); ctx.stroke();
+            // ゴーストの四角自体は上のアイコン描画ループが「移動後の並び」で描いている
+            // （移動先の扉は N+1 個で整列し直され、運んでいる当人だけゴースト色になる）
+            ctx.restore();
+          }
+        }
+
         const _drawDoorOutline = (doorId) => {
           const hit = doorHits.find(dh => dh.door.id === doorId);
           if (!hit) return;
-          ctx.strokeStyle = '#FBBF24'; ctx.lineWidth = 2; ctx.globalAlpha = 1;
+          ctx.strokeStyle = PDC_ICON_BOX_SELECT.color; ctx.lineWidth = PDC_ICON_BOX_SELECT.lineWidth; ctx.globalAlpha = 1;
           ctx.beginPath(); ctx.moveTo(hit.pts[0].x, hit.pts[0].y);
           for (let i=1; i<hit.pts.length; i++) ctx.lineTo(hit.pts[i].x, hit.pts[i].y);
           ctx.closePath(); ctx.stroke();
@@ -2497,7 +2718,10 @@ function PanelCanvas3D({
       }
 
       // ── Step 3.78: アイコンドラッグ中 — 最近傍区画のオレンジ枠表示 ──
-      if (iconMoveDragRef.current && _cableNearestDotRef.current) {
+      // 「移動先を示す枠は常に1つだけ」: iconDragPreview の枠があるときはそちらが正なので描かない
+      // （両方描くと仕切り際でオレンジ枠が2つ見える）。扉アイコンは区画へ着地しないので対象外。
+      if (_iconDragKindRef.current === 'chamber' && !iconDragPreview
+          && iconMoveDragRef.current && _cableNearestDotRef.current) {
         const _sc = _cableNearestDotRef.current.snapCell;
         if (_sc) {
           const _sdc = [
@@ -2752,6 +2976,7 @@ function PanelCanvas3D({
           return proj(da.wx||0, da.wy||0, da.wz||0).depth - proj(db.wx||0, db.wy||0, db.wz||0).depth;
         });
         _sortedIcons.forEach(icon => {
+          if (icon.doorId) return;   // doorIdが正: 壊れたデータ（座標も持つ）でも扉アイコンとして扱う
           if (icon.wx == null || icon.wy == null || icon.wz == null) return;
           if (iconDragPreview && icon.id === selectedIconId) return;
 
@@ -2868,7 +3093,8 @@ function PanelCanvas3D({
             pdcPaintIconLabel(ctx, proj(dwx, dwy, dwz), _label, pdcView, { alpha: ctx.globalAlpha });
           }
         });
-        iconHitRef.current = hits;
+        // 扉アイコンも同じ当たり判定リストに載せる（容器が扉か区画かで機構を分けない）
+        iconHitRef.current = hits.concat(_doorIconHits);
 
         ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
 
@@ -2985,13 +3211,9 @@ function PanelCanvas3D({
       const doorCandidates = [];
       if (doorPlaceMode && doorPlaceMode !== 'hover') {
         const { strict, extended } = deriveFaceDoorCandidates(panel, doorPlaceMode);
-        const _W=panel.widthMm, _H=panel.heightMm, _D=panel.depthMm;
-        const faceUV=(u,v)=>{ switch(doorPlaceMode){
-          case 'front': return[u,0,v];   case 'back':  return[u,_D,v];
-          case 'left':  return[0,u,v];   case 'right': return[_W,u,v];
-          case 'top':   return[u,v,_H];  case 'bottom':return[u,v,0];
-          default: return[u,0,v];
-        }};
+        // 面UV→盤ローカルxyz は pdcFaceUV が唯一の正。自前コピーは規約ずれの温床
+        // （同じ変換を手書きした doorToChamberId が上下反転していた実害あり）
+        const faceUV=(u,v)=>pdcFaceUV(doorPlaceMode, u, v, panel);
         // 選択面をオレンジ点線枠で描画（展開図と同じ表現）
         const _selFaceDefs = _boxFaceDefs(panel.widthMm, panel.depthMm, panel.heightMm);
         for (const face of _selFaceDefs) {
@@ -3141,12 +3363,7 @@ function PanelCanvas3D({
         if (selDoor && doorsVisible) {
           const { uMm: du, vMm: dv, widthMm: dw, heightMm: dh, face } = selDoor;
           const _W = panel.widthMm, _H = panel.heightMm, _D = panel.depthMm;
-          const fuv = (u, v) => { switch(face) {
-            case 'front':  return [u, 0,   v]; case 'back':   return [u, _D, v];
-            case 'left':   return [0, u,   v]; case 'right':  return [_W, u, v];
-            case 'top':    return [u, v,  _H]; case 'bottom': return [u, v,  0];
-            default: return [u, 0, v];
-          }};
+          const fuv = (u, v) => pdcFaceUV(face, u, v, panel);   // 自前コピーはしない（pdcFaceUVが唯一の正）
           const FACE_MAX = {
             front:{uM:_W,vM:_H}, back:{uM:_W,vM:_H},
             left:{uM:_D,vM:_H},  right:{uM:_D,vM:_H},
@@ -3268,6 +3485,16 @@ function PanelCanvas3D({
       if (gizmoHandles.length > 0) {
         ctx.fillStyle = 'rgba(251,191,36,0.85)';
         ctx.fillText('● 位置移動　◆ 端点/範囲変更', W/2, H-19);
+      }
+      if (_perfT0) {
+        console.log('[PANEL_PERF]', {
+          ms: +(performance.now() - _perfT0).toFixed(1),
+          lowRes: _isCameraDragging, scaleR: _scaleR,
+          buf: `${Wr}x${Hr}`, canvas: `${W}x${H}`,
+          doorsVisible, cables: (cables || []).length, cablesVisible,
+          solids: solids.length, icons: (panel.placedIcons || []).length,
+          doors: (panel.doors || []).length, transparency, iconVisMode,
+        });
       }
     } catch (err) {
       console.error('[PanelCanvas3D]', err);
@@ -3545,7 +3772,9 @@ function PanelCanvas3D({
       if (bestIcon) {
         // 扉が手前にある場合はアイコンhitを無効化（扉優先）
         let doorBlocksIcon = false;
-        for (const { pts, depth: dDepth } of doorHitRef.current) {
+        for (const { door: _dr, pts, depth: dDepth } of doorHitRef.current) {
+          // 自分が貼られている扉は自分を遮らない（でないと扉アイコンは永久に掴めない）
+          if (bestIcon.doorId && _dr.id === bestIcon.doorId) continue;
           let inside = false;
           for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
             const xi = pts[i].x, yi = pts[i].y;
@@ -3564,8 +3793,10 @@ function PanelCanvas3D({
             if (idx !== -1) { groupKey = gk; originalSlotIdx = idx; break; }
           }
           iconMoveDragRef.current = { icon: bestIcon, x0: e.clientX, y0: e.clientY, groupKey, originalSlotIdx };
+          _iconDragKindRef.current = bestIcon.doorId ? 'door' : 'chamber';
           // mousemove前にAltサイクルを有効化: mousedown位置で区画リストを即初期化
-          {
+          // （扉アイコンは区画へ着地しないため対象外）
+          if (!bestIcon.doorId) {
             const { az: azD, el: elD, zoom: zD, panX: pxD, panY: pyD } = cameraRef.current;
             const hitD = _hitTestFace(e.clientX - rect.left, e.clientY - rect.top, panel, azD, elD, zD, pxD, pyD, W, H);
             if (hitD) {
@@ -3579,6 +3810,9 @@ function PanelCanvas3D({
           }
         } else {
           iconClickRef.current = { icon: bestIcon, x0: e.clientX, y0: e.clientY, _cableMode: !!_cableAddModeRef.current };
+          // 扉上のアイコンは「扉本体のドラッグ移動」より優先する。
+          // ここでreturnしないと後段の doorPosDragRef 判定に落ち、扉ごと動いてしまう。
+          if (bestIcon.doorId) return;
         }
         } // !doorBlocksIcon
       }
@@ -3812,7 +4046,7 @@ function PanelCanvas3D({
     }
     // 選択済みアイコンのドラッグ移動中: ホバー区画 + プレビュー座標を更新
     if (iconMoveDragRef.current) {
-      const { x0, y0, groupKey, originalSlotIdx } = iconMoveDragRef.current;
+      const { icon: _dragIcon, x0, y0, groupKey, originalSlotIdx } = iconMoveDragRef.current;
       if (Math.hypot(e.clientX - x0, e.clientY - y0) > 5) {
         if (canvasRef.current) canvasRef.current.style.cursor = 'grabbing';
         const rect = canvasRef.current.getBoundingClientRect();
@@ -3826,7 +4060,8 @@ function PanelCanvas3D({
 
         // Altサイクル用: リオーダー/通常モード両方で常に更新（リオーダー中もAlt押下を有効にする）
         lastDragCursorRef.current = { clientX: e.clientX, clientY: e.clientY };
-        if (hit) {
+        // 扉アイコンは区画スロットへ着地しないので、Alt層サイクル用の候補も作らない
+        if (hit && !(_dragIcon && _dragIcon.doorId)) {
           const allChs = hitAllChambers(hit.face, hit.uMm, hit.vMm, chambers, panel);
           const builtSlots = buildAltSlots(hit.face, hit.uMm, hit.vMm, allChs, panel);
           altSlotsRef.current = builtSlots;
@@ -3836,8 +4071,45 @@ function PanelCanvas3D({
 
         // ── グループアイコン: 明示的に別区画に移った場合のみ通常移動、それ以外はリオーダーモード ──
         const info = groupKey ? iconGroupRef.current.get(groupKey) : null;
-        const movedToOtherChamber = info && hch && chamberStableKey(hch) !== info.chamberKey;
-        if (info && !movedToOtherChamber) {
+        // 容器（区画+面 / 扉）の同一性で判定する。扉グループは chamberKey を持たないため
+        // chamberKey 直接比較ではなく containerKey 比較へ一般化している。
+        // 扉グループのドラッグは第1段階では「並び替え専用」。扉アイコンは wx/wy/wz/chamberKey/cellBox を
+        // 持たないため、区画への通常移動へ落とすとデータモデルが破綻する（扉→区画の移動は将来の明示経路で）。
+        const movedToOtherContainer = info && hch && info.containerType !== 'door' &&
+          `chamber:${chamberStableKey(hch)}:${info.face}` !== info.containerKey;
+        // 扉アイコンが「別の扉」の上にいるときは並び替えではなく扉の移り替え。
+        // ここで並び替えプレビューを消しておかないと、mouseupが常に並び替えで確定してしまい
+        // 別の扉へ移せない（元の扉のスロットが必ず最近傍として当たるため）。
+        // 判定の基準はドラッグ中アイコン自身の doorId（グループ情報に依存させない）。
+        // グループ側を基準にすると、プレビューでグループが変化した瞬間に判定が止まり振動する。
+        let _overOtherDoor = null;
+        if (_dragIcon && _dragIcon.doorId) {
+          let _bd = -Infinity;
+          for (const { door: _dr, pts: _dpts, depth: _dd } of doorHitRef.current) {
+            if (_dr.id === _dragIcon.doorId) continue;
+            if (!_doorVisibleIdsRef.current.has(_dr.id)) continue;
+            if (_ptInPoly(mx2, my2, _dpts) && _dd > _bd) { _bd = _dd; _overOtherDoor = _dr; }
+          }
+        }
+        if (_overOtherDoor) {
+          if (iconReorderPreviewRef.current) {
+            iconReorderPreviewRef.current = null;
+            setIconReorderPreview(null);
+          }
+          setIconDragPreview(null);
+          if (onHoverChamber) onHoverChamber(null);
+          // 移動先の扉を記録 → 描画側が「その扉の枠＋追加される位置のゴースト」を出す
+          if (_doorDropTargetRef.current !== _overOtherDoor.id) {
+            _doorDropTargetRef.current = _overOtherDoor.id;
+            _setDrawVersion(v => v + 1);
+          }
+          return;
+        }
+        if (_doorDropTargetRef.current) {
+          _doorDropTargetRef.current = null;
+          _setDrawVersion(v => v + 1);
+        }
+        if (info && !movedToOtherContainer) {
           // リオーダーモード: 最近スロットを探す（スクリーン座標で近傍判定）
           let nearestIdx = originalSlotIdx, nearestDist = Infinity;
           info.slotPositions.forEach((sp, i) => {
@@ -3852,7 +4124,9 @@ function PanelCanvas3D({
             setIconReorderPreview(newRp);
           }
           setIconDragPreview(null);
-          if (onHoverChamber) onHoverChamber(hch ? hch.id : null);
+          // 扉アイコンは区画へ着地しないので、カーソル奥の区画をハイライトしない
+          // （オレンジの区画選択枠が出ると「そこへ置ける」と誤解させる）
+          if (onHoverChamber) onHoverChamber(info.containerType === 'door' ? null : (hch ? hch.id : null));
           return;
         }
 
@@ -4224,6 +4498,7 @@ function PanelCanvas3D({
     if (iconMoveDragRef.current) {
       const { icon, x0, y0, groupKey } = iconMoveDragRef.current;
       iconMoveDragRef.current = null;
+      _iconDragKindRef.current = null; _doorDropTargetRef.current = null;
       _iconDragCursorRef.current = null;
       const rp = iconReorderPreviewRef.current;
       const altSlot = altSelectedSlotRef.current; // keydown時点で確定したスロット（mousemoveの再構築に影響されない）
@@ -4249,6 +4524,20 @@ function PanelCanvas3D({
             reorderedIds.splice(rp.toIdx, 0, mv);
             onReorderIcon(reorderedIds);
           }
+        } else if (icon.doorId) {
+          // 扉アイコンの着地先は「同じ扉の別スロット（並び替え）」か「別の扉」だけ。
+          // 区画へ落とすと wx/wy/wz/chamberKey/cellBox が付き、扉に貼ったまま区画のBoxとしても
+          // 描かれてしまう（扉を貫通したBox）。よってここでは扉だけを見る。
+          const rectU = canvasRef.current.getBoundingClientRect();
+          const sxU = W / rectU.width, syU = H / rectU.height;
+          const mxU = (e.clientX - rectU.left) * sxU, myU = (e.clientY - rectU.top) * syU;
+          let tgtDoor = null, tgtDepth = -Infinity;
+          for (const { door: dr, pts, depth } of doorHitRef.current) {
+            if (dr.id === icon.doorId) continue;                       // 同じ扉は並び替えで処理済み
+            if (!_doorVisibleIdsRef.current.has(dr.id)) continue;      // 見えていない扉には置かない
+            if (_ptInPoly(mxU, myU, pts) && depth > tgtDepth) { tgtDepth = depth; tgtDoor = dr; }
+          }
+          if (tgtDoor && onMoveIconToDoor) onMoveIconToDoor(icon.id, tgtDoor.id);
         } else if (onMoveIcon) {
           // 通常移動（別区画への移動）— Alt未使用はhitChamber優先、Alt使用時はaltSlot(keydown確定)を参照
           const rect = canvasRef.current.getBoundingClientRect();
@@ -4962,6 +5251,32 @@ function PanelCanvas3D({
           const raw = e.dataTransfer.getData('application/panel-icon');
           if (!raw) return;
           const rect = canvasRef.current.getBoundingClientRect();
+          // ── 扉を先に判定する ──
+          // 開扉は箱の外に張り出すため _hitTestFace（箱の面を拾う関数）では拾えない。
+          // 扉の投影多角形で先に見て、重なりは depth で最前面を採る。
+          if (onDropIconOnDoor && doorsVisible) {
+            const sxD = W / rect.width, syD = H / rect.height;
+            const mxD = (e.clientX - rect.left) * sxD, myD = (e.clientY - rect.top) * syD;
+            let bestDoor = null, bestDepth = -Infinity;
+            const _nsD = 1; // エディタ規約: depth大 = 手前
+            for (const { door, pts, depth } of doorHitRef.current) {
+              if (!_doorVisibleIdsRef.current.has(door.id)) continue; // 見えない扉は受け付けない
+              let inside = false;
+              for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+                if ((pts[i].y > myD) !== (pts[j].y > myD) &&
+                    mxD < (pts[j].x - pts[i].x) * (myD - pts[i].y) / (pts[j].y - pts[i].y) + pts[i].x)
+                  inside = !inside;
+              }
+              if (inside && depth * _nsD > bestDepth) { bestDepth = depth * _nsD; bestDoor = door; }
+            }
+            if (bestDoor) {
+              // 位置は自動整列（扉4隅から毎回導出）なのでドロップ座標は使わない。
+              // 扉のどちら側からドロップされても「外面に貼られた」扱い。
+              onDropIconOnDoor(bestDoor.id, JSON.parse(raw));
+              altCycleRef.current = 0;
+              return;
+            }
+          }
           const hit = _hitTestFace(e.clientX - rect.left, e.clientY - rect.top, panel, az, el, zoom, panX, panY, W, H);
           if (!hit) return;
           // 新規ドロップ: hitChamber + カーソル位置Y（ySpecific相当）

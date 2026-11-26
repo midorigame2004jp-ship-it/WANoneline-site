@@ -131,8 +131,10 @@ function usePanelEditorState(initialPanels = []) {
       const updated = { ...p, ...changes };
       // 寸法変化がなければ仕切り更新不要
       const dimAxes = { widthMm: 'x', depthMm: 'y', heightMm: 'z' };
-      let partitions = p.partitions;
-      let doors = p.doors || [];
+      // 初期値は changes 優先。更新前の p から取ると、最終行の { ...updated, partitions, doors } で
+      // changes.doors / changes.partitions を握り潰してしまう（3次元図からの扉開閉が反映されない原因）。
+      let partitions = Array.isArray(changes.partitions) ? changes.partitions : p.partitions;
+      let doors = Array.isArray(changes.doors) ? changes.doors : (p.doors || []);
       for (const [dim, movingAxis] of Object.entries(dimAxes)) {
         if (changes[dim] == null || changes[dim] === p[dim]) continue;
         const oldMax = p[dim], newMax = changes[dim];
@@ -254,9 +256,18 @@ function usePanelEditorState(initialPanels = []) {
   // 扉削除（ロック中は不可）
   const deleteDoor = (panelId, doorId) => {
     if (_isLocked(panelId)) return;
-    setPanels(pr => pr.map(p =>
-      p.id === panelId ? { ...p, doors: (p.doors || []).filter(d => d.id !== doorId) } : p
-    ));
+    setPanels(pr => pr.map(p => {
+      if (p.id !== panelId) return p;
+      // 扉に貼られたアイコンも道連れで消す（扉が無いと座標を導出できず不可視ゾンビになるため）
+      const goneIds = new Set((p.placedIcons || []).filter(ic => ic.doorId === doorId).map(ic => ic.id));
+      return {
+        ...p,
+        doors: (p.doors || []).filter(d => d.id !== doorId),
+        placedIcons: (p.placedIcons || []).filter(ic => ic.doorId !== doorId),
+        // 消えたアイコンに繋がっていた配線も外す（端点だけ残った配線を作らない）
+        cables: (p.cables || []).filter(c => !goneIds.has(c.fromIconId) && !goneIds.has(c.toIconId)),
+      };
+    }));
   };
 
   // ケーブル追加（ロック中は不可）
@@ -299,6 +310,44 @@ function usePanelEditorState(initialPanels = []) {
     ));
   };
 
+  // ── 配置済み盤（3次元図の実体）の受け入れ ──
+  // 実体はテンプレートと同じ panels 配列に置き、placedId の有無だけで区別する。
+  // 別配列にすると編集・アンドゥ・描画をすべて二重に持つことになるため一本化する。
+  // 既に同じ placedId があれば「開き直し」なので作り直さず既存を返す（編集内容を失わない）。
+  const upsertPlacedPanel = (msg) => {
+    if (!msg || !msg.placedId) return null;
+    const existing = panels.find(p => p.placedId === msg.placedId);
+    if (existing) return existing;
+    if (!msg.panelData) return null;
+    const inst = {
+      ...msg.panelData,
+      placedId: msg.placedId,
+      serialNo: msg.serialNo,
+      templateId: msg.templateId,
+      templateName: msg.templateName,
+    };
+    setPanels(pr => pr.some(p => p.placedId === msg.placedId) ? pr : [...pr, inst]);
+    return inst;
+  };
+
+  // 3次元図に実在する placedId 群を受け取り、そこに無い実体を一覧から取り除く。
+  // テンプレート（placedId 無し）は対象外。
+  const prunePlacedPanels = (livingIds) => {
+    const alive = new Set(livingIds || []);
+    setPanels(pr => {
+      const kept = pr.filter(p => !p.placedId || alive.has(p.placedId));
+      return kept.length === pr.length ? pr : kept;
+    });
+  };
+
+  const removePlacedPanel = (placedId) => {
+    if (!placedId) return;
+    setPanels(pr => pr.filter(p => p.placedId !== placedId));
+    if (activePanelId && panels.find(p => p.id === activePanelId)?.placedId === placedId) {
+      setActivePanelId(null);
+    }
+  };
+
   return {
     panels,
     activePanelId,
@@ -307,6 +356,9 @@ function usePanelEditorState(initialPanels = []) {
     camera,
     setCamera,
     addPanel,
+    upsertPlacedPanel,
+    prunePlacedPanels,
+    removePlacedPanel,
     updatePanel,
     deletePanel,
     toggleLock,

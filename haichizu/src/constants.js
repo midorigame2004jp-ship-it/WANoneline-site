@@ -37,8 +37,43 @@ const initSegs = [
   { id: "s10", from: "t5", to: "cb5" }, { id: "s11", from: "cb5", to: "g3" },
 ];
 // 全ブロック統一: points[{x,y}] = 平面図座標, zBottom/zTop = 高さ範囲
+// ══ 動作確認用の既定データ・2026-09-06（ユーザー要望）══
+// 「毎回めんどいからデフォルトでこれしておいて → 床に1つ・壁に1つ・扉に1つ機器を置く」
+// 建屋Aの1階に、壁1枚・扉1つ・機器3つ（床置き／壁付け／扉付け）を最初から入れておく。
+// 【なぜ初期データに書くか】保存済みのレイアウトを読み込んだときは丸ごと差し替わるので、
+// **これは「何も保存されていないときだけ」出る**。ユーザーの作ったデータを壊さない。
+// 【単位】x,y = グリッドpx（1グリッド=0.1m）。壁の厚み・機器の寸法・高さ = メートル
+const INIT_BLD_A_FLOOR = {
+  id: 'floorA1', name: '', levelZ: 0, heightM: 3, slabThicknessM: 0.15,
+  outline: null, openings: [],
+  // 建屋Aの中を東西に横切る壁（20m〜50m の位置＝長さ30m）
+  partitions: [
+    { id: 'partA1', name: '', kind: 'wall',
+      a: { x: 200, y: 260 }, b: { x: 500, y: 260 },
+      thicknessM: 0.15, heightM: null, baseM: 0, color: null },
+  ],
+  // その壁の中央あたりに扉を1つ
+  doors: [
+    { id: 'doorA1', name: '扉', partitionId: 'partA1', uM: 15,
+      widthM: 0.9, heightM: 2.0, thicknessM: null, faceSide: 1,
+      hingeSide: 'left', isOpen: false },
+  ],
+  // 機器3つ。名前で区別できるようにしておく（動作確認でどれを触ったか言えるように）
+  icons: [
+    // ① 床置き（壁の手前・床の上に立つ箱）
+    { id: 'iconFloorA', name: '床の機器', iconType: 'generic', color: '#38BDF8',
+      partitionId: null, gx: 300, gy: 320, rotDeg: 0,
+      tM: 0, wM: 0.8, dM: 0.6, hM: 1.8 },
+    // ② 壁付け（壁の面に貼る板）
+    { id: 'iconWallA', name: '壁の機器', iconType: 'generic', color: '#FBBF24',
+      partitionId: 'partA1', side: 1, sM: 8, tM: 1.2, wM: 0.3, hM: 0.3 },
+    // ③ 扉付け（扉の面に貼る板）
+    { id: 'iconDoorA', name: '扉の機器', iconType: 'generic', color: '#FBBF24',
+      doorId: 'doorA1', side: 1, sM: 0.45, tM: 1.2, wM: 0.3, hM: 0.3 },
+  ],
+};
 const INIT_BUILDINGS = [
-  { id: "bld1", label: "建屋A", color: "#6B7A8D", blocks: [
+  { id: "bld1", label: "建屋A", color: "#6B7A8D", floors: [INIT_BLD_A_FLOOR], blocks: [
     { points: [{x:144,y:144},{x:576,y:144},{x:576,y:432},{x:144,y:432}], zBottom: 0, zTop: 15 }
   ]},
   { id: "bld2", label: "建屋B", color: "#7B8A9D", blocks: [

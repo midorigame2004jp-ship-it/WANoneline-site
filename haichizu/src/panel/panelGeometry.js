@@ -1,7 +1,12 @@
 // ================================================================
-// panelGeometry.js — 配電盤エディタ専用 3D投影・オートフィット
+// panelGeometry.js — 3D投影・逆投影・オートフィット（配電盤／建物エディタ共有）
 // geometry.js の project3D を TW/TH/METERS_PER_PX 非依存で再実装
 // 単位: mm
+//
+// 【共有ファイルである】当初は「配電盤エディタ専用」だったが、
+// 建物エディタの3Dプレビュー（BuildingPreview3D.jsx）も project3DPanel を使う。
+// 投影と逆投影は同じ数式の表裏なので、必ずこのファイルで対にして管理すること
+// （別ファイルに分けると az/el/zoom の規約や cy=-(wy-D/2) のY反転がズレる）
 // ================================================================
 
 // 3D投影（等角投影＋回転）
@@ -21,6 +26,51 @@ function project3DPanel(wx, wy, wz, panelW, panelH, panelD, az, el, zoom, panX, 
   const sy = (-ry * Math.sin(el) - cz * Math.cos(el)) * zoom + (panY || 0);
   const depth = ry * Math.cos(el) - cz * Math.sin(el);
   return { x: sx + (canvW || 600) / 2, y: sy + (canvH || 500) / 2, depth };
+}
+
+// ── 逆投影: 画面座標 →「高さ wz の水平面」上のワールド座標 ──
+// project3DPanel の厳密な逆。wz を決めれば cz が定まるので一意に解ける。
+// 用途: 3Dのまま壁を掴んで動かす／3Dで作図する／カーソル位置を拾う。
+//
+// 【特異点の扱い — geometry.js の作法に合わせる】
+// el≈0（カメラが水平）だと水平面が真横を向き、交点計算が発散する。
+// geometry.js は同じ問題に対して3世代かけて
+//   「null や クランプではなく、**常に有限の値をフォールバックで返す**」
+// という結論に達している（pickOrbitPivot / cabScreenToGroundPoint）。
+// null を返すと「壁を掴んでいる途中で理由もなく動かなくなる」体験になり、
+// 発散値を返すと NaN 座標が実データに混入する（geometry.js に実事故の記録あり）。
+// ここも同じ方針: 閾値は同じ 0.08、フォールバックは
+//   「視線レイ上で、その高さの面の中心にいちばん近い点」。
+// さらに最後に isFinite を保証する（ドラッグ中のプレビューは
+// bcApplyPartEdit の検証を通らないまま描画へ行くため、ここで止める必要がある）
+const PANEL_UNPROJECT_SINE_EPS = 0.08; // geometry.js の PICK_ORBIT_GROUND_SINE_EPS と同値
+function unproject3DPanelOnZ(screenX, screenY, wz, panelW, panelH, panelD, az, el, zoom, panX, panY, canvW, canvH) {
+  const W = panelW, H = panelH, D = panelD;
+  const zm = (zoom && isFinite(zoom) && Math.abs(zoom) > 1e-9) ? zoom : 1;
+  const cosA = Math.cos(az), sinA = Math.sin(az);
+  const cosE = Math.cos(el), sinE = Math.sin(el);
+  const cz0 = wz - H / 2;
+  // 画面座標を投影前の量へ戻す
+  const rx = (screenX - (canvW || 600) / 2 - (panX || 0)) / zm;
+  const sv = (screenY - (canvH || 500) / 2 - (panY || 0)) / zm; // = -ry*sinE - cz*cosE
+  let ry;
+  if (Math.abs(sinE) > PANEL_UNPROJECT_SINE_EPS) {
+    // 面と交わる。depth を消去して ry を解く
+    ry = -(sv + cz0 * cosE) / sinE;
+  } else {
+    // ほぼ真横。レイ上で「面の中心」にいちばん近い点を採る（常に有限）
+    // レイ: P(d) = (rx, -sinE*sv + cosE*d, -cosE*sv - sinE*d) / 方向は単位ベクトル
+    // 面の中心 R=(0,0,cz0) への最近点は d* = -sinE*cz0
+    const d = -sinE * cz0;
+    ry = -sinE * sv + cosE * d;
+  }
+  const cx = rx * cosA + ry * sinA;
+  const cy = -rx * sinA + ry * cosA;
+  const wx = cx + W / 2;
+  const wy = D / 2 - cy;
+  // NaN/Infinity を外へ出さない。壊れたら面の中心を返す
+  if (!isFinite(wx) || !isFinite(wy)) return { x: W / 2, y: D / 2, degenerate: true };
+  return { x: wx, y: wy, degenerate: Math.abs(sinE) <= PANEL_UNPROJECT_SINE_EPS };
 }
 
 // パネル8頂点を zoom=1 で投影しbboxからフィットパラメータを返す
