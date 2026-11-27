@@ -11115,18 +11115,37 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
           for (const block of data.blocks || []) {
             for (const paragraph of block.paragraphs) {
               for (const line of paragraph.lines) {
-                const text = line.text.trim().replace(/\s+/gu, ' ')
-                  .replace(/(?<=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]) (?=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}])/gu, '');
-                const {x0, x1, y0, y1} = line.bbox;
-                if (!text || ![x0,x1,y0,y1].every(Number.isFinite) || x1 <= x0 || y1 <= y0) continue;
-                const height = y1 - y0;
-                const baseline = y1 - height * .2;
-                const origin = viewport.convertToPdfPoint(x0, baseline);
-                const right = viewport.convertToPdfPoint(x0 + (x1 - x0) / [...text].length, baseline);
-                const up = viewport.convertToPdfPoint(x0, baseline - height);
-                lines.push({text, matrix: [
-                  right[0] - origin[0], right[1] - origin[1], up[0] - origin[0], up[1] - origin[1], ...origin
-                ]});
+                // Tesseract can return text from multiple table columns as one line.
+                // Split at large gaps so the PDF text layer does not cross empty cells.
+                const runs = [];
+                for (const word of line.words || []) {
+                  const text = word.text.trim();
+                  const {x0, x1, y0, y1} = word.bbox;
+                  if (!text || ![x0, x1, y0, y1].every(Number.isFinite) || x1 <= x0 || y1 <= y0) continue;
+                  const previous = runs.at(-1);
+                  if (previous && x0 - previous.x1 <= 1.5 * Math.max(y1 - y0, previous.lastHeight)) {
+                    previous.text += ' ' + text;
+                    previous.x0 = Math.min(previous.x0, x0);
+                    previous.x1 = Math.max(previous.x1, x1);
+                    previous.y0 = Math.min(previous.y0, y0);
+                    previous.y1 = Math.max(previous.y1, y1);
+                    previous.lastHeight = y1 - y0;
+                  } else {
+                    runs.push({text, x0, x1, y0, y1, lastHeight: y1 - y0});
+                  }
+                }
+                for (const {text: rawText, x0, x1, y0, y1} of runs) {
+                  const text = rawText.replace(/\s+/gu, ' ')
+                    .replace(/(?<=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]) (?=[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}])/gu, '');
+                  const height = y1 - y0;
+                  const baseline = y1 - height * .2;
+                  const origin = viewport.convertToPdfPoint(x0, baseline);
+                  const right = viewport.convertToPdfPoint(x0 + (x1 - x0) / [...text].length, baseline);
+                  const up = viewport.convertToPdfPoint(x0, baseline - height);
+                  lines.push({text, matrix: [
+                    right[0] - origin[0], right[1] - origin[1], up[0] - origin[0], up[1] - origin[1], ...origin
+                  ]});
+                }
               }
             }
           }
