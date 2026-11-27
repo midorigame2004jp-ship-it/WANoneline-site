@@ -11060,8 +11060,40 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
     return text.normalize('NFKC').replace(/\s+/gu, '');
   }
 
+  function strengthenOcrStrokes(source) {
+    const scale = Math.min(1, 700 / Math.max(source.width, source.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(source.width * scale));
+    canvas.height = Math.max(1, Math.round(source.height * scale));
+    const ctx = canvas.getContext('2d', {alpha: false, willReadFrequently: true});
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+    const {width, height} = canvas;
+    const image = ctx.getImageData(0, 0, width, height);
+    const pixels = image.data;
+    const gray = new Uint8Array(width * height);
+    for (let i = 0; i < gray.length; i++) {
+      const offset = i * 4;
+      gray[i] = Math.round(.299 * pixels[offset] + .587 * pixels[offset + 1] + .114 * pixels[offset + 2]);
+    }
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let darkest = 255;
+        for (let row = Math.max(0, y - 1); row <= Math.min(height - 1, y + 1); row++) {
+          for (let col = Math.max(0, x - 1); col <= Math.min(width - 1, x + 1); col++) {
+            darkest = Math.min(darkest, gray[row * width + col]);
+          }
+        }
+        const offset = (y * width + x) * 4;
+        pixels[offset] = pixels[offset + 1] = pixels[offset + 2] = darkest;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+    return canvas;
+  }
+
   async function prepareOcr(doc, file, options, job) {
-    const {pages, language, progress = () => {}} = options;
+    const {pages, language, strengthen, progress = () => {}} = options;
     const languages = {both: ['jpn', 'eng'], jpn: ['jpn'], eng: ['eng']};
     if (!Array.isArray(pages) || !pages.length || new Set(pages).size !== pages.length ||
         pages.some(page => !Number.isInteger(page) || page < 1 || page > doc.numPages) ||
@@ -11099,12 +11131,20 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
           const cancelRender = () => task.cancel();
           signal.addEventListener('abort', cancelRender, {once: true});
           let image;
+          let ocrCanvas = canvas;
+          let scaleX = 1, scaleY = 1;
           try {
             await task.promise;
             pageEditorCheck(doc, job);
-            image = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+            if (strengthen) {
+              ocrCanvas = strengthenOcrStrokes(canvas);
+              scaleX = canvas.width / ocrCanvas.width;
+              scaleY = canvas.height / ocrCanvas.height;
+            }
+            image = await new Promise(resolve => ocrCanvas.toBlob(resolve, 'image/png'));
           } finally {
             signal.removeEventListener('abort', cancelRender);
+            if (ocrCanvas !== canvas) ocrCanvas.width = ocrCanvas.height = 1;
             canvas.width = canvas.height = 1;
           }
           pageEditorCheck(doc, job);
@@ -11142,9 +11182,9 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
                   const bottom = Math.min(y1, line.bbox.y1);
                   const height = bottom > top ? bottom - top : y1 - y0;
                   const baseline = bottom > top ? bottom : y1;
-                  const origin = viewport.convertToPdfPoint(x0, baseline);
-                  const right = viewport.convertToPdfPoint(x0 + (x1 - x0) / [...text].length, baseline);
-                  const up = viewport.convertToPdfPoint(x0, baseline - height);
+                  const origin = viewport.convertToPdfPoint(x0 * scaleX, baseline * scaleY);
+                  const right = viewport.convertToPdfPoint((x0 + (x1 - x0) / [...text].length) * scaleX, baseline * scaleY);
+                  const up = viewport.convertToPdfPoint(x0 * scaleX, (baseline - height) * scaleY);
                   lines.push({text, matrix: [
                     right[0] - origin[0], right[1] - origin[1], up[0] - origin[0], up[1] - origin[1], ...origin
                   ]});
@@ -11794,7 +11834,7 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
 <script id="pakuribat-ui-script">(()=>{'use strict';const $=id=>document.getElementById(id);const paths={comment:'M20 11a8 8 0 1 1-3-6M8 9h8M8 13h6',bookmarks:'M6 3h12v18l-6-4-6 4z',pages:'M7 3h11v15H7zM4 7v14h11',files:'M3 5h7l2 3h9v13H3z',search:'M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0M15 15l6 6',edit:'M4 17L17 4l3 3L7 20H4z',image:'M3 4h18v16H3zM3 17l6-7 5 5 3-3 4 5',organize:'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z',compress:'M4 3h16v18H4zM8 8l4 4 4-4M12 5v7M8 17h8',link:'M10 8l3-3a4 4 0 0 1 6 6l-3 3M14 16l-3 3a4 4 0 0 1-6-6l3-3M8 16l8-8',ocr:'M3 8V3h5M16 3h5v5M21 16v5h-5M8 21H3v-5M7 16l5-9 5 9',watermark:'M12 3C8 9 5 12 5 15a7 7 0 0 0 14 0c0-3-3-6-7-12',print:'M6 8V3h12v5M6 18H3V8h18v10h-3M6 14h12v7H6z',rotate:'M19 7a8 8 0 1 0 1 10M19 3v5h-5'};const icon=k=>`<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[k]||paths.edit}"/></svg>`;const action=(label,key)=>`<button type="button" data-panel="${key}" class="pk-action">${icon(key)}<span>${label}</span></button>`;
 const style=document.createElement('style');style.textContent=`body{background:#242424;color:#eee}.app{display:block;padding-top:100px}.header{position:fixed;inset:0 0 auto;height:48px;min-height:48px;background:#252525;padding:5px 16px;z-index:80;border-color:#555}.brand-mark,.brand-subtitle,.safety,.sidebar,.document-head,.status{display:none}.brand-title{font-size:17px;font-weight:500}.header .button{min-height:32px;font-size:13px;padding:5px 10px;background:#333;color:#eee;border-color:#666}.main{display:block}.content,.content-inner{padding:0;max-width:none}.viewer{padding:0 64px 30px 74px}.viewer-toolbar{background:#303030;border:0;border-radius:0;padding:6px 12px}.viewer-toolbar>.toolbar-group:not(:first-of-type){display:none}.toolbar-label{display:none}.annotation-properties{background:#303030;border:0;border-radius:0;padding:8px 12px;font-size:12px}.property-label,.property-value{color:#ddd}.fit-button,.button{background:#353535;color:#eee;border-color:#666}.page-stage{background:#242424;background-image:none;border:0;border-radius:0;padding:24px 0;min-height:calc(100vh - 225px)}.annotation-side-tools{top:160px;left:10px;z-index:75}.annotation-menu-items{max-height:calc(100vh - 125px);overflow:auto}.annotation-menu-items .fit-button{color:#ddd}.footer{position:fixed;bottom:0;left:0;right:0;background:#242424;border:0;min-height:22px;padding:3px 12px;font-size:11px;color:#aaa;z-index:30}.toast{z-index:120}.pk-top{position:fixed;top:48px;left:0;right:0;height:52px;display:flex;align-items:center;gap:8px;padding:4px 15px;background:#303030;border-bottom:1px solid #555;z-index:80}.pk-top button,.pk-rail button,.pk-panel button,.pk-menu button{color:#ddd;background:transparent;border:0;cursor:pointer}.pk-top button{padding:10px;font-size:14px;white-space:nowrap}.pk-top button:hover,.pk-panel button:hover,.pk-menu button:hover{background:#484848}.pk-top .pk-search{margin-left:auto}.pk-top svg,.pk-rail svg,.pk-panel svg{width:23px;height:23px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.pk-top button{display:flex;align-items:center;gap:8px}.pk-rail{position:fixed;right:0;top:100px;bottom:22px;width:48px;background:#303030;border-left:1px solid #555;display:flex;flex-direction:column;align-items:center;padding:8px 3px;z-index:70}.pk-rail button{width:38px;height:40px;border-radius:4px;margin-bottom:5px;display:grid;place-items:center}.pk-rail button:hover,.pk-rail button[aria-pressed=true]{background:#555}.pk-nav{margin-top:auto;display:flex;flex-direction:column;align-items:center;border-top:1px solid #555;padding-top:8px}.pk-nav .page-input{width:36px;padding:4px;background:#303030;color:#eee;border-color:#777;font-size:13px}.pk-nav .page-total,.pk-nav .zoom-text{font-size:11px;color:#bbb;min-width:0;text-align:center}.pk-nav .button{background:transparent;border:0;font-size:22px}.pk-nav .fit-button{font-size:10px;padding:0}.pk-panel{position:fixed;right:48px;top:100px;bottom:22px;width:340px;padding:14px;background:#303030;border-left:1px solid #555;color:#ddd;overflow:auto;z-index:65}.pk-panel[hidden],.pk-section[hidden],.pk-menu[hidden]{display:none}.pk-panel header{display:flex;align-items:center;gap:10px;margin-bottom:18px}.pk-panel h2{margin:0;font-size:17px;flex:1}.pk-panel header button{font-size:23px}.pk-panel input,.pk-panel textarea,.pk-panel select{width:100%;background:#242424;color:#ddd;border:1px solid #777;border-radius:4px;padding:9px;margin-bottom:12px}.pk-panel label{display:block;font-size:13px;margin:10px 0 5px}.pk-action{display:flex;align-items:center;gap:14px;padding:12px 5px;width:100%;text-align:left;font-size:14px}.pk-note{font-size:13px;color:#aaa;line-height:1.7;padding:18px 5px}.pk-open .viewer{padding-right:408px}.pk-left{left:0;right:auto;width:270px}.pk-left-open .viewer{padding-left:342px}.pk-left-open .annotation-side-tools{left:278px}.pk-panel .tab-open{color:#eee}.pk-panel .tab-row.active{background:#294a66}.pk-panel .tab-meta{color:#bbb}.pk-panel .sidebar-foot{display:none}.pk-panel .sidebar-head{padding:0;border:0}.pk-menu{position:fixed;left:8px;top:48px;width:230px;padding:8px;background:#303030;border:1px solid #666;z-index:95}.pk-menu button{display:block;text-align:left;padding:11px;width:100%}@media(max-width:800px){.pk-top{gap:0;padding:3px}.pk-top button{font-size:12px;padding:7px}.pk-search span{display:none}.pk-panel{width:285px}.pk-open .viewer{padding-right:353px}}`;document.head.append(style);
 
-const pending='<p class="pk-note">機能実装の段階で処理を接続します。</p>';const config={tools:['すべてのツール',action('PDFを編集','edit')+action('画像を編集','image')+action('ページを整理','organize')+action('PDFを結合','combine')+action('PDFを分割・抽出','split')+action('PDFを圧縮','compress')+action('コメントを表示','comment')+action('添付ファイルを管理','attachments')+action('リンクを編集','link')+action('しおりを編集','bookmarkEdit')+action('透かしを追加','watermark')+action('OCR・文字認識','ocr')],comment:['コメント','<input aria-label="コメントを検索" placeholder="コメントを検索">'+action('絞り込み','filter')+action('並べ替え','sort')+'<textarea aria-label="コメントを追加" placeholder="コメントを追加"></textarea><p class="pk-note">コメント一覧・返信は機能実装の段階で接続します。</p>'],bookmarks:['しおり','<p class="pk-note">しおり一覧は機能実装の段階で接続します。</p>'+action('しおりを追加','bookmarkEdit')],pages:['ページサムネイル','<p class="pk-note">サムネイル表示は機能実装の段階で接続します。</p>'],files:['開いたPDF','<div id="pkFilesHost"></div>'],search:['検索','<input aria-label="検索文字" placeholder="文書内の文字を検索">'+pending],edit:['PDFを編集',action('本文を編集','textEdit')+action('画像を編集','image')+action('リンクを編集','link')+action('しおりを編集','bookmarkEdit')],textEdit:['本文を編集','<label>フォント</label><select><option>フォントを選択</option><option>游ゴシック</option><option>メイリオ</option></select><label>文字サイズ</label><input type="number" min="1" value="12"><label>文字色</label><input type="color" value="#000000">'+pending],image:['画像を編集',action('差し替え','imageReplace')+action('移動','imageMove')+action('回転','imageRotate')+action('トリミング','imageCrop')+action('削除','imageDelete')],organize:['ページを整理',action('ページを追加','pageAdd')+action('ページを削除','pageDelete')+action('並べ替え','pageOrder')+action('ページを回転','pageRotate')+action('PDFを結合','combine')+action('PDFを分割・抽出','split')],compress:['PDFを圧縮','<label>圧縮設定</label><select aria-label="圧縮設定"><option>画質を優先</option><option selected>標準</option><option>サイズを優先</option></select>'+pending],link:['リンクを編集','<label>移動先</label><select><option>Webページ</option><option>このPDFのページ</option></select><input placeholder="URLまたはページ番号">'+pending],bookmarkEdit:['しおりを編集','<input placeholder="しおりの名前"><label>移動先ページ</label><input type="number" min="1" value="1">'+pending],ocr:['OCR・文字認識','<form id="pkOcrForm"> <label>認識言語 <select name="language"><option value="both">日本語と英語</option><option value="jpn">日本語</option><option value="eng">英語</option></select></label> <label>対象ページ <select name="scope"><option value="current">現在のページ</option><option value="all">全ページ</option><option value="range">ページ指定</option></select></label> <label data-ocr-range hidden>ページ番号・範囲 <input name="range" placeholder="1, 3-5"></label> <p class="pk-note">すでに検索できる文字があるページはスキップします。</p> <button type="submit">OCRを実行</button> <button type="button" data-ocr-cancel hidden>中止</button> <p role="status" hidden></p></form>'],sign:['署名',action('署名を追加','signature')+action('イニシャルを追加','initials')],print:['印刷','<label>ページ範囲</label><input placeholder="すべて、または例：1-3"><label>倍率</label><select><option>用紙に合わせる</option><option>実際のサイズ</option></select>'+pending],filter:['コメントの絞り込み','<label>種類</label><select><option>すべて</option><option>コメント</option><option>ハイライト</option><option>図形</option></select><label>作成者</label><input placeholder="すべての作成者">'],sort:['コメントの並べ替え','<select><option>ページ順</option><option>日時順</option><option>作成者順</option></select>'],combine:['PDFを結合',pending],split:['PDFを分割・抽出','<input placeholder="ページ範囲：例 1-3,5">'+pending]};
+const pending='<p class="pk-note">機能実装の段階で処理を接続します。</p>';const config={tools:['すべてのツール',action('PDFを編集','edit')+action('画像を編集','image')+action('ページを整理','organize')+action('PDFを結合','combine')+action('PDFを分割・抽出','split')+action('PDFを圧縮','compress')+action('コメントを表示','comment')+action('添付ファイルを管理','attachments')+action('リンクを編集','link')+action('しおりを編集','bookmarkEdit')+action('透かしを追加','watermark')+action('OCR・文字認識','ocr')],comment:['コメント','<input aria-label="コメントを検索" placeholder="コメントを検索">'+action('絞り込み','filter')+action('並べ替え','sort')+'<textarea aria-label="コメントを追加" placeholder="コメントを追加"></textarea><p class="pk-note">コメント一覧・返信は機能実装の段階で接続します。</p>'],bookmarks:['しおり','<p class="pk-note">しおり一覧は機能実装の段階で接続します。</p>'+action('しおりを追加','bookmarkEdit')],pages:['ページサムネイル','<p class="pk-note">サムネイル表示は機能実装の段階で接続します。</p>'],files:['開いたPDF','<div id="pkFilesHost"></div>'],search:['検索','<input aria-label="検索文字" placeholder="文書内の文字を検索">'+pending],edit:['PDFを編集',action('本文を編集','textEdit')+action('画像を編集','image')+action('リンクを編集','link')+action('しおりを編集','bookmarkEdit')],textEdit:['本文を編集','<label>フォント</label><select><option>フォントを選択</option><option>游ゴシック</option><option>メイリオ</option></select><label>文字サイズ</label><input type="number" min="1" value="12"><label>文字色</label><input type="color" value="#000000">'+pending],image:['画像を編集',action('差し替え','imageReplace')+action('移動','imageMove')+action('回転','imageRotate')+action('トリミング','imageCrop')+action('削除','imageDelete')],organize:['ページを整理',action('ページを追加','pageAdd')+action('ページを削除','pageDelete')+action('並べ替え','pageOrder')+action('ページを回転','pageRotate')+action('PDFを結合','combine')+action('PDFを分割・抽出','split')],compress:['PDFを圧縮','<label>圧縮設定</label><select aria-label="圧縮設定"><option>画質を優先</option><option selected>標準</option><option>サイズを優先</option></select>'+pending],link:['リンクを編集','<label>移動先</label><select><option>Webページ</option><option>このPDFのページ</option></select><input placeholder="URLまたはページ番号">'+pending],bookmarkEdit:['しおりを編集','<input placeholder="しおりの名前"><label>移動先ページ</label><input type="number" min="1" value="1">'+pending],ocr:['OCR・文字認識','<form id="pkOcrForm"> <label>認識言語 <select name="language"><option value="both">日本語と英語</option><option value="jpn">日本語</option><option value="eng">英語</option></select></label> <label>対象ページ <select name="scope"><option value="current">現在のページ</option><option value="all">全ページ</option><option value="range">ページ指定</option></select></label> <label data-ocr-range hidden>ページ番号・範囲 <input name="range" placeholder="1, 3-5"></label> <label class="pk-ocr-strengthen"><span><input type="checkbox" name="strengthen"> 文字の線を太くして認識</span></label> <p class="pk-note">すでに検索できる文字があるページはスキップします。</p> <button type="submit">OCRを実行</button> <button type="button" data-ocr-cancel hidden>中止</button> <p role="status" hidden></p></form>'],sign:['署名',action('署名を追加','signature')+action('イニシャルを追加','initials')],print:['印刷','<label>ページ範囲</label><input placeholder="すべて、または例：1-3"><label>倍率</label><select><option>用紙に合わせる</option><option>実際のサイズ</option></select>'+pending],filter:['コメントの絞り込み','<label>種類</label><select><option>すべて</option><option>コメント</option><option>ハイライト</option><option>図形</option></select><label>作成者</label><input placeholder="すべての作成者">'],sort:['コメントの並べ替え','<select><option>ページ順</option><option>日時順</option><option>作成者順</option></select>'],combine:['PDFを結合',pending],split:['PDFを分割・抽出','<input placeholder="ページ範囲：例 1-3,5">'+pending]};
 const top=document.createElement('nav');top.className='pk-top';top.setAttribute('aria-label','文書ツール');top.innerHTML=action('すべてのツール','tools')+action('編集','edit')+action('ページを整理','organize')+action('PDFを圧縮','compress')+action('署名','sign')+`<button class="pk-search" data-panel="search">${icon('search')}<span>テキストを検索</span></button><button data-forward="saveAsButton" title="名前を付けて保存" aria-label="名前を付けて保存">${icon('files')}</button><button data-panel="print" title="印刷" aria-label="印刷">${icon('print')}</button>`;document.body.append(top);
 const panel=document.createElement('aside');panel.id='pkRightPanel';panel.className='pk-panel';panel.hidden=true;const left=document.createElement('aside');left.id='pkLeftPanel';left.className='pk-panel pk-left';left.hidden=true;function fill(host,keys){host.innerHTML='<header><button data-close aria-label="パネルを閉じる">×</button><h2></h2></header>'+keys.map(k=>`<section class="pk-section" data-section="${k}" hidden>${config[k][1]}</section>`).join('');}fill(panel,Object.keys(config).filter(k=>k!=='tools'));fill(left,['tools']);document.body.append(panel,left);const sidebar=document.querySelector('.sidebar');while(sidebar.firstChild)$('pkFilesHost').append(sidebar.firstChild);
 const rail=document.createElement('nav');rail.className='pk-rail';rail.setAttribute('aria-label','右側の文書ナビゲーション');rail.innerHTML=['comment','bookmarks','pages','files'].map(k=>`<button data-panel="${k}" title="${config[k][0]}" aria-label="${config[k][0]}" aria-pressed="false">${icon(k)}</button>`).join('')+'<div class="pk-nav"></div>';document.body.append(rail);const nav=rail.querySelector('.pk-nav');['pageNumberInput','pageTotalText','previousPageButton','nextPageButton'].forEach(id=>nav.append($(id)));nav.insertAdjacentHTML('beforeend',`<button data-panel="viewRotate" title="表示を回転" aria-label="表示を回転">${icon('rotate')}</button>`);['fitWidthButton','zoomInButton','zoomText','zoomOutButton'].forEach(id=>nav.append($(id)));
@@ -11909,7 +11949,7 @@ function syncOcrControls() {
  const context = window.PakuribatOcr?.context();
  ocrStart.disabled = ocrPending || !context || context.busy || context.draft;
  ocrCancel.hidden = !ocrPending;
- for (const name of ['language', 'scope', 'range']) ocrForm.elements[name].disabled = ocrPending;
+ for (const name of ['language', 'scope', 'range', 'strengthen']) ocrForm.elements[name].disabled = ocrPending;
  ocrForm.querySelector('[data-ocr-range]').hidden = ocrForm.elements.scope.value !== 'range';
 }
 function ocrProgress(message) {
@@ -11929,13 +11969,13 @@ ocrForm.addEventListener('submit', async event => {
  const context = window.PakuribatOcr?.context();
  if (ocrPending || !context || context.busy || context.draft) return;
  try {
-  const {scope, range, language} = ocrForm.elements;
+  const {scope, range, language, strengthen} = ocrForm.elements;
   const pages = parseToolPages(scope.value, range.value, context);
   ocrPending = true;
   syncOcrControls();
   ocrProgress('対象ページを確認しています…');
   const {ocrSummary: summary} = await window.PakuribatOcr.start(context.documentId, {
-   pages, language: language.value, progress: ocrProgress
+   pages, language: language.value, strengthen: strengthen.checked, progress: ocrProgress
   });
   const details = [summary.recognized + 'ページに文字層を追加'];
   if (summary.skipped) details.push(summary.skipped + 'ページは既存文字あり');
@@ -11991,6 +12031,7 @@ ocrStyle.textContent = `
  cursor: default;
 }
 #pkOcrForm label { display: grid; gap: 4px; margin-bottom: 10px; }
+#pkOcrForm .pk-ocr-strengthen input { width: auto; margin: 0 4px 0 0; vertical-align: middle; }
 #pkOcrForm [hidden] { display: none; }
 #pkOcrForm [role="status"] { margin-top: 10px; font-size: 12px; line-height: 1.5; }
 `;
