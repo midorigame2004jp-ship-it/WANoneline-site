@@ -616,60 +616,263 @@ function gsiRoadNodes(lines) {
   }
   return 節ら;
 }
-// 交差点のまわりの道路の面（隅切りを含む）を、交差点の中心から全方向に線を伸ばし、
-//   最初に当たった道路縁までを結んだ星形の多角形として取る。
-//   ・当たらない向き（道路が続く向き）は中心に戻す＝そこは中心線の帯が受け持つ（縁の切れ目から街区へはみ出さない）
-//   ・上限より遠い当たり・最小より近い当たりは無視
-// 戻り: 輪（点の配列・入力と同じ単位）。当たりが3点未満なら null
-function gsiRoadCornerPatch(中, 縁, opt) {
+// 中心線1本ぶんの記録（交差点の角を取るのに使う）。半幅はタイル内座標。測れなければ 左・右 は null（既定半幅＝区分の幅の半分）。
+//   幅の実測の決まり（2026-11-27）: 上限＝区分の上限の半分＋1.5m（隣の道路の縁を拾わない）・端の余白＝上限（交差点で横道の縁まで伸びない）
+function gsiRoadCoreEntry(細, 縁線, 単位m, 幅m, 上m) {
+  const e = { 細, 上m, 上半幅: 上m / 単位m, 左: null, 右: null, 既定半幅: 幅m / 2 / 単位m, 標本: 0 };
+  if (縁線 && 縁線.length) {
+    const m = gsiMeasureRoadHalfWidths(細, 縁線, { 刻み: 2 / 単位m, 上限: 上m / 単位m, 最小: 0.3 / 単位m, 端の余白: 上m / 単位m });
+    if (m.左 != null && m.右 != null) { e.左 = m.左; e.右 = m.右; e.標本 = m.標本; }
+  }
+  return e;
+}
+// 1タイルの交差点の角（タイル内座標）。自分のタイルの中の交差点だけ（隣のタイルと二重にしない）。
+//   戻り: [{ 節, 輪 }]。数値の決まりはここ1か所（取り込みと検査が同じ関数を呼ぶ）。
+function gsiRoadCornersInTile(芯ら, 縁線, ext, 単位m) {
+  const 出 = [];
+  if (!縁線 || !縁線.length || !芯ら || 芯ら.length < 2) return 出;
+  for (const 節 of gsiRoadNodes(芯ら.map(d => d.細))) {
+    if (節.x < 0 || 節.x >= ext || 節.y < 0 || 節.y >= ext) continue;
+    // 届く距離＝その交差点に集まる道路の半幅の上限のうち最大＋隅切りの余裕10m
+    const 上 = Math.max(...節.線.map(i => 芯ら[i].上m)) + 10;
+    const 輪 = gsiRoadCornerFill(節, 芯ら, 縁線, { 上限: 上 / 単位m, 最小: 0.3 / 単位m,
+      余裕: 0.1 / 単位m, 継ぎ: 0.5 / 単位m, 面取りの許し: 2 / 単位m, 向き長: 5 / 単位m, 直線の最短: 1.5 / 単位m });
+    if (輪) 出.push({ 節, 輪 });
+  }
+  return 出;
+}
+// 交差点の角を「面取り（角を取るだけ）」で塗る面・2026-11-27 作り直し
+// 【ユーザー指摘】①「こんなとげとげしてない」②「丸くなる必要はなく角を取る程度で構わない。緑の線のようになればよい」
+//   （緑の線＝角の縁が道路の側面から離れる点どうしを結んだ直線）。
+// 【旧版（中心から全方向に線を伸ばす星形）をやめた理由・実データで確認】
+//   道路に沿った向きでは当たりが遠く、隣の向きは当たらずに中心へ戻るので、道路に沿って細長い「とげ」ができた。
+//   しかも縁の線どうしのわずかな切れ目を線がすり抜けると、遠くの縁まで届いて街区へ刺さる。
+// 【作り方】交差点に集まる道路（腕）を角度順に並べ、隣り合う2本の腕のあいだ＝角ごとに:
+//   1) 角の二等分の向きに1本だけ線を伸ばし、最初に当たった縁の線を「その角の縁」とする
+//   2) その縁の線を両向きに辿り、腕Aの側面に入る点と、腕Bの側面に入る点を探す
+//      （側面＝中心線から半幅＋余裕 以内、または縁がその腕と平行な 直線の最短 以上の区間になった所）
+//      ＝縁が道路の側面から離れる点（隅切りの始まりと終わり）。縁の線が途中で切れていても、端どうしが 継ぎ 以内ならつないで辿る
+//   3) 角の面＝その2点を結ぶ直線（面取り）。両端は帯の側面へ移す（交差点の近くで道路が帯より広くても「耳」が出ない）。
+//      辿った縁がその直線から 面取りの許し 以上離れるときだけ、その点も残す
+//      （直線で切ると街区へ大きく食い込む形・道路が大きく曲がる外側）
+//   見つからない角（縁の線が無い・腕の側面まで辿れない）は交差点の中心を使う＝帯に任せる（はみ出さない）。
+//   交差点の面＝角ごとの点を角度順につないだ多角形（腕を横切る辺は帯の中を通る）。
+// 【単位】中・芯ら・縁・opt の長さはすべて同じ単位（タイル内座標）。
+//   芯ら[i] = { 細: 中心線, 左, 右: 測った半幅（無ければ null）, 既定半幅, 上半幅: 半幅の上限 }（左右は gsiMeasureRoadHalfWidths と同じ向き）
+// 戻り: 輪（点の配列）。角が1つも取れなければ null
+function gsiRoadCornerFill(中, 芯ら, 縁, opt) {
   const o = opt || {};
-  const 本数 = o.本数 > 0 ? o.本数 : 72, 上限 = o.上限 > 0 ? o.上限 : Infinity, 最小 = o.最小 > 0 ? o.最小 : 0;
-  // 上限の円にかかる線分だけ先に選ぶ
-  const 近 = [];
-  for (const g of 縁) for (let k = 1; k < g.length; k++) {
-    const a = g[k - 1], b = g[k];
-    if (Math.min(a.x, b.x) > 中.x + 上限 || Math.max(a.x, b.x) < 中.x - 上限
-      || Math.min(a.y, b.y) > 中.y + 上限 || Math.max(a.y, b.y) < 中.y - 上限) continue;
-    近.push([a, b]);
-  }
-  if (!近.length) return null;
-  // 線を伸ばす向き: 等間隔の 本数 本＋**縁の線の頂点の向き（とその前後わずか）**。
-  //   等間隔だけだと、直角の角（隅切りの無い角）や丸みの頂点の間で、隣り合う当たりを結ぶ辺が街区を少し削る／はみ出す。
-  //   頂点の向きにも伸ばせば、見えている縁の線の形をそのまま辿る（見通しの多角形）。
-  //   旗 globalThis.__GSI_ROAD_CORNER_VERTEX_RAYS = false で等間隔だけ（従来）。
-  const 向き = [];
-  for (let i = 0; i < 本数; i++) 向き.push(2 * Math.PI * i / 本数);
-  if (!(typeof globalThis !== 'undefined' && globalThis.__GSI_ROAD_CORNER_VERTEX_RAYS === false)) {
-    const ε = 1e-4, 見た = new Set();
-    for (const [a, b] of 近) for (const v of [a, b]) {
-      const k = v.x + ',' + v.y; if (見た.has(k)) continue; 見た.add(k);
-      const d = Math.hypot(v.x - 中.x, v.y - 中.y);
-      if (d < 最小 || d > 上限) continue;
-      const th = Math.atan2(v.y - 中.y, v.x - 中.x);
-      向き.push(th - ε, th, th + ε);
-      if (向き.length > 4000) break;
+  const 上限 = o.上限 > 0 ? o.上限 : Infinity, 最小 = o.最小 > 0 ? o.最小 : 0;
+  const 余裕 = o.余裕 >= 0 ? o.余裕 : 0, 継ぎ = o.継ぎ > 0 ? o.継ぎ : 1;
+  const 許し = o.面取りの許し > 0 ? o.面取りの許し : Infinity;
+  const 向き長 = o.向き長 > 0 ? o.向き長 : 4 * 継ぎ;
+  const 直線の最短 = o.直線の最短 > 0 ? o.直線の最短 : 3 * 継ぎ;
+  const 二π = 2 * Math.PI;
+  // ── 腕を作る（交差点から外へ向かう折れ線）──
+  const 腕 = [];
+  for (const i of 中.線) {
+    const d = 芯ら[i]; if (!d || !d.細 || d.細.length < 2) continue;
+    const P = d.細, 累 = [0];
+    for (let k = 1; k < P.length; k++) 累.push(累[k - 1] + Math.hypot(P[k].x - P[k - 1].x, P[k].y - P[k - 1].y));
+    const 全 = 累[累.length - 1]; if (!(全 > 0)) continue;
+    let bk = 1, bt = 0, bd = Infinity;
+    for (let k = 1; k < P.length; k++) {
+      const ax = P[k - 1].x, ay = P[k - 1].y, ex = P[k].x - ax, ey = P[k].y - ay, L2 = ex * ex + ey * ey;
+      let t = L2 > 0 ? ((中.x - ax) * ex + (中.y - ay) * ey) / L2 : 0; t = Math.max(0, Math.min(1, t));
+      const dd = Math.hypot(ax + ex * t - 中.x, ay + ey * t - 中.y);
+      if (dd < bd) { bd = dd; bk = k; bt = t; }
     }
-    for (let i = 0; i < 向き.length; i++) { let t = 向き[i] % (2 * Math.PI); if (t < 0) t += 2 * Math.PI; 向き[i] = t; }
-    向き.sort((p, q) => p - q);
-  }
-  const 点 = []; let 当 = 0;
-  for (const th of 向き) {
-    const dx = Math.cos(th), dy = Math.sin(th);
-    let best = Infinity;
-    for (const [a, b] of 近) {
-      const ex = b.x - a.x, ey = b.y - a.y, den = dx * ey - dy * ex;
-      if (Math.abs(den) < 1e-12) continue;
-      const t = ((a.x - 中.x) * ey - (a.y - 中.y) * ex) / den, u = ((a.x - 中.x) * dy - (a.y - 中.y) * dx) / den;
-      // 頂点ちょうどの向きは隣り合う2本の端（u=0 か 1）に当たる。丸め誤差で両方から外れないよう少し余裕を持つ
-      if (u < -1e-9 || u > 1 + 1e-9 || t < 最小 || t > 上限) continue;
-      if (t < best) best = t;
+    if (bd > 継ぎ) continue;
+    const s0 = 累[bk - 1] + (累[bk] - 累[bk - 1]) * bt;
+    const hL = d.左 > 0 ? d.左 : d.既定半幅, hR = d.右 > 0 ? d.右 : d.既定半幅;
+    for (const 向 of [1, -1]) {
+      const 長 = 向 === 1 ? 全 - s0 : s0;
+      if (長 < 継ぎ) continue;
+      const pts = [{ x: 中.x, y: 中.y }];
+      if (向 === 1) { for (let k = bk; k < P.length; k++) if (累[k] > s0 + 1e-9) pts.push(P[k]); }
+      else { for (let k = bk - 1; k >= 0; k--) if (累[k] < s0 - 1e-9) pts.push(P[k]); }
+      if (pts.length < 2) continue;
+      // 向き＝交差点から 向き長 先の点へ
+      let 残 = Math.min(向き長, 長), q = pts[pts.length - 1];
+      for (let k = 1; k < pts.length; k++) {
+        const L = Math.hypot(pts[k].x - pts[k - 1].x, pts[k].y - pts[k - 1].y);
+        if (L >= 残) { const f = 残 / L; q = { x: pts[k - 1].x + (pts[k].x - pts[k - 1].x) * f, y: pts[k - 1].y + (pts[k].y - pts[k - 1].y) * f }; break; }
+        残 -= L;
+      }
+      let 角 = Math.atan2(q.y - 中.y, q.x - 中.x); if (角 < 0) 角 += 二π;
+      腕.push({ pts, 角, 左: 向 === 1 ? hL : hR, 右: 向 === 1 ? hR : hL, 上: d.上半幅 > 0 ? d.上半幅 : 2 * Math.max(hL, hR) });
     }
-    if (Number.isFinite(best)) { 点.push({ x: 中.x + dx * best, y: 中.y + dy * best }); 当++; }
-    else if (!点.length || 点[点.length - 1].x !== 中.x || 点[点.length - 1].y !== 中.y) 点.push({ x: 中.x, y: 中.y });
   }
-  if (当 < 3) return null;
-  if (点.length > 1 && 点[0].x === 中.x && 点[0].y === 中.y && 点[点.length - 1].x === 中.x && 点[点.length - 1].y === 中.y) 点.pop();
-  return 点;
+  if (腕.length < 2) return null;
+  腕.sort((a, b) => a.角 - b.角);
+  // 点 Q と腕の関係: 交差点より前（s>−余裕）にあり、指定の側（+1 左／-1 右）で、
+  //   ①中心線から 半幅＋余裕 以内、または ②その先の縁（向き 方向）が腕と平行（22°以内）で 上半幅の2.5倍 以内 なら「腕の側面に入った」
+//   （2.5倍＝右折車線などで角が10m近く引っ込んだ実データの交差点がある）
+  //   ②が要る理由（実データ）: 半幅は1本の線全体の中央値なので、交差点の近くで道路が広い所では①が成り立たない
+  //   腕の最後の区間はその先へ延ばして見る（タイルの縁で切れた短い腕でも側面を辿れる）
+  const 平行 = Math.sin(22 * Math.PI / 180);   // 隅切りは腕と45°前後。22°以内なら道路の側面とみなす（実データで16°ほど開いて狭まる側面があった）
+  const 側面に入る = (Q, a, 側, 向き) => {
+    const h = (側 > 0 ? a.左 : a.右) + 余裕;
+    let 累s = 0;
+    for (let k = 1; k < a.pts.length; k++) {
+      const A = a.pts[k - 1], B = a.pts[k], ex = B.x - A.x, ey = B.y - A.y, L = Math.hypot(ex, ey);
+      if (!(L > 0)) continue;
+      let t = ((Q.x - A.x) * ex + (Q.y - A.y) * ey) / (L * L);
+      const 最後 = k === a.pts.length - 1;
+      if (t < 0) t = 0; if (!最後 && t > 1) t = 1;
+      const nx = A.x + ex * t, ny = A.y + ey * t, dd = Math.hypot(Q.x - nx, Q.y - ny), s = 累s + t * L;
+      const cr = ex * (Q.y - A.y) - ey * (Q.x - A.x);   // >0 ＝左
+      // 交差点のほぼ真横（まっすぐな側の真ん中・s≒0）も入れる。後ろ（余裕より手前）は入れない
+      if (s > -余裕 && (cr > 0 ? 1 : -1) === 側) {
+        if (dd <= h) return true;
+        // 平行は「腕の外向きと同じ向き」に続くときだけ（逆向きに平行＝反対側の腕に沿う縁）
+        if (向き && dd <= a.上 * 2.5 && (ex * 向き.x + ey * 向き.y) > 0 && Math.abs((ex * 向き.y - ey * 向き.x) / L) <= 平行) return true;
+      }
+      累s += L;
+    }
+    return false;
+  };
+  // 点 Q を腕の帯の側面（中心線から帯の半幅）へ移す。帯は測った半幅で描くので、交差点の近くで道路が帯より広いと
+  //   縁の点のままでは帯からはみ出して「耳」になる。面取りの両端は帯の側面に乗せる＝帯と角がつながる。
+  const 帯の側へ = (Q, a, 側) => {
+    const h = 側 > 0 ? a.左 : a.右;
+    let best = null, 累s = 0;
+    for (let k = 1; k < a.pts.length; k++) {
+      const A = a.pts[k - 1], B = a.pts[k], ex = B.x - A.x, ey = B.y - A.y, L = Math.hypot(ex, ey);
+      if (!(L > 0)) continue;
+      let t = ((Q.x - A.x) * ex + (Q.y - A.y) * ey) / (L * L);
+      const 最後 = k === a.pts.length - 1;
+      if (t < 0) t = 0; if (!最後 && t > 1) t = 1;
+      const nx = A.x + ex * t, ny = A.y + ey * t, dd = Math.hypot(Q.x - nx, Q.y - ny);
+      if (!best || dd < best.dd) best = { dd, x: nx + 側 * (-ey / L) * h, y: ny + 側 * (ex / L) * h };
+      累s += L;
+    }
+    return best ? { x: best.x, y: best.y } : Q;
+  };
+  // 半直線の最初の当たり（縁の線の番号・区間・位置）
+  const 当たり = (dx, dy) => {
+    let best = null;
+    for (let g = 0; g < 縁.length; g++) {
+      const 線 = 縁[g];
+      for (let k = 1; k < 線.length; k++) {
+        const a = 線[k - 1], b = 線[k], ex = b.x - a.x, ey = b.y - a.y, den = dx * ey - dy * ex;
+        if (Math.abs(den) < 1e-12) continue;
+        const t = ((a.x - 中.x) * ey - (a.y - 中.y) * ex) / den, u = ((a.x - 中.x) * dy - (a.y - 中.y) * dx) / den;
+        if (u < -1e-9 || u > 1 + 1e-9 || t < 最小 || t > 上限) continue;
+        if (!best || t < best.t) best = { t, g, k, u: Math.max(0, Math.min(1, u)), x: 中.x + dx * t, y: 中.y + dy * t };
+      }
+    }
+    return best;
+  };
+  // 縁の線の端につながる別の線（端どうしが 継ぎ 以内）
+  const 続き = (g, 端) => {
+    const e = 縁[g][端 === 0 ? 0 : 縁[g].length - 1];
+    let best = null, bd = 継ぎ;
+    for (let h = 0; h < 縁.length; h++) {
+      if (h === g) continue;
+      const L = 縁[h];
+      const d0 = Math.hypot(L[0].x - e.x, L[0].y - e.y), d1 = Math.hypot(L[L.length - 1].x - e.x, L[L.length - 1].y - e.y);
+      if (d0 <= bd) { bd = d0; best = { g: h, 端: 0 }; }
+      if (d1 <= bd) { bd = d1; best = { g: h, 端: 1 }; }
+    }
+    return best;
+  };
+  // 辿る: 当たった点から向き（+1＝番号が増える向き）へ。腕A（左側）か腕B（右側）の側面に入ったらそこで止める
+  const 辿る = (始, 向, Aa, Bb, 探A = true, 探B = true) => {
+    const 道 = []; let g = 始.g, 向g = 向, U = { x: 始.x, y: 始.y };
+    let k = 向 > 0 ? 始.k : 始.k - 1;   // 次に向かう頂点の番号
+    const 見た = new Set();
+    for (let 歩 = 0; 歩 < 400; 歩++) {
+      const 線 = 縁[g];
+      if (k < 0 || k >= 線.length) {
+        const c = 続き(g, k < 0 ? 0 : 1); if (!c) return null;
+        const 鍵 = c.g + ':' + c.端; if (見た.has(鍵)) return null; 見た.add(鍵);
+        g = c.g; 向g = c.端 === 0 ? 1 : -1; k = c.端 === 0 ? 0 : 縁[g].length - 1;
+        continue;
+      }
+      const V = 線[k];
+      // ここから先の縁が腕と平行＝隅切りが終わって道路の側面になった → U が離れる点
+      //   （次の頂点が遠くても先に見る。道路の側面は長い1本の区間で届くことが多い）
+      const LV = Math.hypot(V.x - U.x, V.y - U.y);
+      if (LV >= 直線の最短) {   // 丸みを細かく刻んだ短い区間は「側面」にしない（丸みの途中で止まる）
+        const 向き = { x: (V.x - U.x) / LV, y: (V.y - U.y) / LV };
+        const aU = 探A && 側面に入る(U, Aa, 1, 向き), bU = 探B && 側面に入る(U, Bb, -1, 向き);
+        if (aU || bU) return { 道, 腕: aU && bU ? 'AB' : (aU ? 'A' : 'B') };
+      }
+      const aV = 探A && 側面に入る(V, Aa, 1), bV = 探B && 側面に入る(V, Bb, -1);
+      if (aV || bV) {
+        // U→V のどこで入るかを二分で詰める
+        let lo = 0, hi = 1;
+        for (let it = 0; it < 12; it++) {
+          const m = (lo + hi) / 2, Q = { x: U.x + (V.x - U.x) * m, y: U.y + (V.y - U.y) * m };
+          if ((aV && 側面に入る(Q, Aa, 1)) || (bV && 側面に入る(Q, Bb, -1))) hi = m; else lo = m;
+        }
+        const Q = { x: U.x + (V.x - U.x) * hi, y: U.y + (V.y - U.y) * hi };
+        道.push(Q);
+        return { 道, 腕: aV && bV ? 'AB' : (aV ? 'A' : 'B') };
+      }
+      if (Math.hypot(V.x - 中.x, V.y - 中.y) > 上限) return null;
+      if (V.x !== U.x || V.y !== U.y) 道.push(V);
+      U = V; k += 向g;
+    }
+    return null;
+  };
+  // 折れ線を直線で間引く（許しより離れる点だけ残す）
+  const 間引き = (L) => {
+    if (L.length <= 2 || !Number.isFinite(許し)) return L.length <= 2 ? L : [L[0], L[L.length - 1]];
+    const 残 = new Array(L.length).fill(false); 残[0] = 残[L.length - 1] = true;
+    const 段 = [[0, L.length - 1]];
+    while (段.length) {
+      const [i, j] = 段.pop(); const a = L[i], b = L[j], ex = b.x - a.x, ey = b.y - a.y, LL = Math.hypot(ex, ey) || 1;
+      let m = -1, md = 0;
+      for (let k = i + 1; k < j; k++) { const dd = Math.abs((L[k].x - a.x) * ey - (L[k].y - a.y) * ex) / LL; if (dd > md) { md = dd; m = k; } }
+      if (m > 0 && md > 許し) { 残[m] = true; 段.push([i, m], [m, j]); }
+    }
+    return L.filter((_, k) => 残[k]);
+  };
+  const 輪 = []; let 取れた = 0;
+  const 足す = (p) => { const z = 輪[輪.length - 1]; if (!z || Math.hypot(z.x - p.x, z.y - p.y) > 1e-6) 輪.push({ x: p.x, y: p.y }); };
+  for (let i = 0; i < 腕.length; i++) {
+    const A = 腕[i], B = 腕[(i + 1) % 腕.length];
+    let Δ = B.角 - A.角; if (i === 腕.length - 1) Δ += 二π;
+    const 記 = o.記録 ? { 角A: +(A.角 * 180 / Math.PI).toFixed(1), 角B: +(B.角 * 180 / Math.PI).toFixed(1), hA: A.左, hB: B.右 } : null;
+    if (記) o.記録.push(記);
+    if (!(Δ > 0.17)) { if (記) 記.結果 = '同じ向き'; 足す(中); continue; }        // 10°未満＝ほぼ同じ向きの2本（角は無い）
+    const θ = A.角 + Δ / 2, 始 = 当たり(Math.cos(θ), Math.sin(θ));
+    if (!始) { if (記) 記.結果 = '縁に当たらない'; 足す(中); continue; }
+    const P0 = { x: 始.x, y: 始.y };
+    const a0 = 側面に入る(P0, A, 1), b0 = 側面に入る(P0, B, -1);
+    let 鎖 = null;
+    if (a0 && b0) 鎖 = [帯の側へ(P0, A, 1)];
+    else if (a0 || b0) {
+      // 当たった点がもう一方の帯の中＝そちら側の端はこの点。もう一方の側面だけを両向きに探す
+      const 前 = 辿る(始, 1, A, B, !a0, !b0), 後 = 辿る(始, -1, A, B, !a0, !b0);
+      const w = [前, 後].find(x => x) ;
+      if (w) 鎖 = a0 ? [P0].concat(w.道) : w.道.slice().reverse().concat([P0]);
+      if (記) { 記.前 = 前 ? 前.腕 + '(' + 前.道.length + ')' : 'なし'; 記.後 = 後 ? 後.腕 + '(' + 後.道.length + ')' : 'なし'; 記.始め = a0 ? 'A側' : 'B側'; }
+    } else {
+      const 前 = 辿る(始, 1, A, B), 後 = 辿る(始, -1, A, B);
+      const 候 = [前, 後];
+      let toA = null, toB = null;
+      // 両方の側面に同時に入った（まっすぐな側・角の無い所）＝その点で終わり
+      const 両 = 候.find(w => w && w.腕 === 'AB');
+      if (両) 鎖 = [帯の側へ(P0, A, 1)];
+      else {
+        for (const w of 候) { if (!w) continue; if (w.腕 === 'A' && !toA) toA = w; else if (w.腕 === 'B' && !toB) toB = w; }
+        if (toA && toB && toA !== toB) 鎖 = toA.道.slice().reverse().concat([P0], toB.道);
+      }
+      if (記) { 記.前 = 前 ? 前.腕 + '(' + 前.道.length + ')' : 'なし'; 記.後 = 後 ? 後.腕 + '(' + 後.道.length + ')' : 'なし'; }
+    }
+    if (!鎖) { if (記) 記.結果 = '側面まで辿れない'; 足す(中); continue; }
+    if (記) 記.結果 = '面取り';
+    const 細鎖 = 間引き(鎖);
+    if (細鎖.length >= 2) { 細鎖[0] = 帯の側へ(細鎖[0], A, 1); 細鎖[細鎖.length - 1] = 帯の側へ(細鎖[細鎖.length - 1], B, -1); }
+    for (const p of 細鎖) 足す(p);
+    取れた++;
+  }
+  if (!取れた) return null;
+  if (輪.length > 1) { const a = 輪[0], z = 輪[輪.length - 1]; if (Math.hypot(a.x - z.x, a.y - z.y) <= 1e-6) 輪.pop(); }
+  return 輪.length >= 3 ? 輪 : null;
 }
 // 1本の（折れの緩い）折れ線を帯にする。hl・hr は点ごとの左右の半幅（無ければ h の一定幅）
 function _gsiBand(p, h, hl, hr) {
@@ -1227,15 +1430,12 @@ async function gsiLoadBuildings(bounds, opts) {
                 if (細.length < 2) continue;
                 // 【実際の幅を縁の線から測る・2026-11-27】測れなければ幅員区分の幅（従来）。
                 //   上限＝区分の上限の半分＋1.5m（隣の道路の縁を拾わない）。端の余白＝上限（交差点で横道の縁まで伸びない）。
-                let _実 = null;
                 const _上m = ((表.区分の上限m && 表.区分の上限m[_rw] != null) ? 表.区分の上限m[_rw]
                   : (表.区分の上限m && 表.区分の上限m.無) || 12) / 2 + 1.5;
-                道路の芯.push({ 細, 上m: _上m });
-                if (縁線.length) {
-                  const _m = gsiMeasureRoadHalfWidths(細, 縁線, {
-                    刻み: 2 / 単位m, 上限: _上m / 単位m, 最小: 0.3 / 単位m, 端の余白: _上m / 単位m });
-                  if (_m.左 != null && _m.右 != null) _実 = { 左m: _m.左 * 単位m, 右m: _m.右 * 単位m, 標本: _m.標本 };
-                }
+                // 交差点の角を取るのにも使う（gsiRoadCoreEntry＝検査 checks/gsi_road_corner_real.cjs と同じ関数）
+                const _芯 = gsiRoadCoreEntry(細, 縁線, 単位m, _幅m, _上m);
+                道路の芯.push(_芯);
+                const _実 = (_芯.左 != null && _芯.右 != null) ? { 左m: _芯.左 * 単位m, 右m: _芯.右 * 単位m, 標本: _芯.標本 } : null;
                 const 芯 = 細.map(pt => ({
                   lat: gsiTileYToLat(ty + pt.y / ext, z),
                   lng: gsiTileXToLng(tx + pt.x / ext, z),
@@ -1314,16 +1514,11 @@ async function gsiLoadBuildings(bounds, opts) {
         }
         // 【交差点の角（隅切り）・2026-11-27 ユーザー報告「十字路の面取りというか角の部分が違う」】
         //   中心線の帯を交差させただけでは角が直角になる。交差点ごとに、道路縁の線から角の形を取って塗る
-        //   （gsiRoadNodes → gsiRoadCornerPatch）。自分のタイルの中の交差点だけ（隣のタイルと二重にしない）。
+        //   （gsiRoadNodes → gsiRoadCornerFill＝角を取るだけの面取り）。自分のタイルの中の交差点だけ（隣のタイルと二重にしない）。
         //   旗 globalThis.__GSI_ROAD_CORNER_FILL = false で従来（角を取らない）＝陽性対照。
         if (表.縁の範囲 && 縁線.length && 道路の芯.length >= 2 && !上限超過
             && !(typeof globalThis !== 'undefined' && globalThis.__GSI_ROAD_CORNER_FILL === false)) {
-          for (const 節 of gsiRoadNodes(道路の芯.map(d => d.細))) {
-            if (節.x < 0 || 節.x >= ext || 節.y < 0 || 節.y >= ext) continue;
-            // 届く距離＝その交差点に集まる道路の半幅の上限のうち最大＋隅切りの余裕10m
-            const _上 = Math.max(...節.線.map(i => 道路の芯[i].上m)) + 10;
-            const 輪 = gsiRoadCornerPatch(節, 縁線, { 上限: _上 / 単位m, 最小: 0.3 / 単位m, 本数: 72 });
-            if (!輪) continue;
+          for (const { 節, 輪 } of gsiRoadCornersInTile(道路の芯, 縁線, ext, 単位m)) {
             const ll = 輪.map(pt => ({ lat: gsiTileYToLat(ty + pt.y / ext, z), lng: gsiTileXToLng(tx + pt.x / ext, z) }));
             const cla = gsiTileYToLat(ty + 節.y / ext, z), clo = gsiTileXToLng(tx + 節.x / ext, z);
             if (cla > bounds.north || cla < bounds.south || clo < bounds.west || clo > bounds.east) continue;
