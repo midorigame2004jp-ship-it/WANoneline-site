@@ -562,7 +562,16 @@ const GSI_IMPORT_LAYERS = {
   building:   { ft: GSI_BUILDING_FT,  型: 3, ズーム: 15, 色: '#A8B2BD' },
   structurea: { ft: GSI_STRUCTURE_FT, 型: 3, ズーム: 15, 色: '#B3ACA2' },
   // 道路は線。幅は rnkWidth（無ければ既定）。高さは薄い板。色は灰色
-  road:       { ft: null, 型: 2, 名: '道路', 区分: GSI_ROAD_CTG, 幅の表: GSI_ROAD_WIDTH,
+  // 【中心線だけ取り込む・2026-11-27 ユーザー報告「なぜ幅を3つに分割するのか」】
+  //   road レイヤには **27xx＝道路中心線**（区分 rdCtg・幅員 rnkWidth を持つ）のほかに
+  //   **22xx＝道路縁**（道路の両側の線。幅員なし）と **24xx＝道路構成線**（トンネル内・分離帯）が同じレイヤで入っている
+  //   （地理院地図Vector の標準地図スタイル data/std.json で確認: 27xx は「国道／都道府県道／市区町村道…」の
+  //   幅員ごとの線、22xx・24xx は区分の無い細い灰色の線で、地図を拡大したときだけ描く道路の輪郭）。
+  //   ftCode で絞らずに全部を帯にしていたので、1本の道路が「中心線の帯＋左右の縁の帯」の**3本**になっていた。
+  //   中心線（徒歩道 2721〜・庭園路 2711〜・石段 2731〜 も中心線）だけを取る。範囲は ft範囲 1か所。
+  //   旗 globalThis.__GSI_ROAD_CENTERLINE_ONLY = false で従来（縁の線も帯にする）＝陽性対照。
+  road:       { ft: null, ft範囲: [2700, 2799], ft範囲の旗: '__GSI_ROAD_CENTERLINE_ONLY',
+                型: 2, 名: '道路', 区分: GSI_ROAD_CTG, 幅の表: GSI_ROAD_WIDTH,
                 既定幅m: 2, 高さm: 0.12, 色: '#9CA3AF', 上限: 300,
                 // 段階フラグ（globalThis.__GSI_ROAD = false で道路を取らない＝陽性対照）
                 // 【立体でなく地面に塗る・2026-11-24 ユーザー裁定「道の厚みは求めていない」】
@@ -936,6 +945,7 @@ function gsiJoinLines(items) {
 async function gsiLoadBuildings(bounds, opts) {
   const o = opts || {};
   const items = []; let 穴 = 0, 範囲外 = 0, 余白 = 0, 切れ = 0, 上限超過 = false;
+  let 範囲外の種類 = 0;   // ft範囲の外で取らなかった地物（道路の縁の線など）
   // 【上限はレイヤごと・2026-11-24】建物と道路で枠を分ける。混ぜると道路が枠を食って建物が途中で止まる
   const 層数 = {};
   const 鍵 = new Set();
@@ -969,6 +979,12 @@ async function gsiLoadBuildings(bounds, opts) {
         for (const f of L.feats) {
           // 【型の門はレイヤの表で決める】面（3）だけでなく線（2）も受ける
           if (f.gtype !== 表.型) continue;
+          // 【ftCode の範囲で絞る・2026-11-27】表に ft範囲 があれば、その外の地物は取らない
+          //   （道路は中心線 27xx だけ。縁の線 22xx・構成線 24xx を帯にしない）。旗が false なら絞らない。
+          if (表.ft範囲 && !(表.ft範囲の旗 && typeof globalThis !== 'undefined' && globalThis[表.ft範囲の旗] === false)) {
+            const _c = Number(f.props && f.props.ftCode);
+            if (!(_c >= 表.ft範囲[0] && _c <= 表.ft範囲[1])) { 範囲外の種類++; continue; }
+          }
           // 種別名: ft の表があればそれで絞る（無い ftCode は捨てる）。
           //   表が null のレイヤ（道路）は ftCode で絞らず、区分（rdCtg）があれば名前に添える。
           let 種別;
@@ -1083,5 +1099,5 @@ async function gsiLoadBuildings(bounds, opts) {
   }
   return { items: _縫.items, 穴, 範囲外, 余白, 切れ, つないだ: _縫.つないだ,
     縫いの試行: _縫.試した || 0, 縫いの理由: _縫.理由 || {},
-    層数, 線をつないだ: _繋.つないだ, タイル数: タイル総数, 上限超過 };
+    層数, 線をつないだ: _繋.つないだ, タイル数: タイル総数, 上限超過, 範囲外の種類 };
 }

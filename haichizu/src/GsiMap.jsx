@@ -145,6 +145,8 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (res && res.重複) 行.push('すでにある ' + res.重複 + ' 件は足していません');
       if (res && res.重なり) 行.push('手で作った建屋と重なる ' + res.重なり + ' 件は足していません');
       if (r.穴) 行.push('中庭などの穴 ' + r.穴 + ' 件は落としました');
+      // 【道路の縁の線は取らない・2026-11-27】道路は中心線だけを帯にする（gsiTiles.js の GSI_IMPORT_LAYERS の ft範囲）
+      if (r.範囲外の種類) 行.push('道路の縁の線など ' + r.範囲外の種類 + ' 本は取り込んでいません（道路は中心線だけを帯にします）');
       if (r.切れ) 行.push('タイルの境目で切れた形 ' + r.切れ + ' 件（端がまっすぐに見えます）');
       if (res && res.交差) 行.push('形が自分と交わっていた ' + res.交差 + ' 件は落としました');
       if (r.上限超過) 行.push('上限に達したので途中で止めました（範囲を狭めてください）');
