@@ -1146,6 +1146,25 @@ function gsiRingKey(p) { return p.lat.toFixed(7) + '|' + p.lng.toFixed(7); }
 // 2倍面積（符号付き・整数）。**先頭点を原点へ平行移動**してから計算する。
 //   通し座標は z15・ext4096 で約1.3e8。そのまま掛けると積が 1.7e16 で 2^53(9e15) を超え、
 //   整数として厳密に扱えない（監査の必須条件）。差にすれば建物の大きさ（数千）なので安全。
+// 輪を軸に平行な1本の線で切る（向 = +1 なら 値 以上を残す・-1 なら 値 以下を残す）。Sutherland–Hodgman の1辺ぶん。
+//   線との交点は「小さい方の端点から」計算する＝隣のタイルの断片で同じ辺を切っても同じ値になる。
+function gsiClipRingAxis(R, 軸, 値, 向) {
+  const 内 = (q) => 向 > 0 ? q[軸] >= 値 : q[軸] <= 値;
+  const 交 = (p, q) => {
+    const [a, b] = (p.x < q.x || (p.x === q.x && p.y < q.y)) ? [p, q] : [q, p];
+    const t = (値 - a[軸]) / (b[軸] - a[軸]);
+    return 軸 === 'x' ? { x: 値, y: a.y + (b.y - a.y) * t } : { x: a.x + (b.x - a.x) * t, y: 値 };
+  };
+  const 出 = [];
+  for (let i = 0; i < R.length; i++) {
+    const p = R[(i - 1 + R.length) % R.length], q = R[i];
+    const pi = 内(p), qi = 内(q);
+    if (qi) { if (!pi) 出.push(交(p, q)); 出.push(q); }
+    else if (pi) 出.push(交(p, q));
+  }
+  // 連続する同じ点を除く
+  return 出.filter((q, k) => { const r = 出[(k - 1 + 出.length) % 出.length]; return 出.length < 2 || q.x !== r.x || q.y !== r.y; });
+}
 function gsiRingArea2(R) {
   if (!R || R.length < 3) return 0;
   const ox = R[0].x, oy = R[0].y;
@@ -1224,7 +1243,9 @@ function gsiMergeRingPair(A, B) {
     //   重なり・向き違い・誤った区間のどれでも崩れる＝**一番強い検査**（監査）。許容誤差は置かない。
     const 面2 = gsiRingArea2(輪), a2 = gsiRingArea2(A), b2 = gsiRingArea2(B);
     if (!(面2 > 0)) { 最後の理由 = '向きが反転した'; continue; }
-    if (面2 !== Math.abs(a2) + Math.abs(b2)) { 最後の理由 = '面積が合わない(' + 面2 + ' ≠ ' + (Math.abs(a2) + Math.abs(b2)) + ')'; continue; }
+    // 枠で切った断片は境目の点が小数になり得る（gsiClipRingAxis）。そのときだけ相対1e-9 の誤差を許す
+    const 和 = Math.abs(a2) + Math.abs(b2), 整数 = 輪.every(q => Number.isInteger(q.x) && Number.isInteger(q.y));
+    if (整数 ? 面2 !== 和 : Math.abs(面2 - 和) > 1e-9 * 和) { 最後の理由 = '面積が合わない(' + 面2 + ' ≠ ' + 和 + ')'; continue; }
     return { 輪 };
   }
   return { 理由: 最後の理由 };
@@ -1243,6 +1264,36 @@ function gsiStitchCut(items) {
     .filter(i => 生[i] && 生[i].cut && Array.isArray(生[i]._生))
     .sort((a, b) => String(生[a].key).localeCompare(String(生[b].key)));
   if (順.length < 2) return { items, つないだ: 0, 試した: 0, 理由 };
+  // 【余白の端で切られた断片は、まず自分のタイルの枠で切る・2026-11-27 ユーザー報告「建物取得ミスが継続している」】
+  //   実データ（大分市の臨海部・z15）: タイルの境目をまたぐ大きな建物は、両側のタイルがそれぞれ
+  //   **余白（約18m）の端まで**の断片を持つ。2つの断片は境目の両側で約36m 重なり、境目の上の点（地理院が入れる）は共有するが
+  //   共有列は一直線でない＝下の融合は「共有列が一直線でない」で断り、**両方を採って重なった2つの建物**になっていた。
+  //   余白の端で切られた辺（断片の外接矩形の端がタイルの外にあり、そこに2点以上が並ぶ）の側だけ、タイルの境目で切る。
+  //   切った2つは境目の上の同じ線を共有するので下の融合でつながる。つながらなくても重ならない（隣り合う2つの箱）。
+  //   旗 globalThis.__GSI_CLIP_BUFFER_CUT = false で従来（切らない）＝陽性対照。
+  let 枠で切った = 0;
+  if (!(typeof globalThis !== 'undefined' && globalThis.__GSI_CLIP_BUFFER_CUT === false)) {
+    for (const i of 順) {
+      const a = 生[i]; const P = a._生, e = a._ext;
+      const X0 = a._tx * e, Y0 = a._ty * e, X1 = X0 + e, Y1 = Y0 + e;
+      let mx = Infinity, Mx = -Infinity, my = Infinity, My = -Infinity;
+      for (const q of P) { if (q.x < mx) mx = q.x; if (q.x > Mx) Mx = q.x; if (q.y < my) my = q.y; if (q.y > My) My = q.y; }
+      const 並ぶ = (f) => P.filter(f).length >= 2;
+      const 辺 = [];
+      if (mx < X0 && 並ぶ(q => q.x === mx)) 辺.push(['x', X0, 1]);
+      if (Mx > X1 && 並ぶ(q => q.x === Mx)) 辺.push(['x', X1, -1]);
+      if (my < Y0 && 並ぶ(q => q.y === my)) 辺.push(['y', Y0, 1]);
+      if (My > Y1 && 並ぶ(q => q.y === My)) 辺.push(['y', Y1, -1]);
+      if (!辺.length) continue;
+      let R = P;
+      for (const [軸, v, 向] of 辺) R = gsiClipRingAxis(R, 軸, v, 向);
+      if (R.length < 3 || !(gsiRingArea2(R) > 0)) continue;
+      const 細 = gsiThinRing(R, a._単位m || 1);
+      if (細.length < 3) continue;
+      生[i] = { ...a, _生: R, ring: 細.map(q => ({ lat: gsiTileYToLat(q.y / e, a._z), lng: gsiTileXToLng(q.x / e, a._z) })) };
+      枠で切った++;
+    }
+  }
   // 縁に乗る点が残っているか（融合後の cut を**再計算**する。引き継ぎでも一律解除でもない＝監査）
   const _縁 = (輪, ext) => 輪.some(q => (q.x % ext === 0) || (q.y % ext === 0));
   for (let 回 = 0; 回 < 4; 回++) {
@@ -1277,7 +1328,7 @@ function gsiStitchCut(items) {
     }
     if (!変) break;
   }
-  return { items: 生.filter(Boolean), つないだ, 試した, 理由 };
+  return { items: 生.filter(Boolean), つないだ, 試した, 理由, 枠で切った };
 }
 // ══ 中心線を端点でつなぐ・2026-11-24 ══
 // 【なぜ】ベクトルタイルは1本の道路を、属性の変わり目やタイルの境目で**複数の地物**に分けて配信する。
@@ -1553,6 +1604,6 @@ async function gsiLoadBuildings(bounds, opts) {
     if (it && it._生) { delete it._生; delete it._z; delete it._ext; delete it._単位m; delete it._tx; delete it._ty; }
   }
   return { items: _縫.items, 穴, 範囲外, 余白, 切れ, つないだ: _縫.つないだ,
-    縫いの試行: _縫.試した || 0, 縫いの理由: _縫.理由 || {},
+    縫いの試行: _縫.試した || 0, 縫いの理由: _縫.理由 || {}, 枠で切った: _縫.枠で切った || 0,
     層数, 線をつないだ: _繋.つないだ, タイル数: タイル総数, 上限超過, 範囲外の種類, 交差点の角 };
 }
