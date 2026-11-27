@@ -11928,7 +11928,50 @@ ocrForm.addEventListener('submit', async event => {
  }
 });
 const ocrStyle = document.createElement('style');
-ocrStyle.textContent = '#pkOcrForm label{display:grid;gap:4px;margin-bottom:10px}#pkOcrForm [hidden]{display:none}#pkOcrForm [role=status]{margin-top:10px;font-size:12px;line-height:1.5}';
+ocrStyle.textContent = `
+.pk-panel button.pk-action[data-panel="ocr"],
+#pkOcrForm button {
+ min-height: 44px;
+ padding: 8px 12px;
+ border: 1px solid #829bb7;
+ border-radius: 6px;
+ background: #303d4d;
+ color: #fff;
+ font-weight: 600;
+}
+#pkOcrForm button[type="submit"] {
+ display: block;
+ width: 100%;
+ border-color: #81baff;
+ background: #0858b2;
+}
+#pkOcrForm button[data-ocr-cancel] {
+ width: 100%;
+ margin-top: 8px;
+}
+.pk-panel button.pk-action[data-panel="ocr"]:hover,
+#pkOcrForm button:not(:disabled):hover {
+ background: #40536b;
+}
+#pkOcrForm button[type="submit"]:not(:disabled):hover {
+ background: #06468f;
+}
+.pk-panel button.pk-action[data-panel="ocr"]:focus-visible,
+#pkOcrForm button:focus-visible {
+ outline: 2px solid #a8d2ff;
+ outline-offset: 2px;
+}
+#pkOcrForm button:disabled {
+ background: #393f47;
+ border-color: #77808b;
+ color: #d2d7df;
+ opacity: 1;
+ cursor: default;
+}
+#pkOcrForm label { display: grid; gap: 4px; margin-bottom: 10px; }
+#pkOcrForm [hidden] { display: none; }
+#pkOcrForm [role="status"] { margin-top: 10px; font-size: 12px; line-height: 1.5; }
+`;
 document.head.append(ocrStyle);
 syncOcrControls();
 
