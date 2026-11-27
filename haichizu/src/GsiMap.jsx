@@ -129,6 +129,8 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
         // 【塗る面は中心線＋幅で運ぶ・2026-11-24】輪（ring）を持たないので points も作らない。
         //   帯は描く側（地面の canvas・平面図）が地面の起伏に乗せて作る。
         if (it.塗る && Array.isArray(it.中心線)) return Object.assign(他, { 中心線: _グ(it.中心線) });
+        // 【交差点の角は形（輪）で運ぶ・2026-11-27】道路縁の線から取った隅切りの面
+        if (it.塗る && Array.isArray(it.輪)) return Object.assign(他, { 輪: _グ(it.輪) });
         return Object.assign(他, { points: _グ(it.ring || []) });
       });
       const res = (typeof onBuildings === 'function') ? onBuildings(items) : null;
@@ -146,13 +148,15 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (res && res.重なり) 行.push('手で作った建屋と重なる ' + res.重なり + ' 件は足していません');
       if (r.穴) 行.push('中庭などの穴 ' + r.穴 + ' 件は落としました');
       // 【道路の縁の線は取らない・2026-11-27】道路は中心線だけを帯にする（gsiTiles.js の GSI_IMPORT_LAYERS の ft範囲）
+      if (r.交差点の角) 行.push('交差点の角 ' + r.交差点の角 + ' か所は道路の縁の線から隅切りの形を取りました');
       if (r.範囲外の種類) 行.push('道路の縁の線など ' + r.範囲外の種類 + ' 本は取り込んでいません（道路は中心線だけを帯にします）');
       if (r.切れ) 行.push('タイルの境目で切れた形 ' + r.切れ + ' 件（端がまっすぐに見えます）');
       if (res && res.交差) 行.push('形が自分と交わっていた ' + res.交差 + ' 件は落としました');
       if (r.上限超過) 行.push('上限に達したので途中で止めました（範囲を狭めてください）');
       // 【高さの知らせは「実データの高さを持たないもの」だけに言う・2026-11-24】
       //   道路は 0.12m の板なので『高さは仮の10m』は嘘になる（Codex監査の指摘）。
-      const _仮の高さ = items.filter(it => !(typeof it.height === "number" && it.height > 0)).length;
+      // 【地面に塗る面（道路・交差点の角）は高さを持たないので数えない・2026-11-27】
+      const _仮の高さ = items.filter(it => !it.塗る && !(typeof it.height === "number" && it.height > 0)).length;
       if (_仮の高さ) 行.push('そのうち ' + _仮の高さ + ' 件は高さが分からないので仮の '
         + (typeof NEW_BLD_H_M !== 'undefined' ? NEW_BLD_H_M : 10) + 'm です。建物エディタで直してください');
       // 道路は幅員**区分**からの推定（実幅員は配信されていない）。ずれる幅を数で言う

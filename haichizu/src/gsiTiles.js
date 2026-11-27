@@ -560,6 +560,117 @@ function gsiMeasureRoadHalfWidths(pts, 縁, opt) {
   出.左 = 左; 出.右 = 右;
   return 出;
 }
+// ══ 交差点の角（隅切り）を道路の縁の線から取る・2026-11-27 ══
+// 【なぜ】ユーザー報告「道路が手抜き道路になっている。十字路の面取りというか角の部分が違う」。
+//   中心線の帯を交差させただけでは角が直角のまま。実際の角の丸み（隅切り）は**道路縁の線**が持っている。
+// 【交差点を見つける】中心線どうしが ①同じ頂点を共有する（次数3以上、または2本が30°以上の角度で会う）
+//   ②端点が別の線の途中に乗る（T字）③途中どうしが交わる（十字）。1単位以内の重複はまとめる。
+// 戻り: [{ x, y, 線: [中心線の番号…] }]（座標は入力と同じ単位）
+function gsiRoadNodes(lines) {
+  const 節ら = [];
+  const 足す = (x, y, 線) => {
+    for (const n of 節ら) if (Math.hypot(n.x - x, n.y - y) <= 1) { for (const l of 線) if (!n.線.includes(l)) n.線.push(l); return; }
+    節ら.push({ x, y, 線: 線.slice() });
+  };
+  // ① 同じ頂点を共有する
+  const 頂 = new Map();
+  lines.forEach((L, li) => L.forEach((p, vi) => {
+    const k = p.x + ',' + p.y;
+    let a = 頂.get(k); if (!a) { a = []; 頂.set(k, a); }
+    a.push({ li, vi, 端: vi === 0 || vi === L.length - 1 });
+  }));
+  for (const [k, a] of 頂) {
+    const 線 = [...new Set(a.map(e => e.li))];
+    if (線.length < 2) continue;
+    const 次数 = a.reduce((s, e) => s + (e.端 ? 1 : 2), 0);
+    const [x, y] = k.split(',').map(Number);
+    if (次数 >= 3) { 足す(x, y, 線); continue; }
+    // 2本の端どうし: 曲がる角度が30°以上なら角として扱う（まっすぐ続くだけなら帯で足りる）
+    const 向き = a.map(e => { const L = lines[e.li]; const q = L[e.vi === 0 ? 1 : L.length - 2];
+      const dx = q.x - x, dy = q.y - y, n = Math.hypot(dx, dy) || 1; return [dx / n, dy / n]; });
+    const cos = 向き[0][0] * 向き[1][0] + 向き[0][1] * 向き[1][1];   // 反対向き（-1）＝まっすぐ
+    if (cos > Math.cos(150 * Math.PI / 180)) 足す(x, y, 線);
+  }
+  // ②③ 端点が途中に乗る・途中どうしが交わる
+  //   線ごとの外接矩形が重ならない組は飛ばす（1タイルに中心線が数百本あっても重くしない）
+  const 箱 = lines.map(L => { let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const p of L) { if (p.x < x0) x0 = p.x; if (p.y < y0) y0 = p.y; if (p.x > x1) x1 = p.x; if (p.y > y1) y1 = p.y; }
+    return [x0, y0, x1, y1]; });
+  for (let i = 0; i < lines.length; i++) for (let j = i + 1; j < lines.length; j++) {
+    const A = lines[i], B = lines[j], bi = 箱[i], bj = 箱[j];
+    if (bi[0] > bj[2] || bj[0] > bi[2] || bi[1] > bj[3] || bj[1] > bi[3]) continue;
+    for (let a = 1; a < A.length; a++) for (let b = 1; b < B.length; b++) {
+      const p = A[a - 1], q = A[a], r = B[b - 1], s = B[b];
+      const ex = q.x - p.x, ey = q.y - p.y, fx = s.x - r.x, fy = s.y - r.y;
+      const den = ex * fy - ey * fx;
+      if (Math.abs(den) < 1e-9) continue;
+      const t = ((r.x - p.x) * fy - (r.y - p.y) * fx) / den, u = ((r.x - p.x) * ey - (r.y - p.y) * ex) / den;
+      const 余 = 1e-6;
+      if (t < -余 || t > 1 + 余 || u < -余 || u > 1 + 余) continue;
+      // 両方とも端点どうし（=①で扱った）は除く
+      const 端A = (a === 1 && t <= 余) || (a === A.length - 1 && t >= 1 - 余);
+      const 端B = (b === 1 && u <= 余) || (b === B.length - 1 && u >= 1 - 余);
+      if (端A && 端B) continue;
+      足す(p.x + ex * t, p.y + ey * t, [i, j]);
+    }
+  }
+  return 節ら;
+}
+// 交差点のまわりの道路の面（隅切りを含む）を、交差点の中心から全方向に線を伸ばし、
+//   最初に当たった道路縁までを結んだ星形の多角形として取る。
+//   ・当たらない向き（道路が続く向き）は中心に戻す＝そこは中心線の帯が受け持つ（縁の切れ目から街区へはみ出さない）
+//   ・上限より遠い当たり・最小より近い当たりは無視
+// 戻り: 輪（点の配列・入力と同じ単位）。当たりが3点未満なら null
+function gsiRoadCornerPatch(中, 縁, opt) {
+  const o = opt || {};
+  const 本数 = o.本数 > 0 ? o.本数 : 72, 上限 = o.上限 > 0 ? o.上限 : Infinity, 最小 = o.最小 > 0 ? o.最小 : 0;
+  // 上限の円にかかる線分だけ先に選ぶ
+  const 近 = [];
+  for (const g of 縁) for (let k = 1; k < g.length; k++) {
+    const a = g[k - 1], b = g[k];
+    if (Math.min(a.x, b.x) > 中.x + 上限 || Math.max(a.x, b.x) < 中.x - 上限
+      || Math.min(a.y, b.y) > 中.y + 上限 || Math.max(a.y, b.y) < 中.y - 上限) continue;
+    近.push([a, b]);
+  }
+  if (!近.length) return null;
+  // 線を伸ばす向き: 等間隔の 本数 本＋**縁の線の頂点の向き（とその前後わずか）**。
+  //   等間隔だけだと、直角の角（隅切りの無い角）や丸みの頂点の間で、隣り合う当たりを結ぶ辺が街区を少し削る／はみ出す。
+  //   頂点の向きにも伸ばせば、見えている縁の線の形をそのまま辿る（見通しの多角形）。
+  //   旗 globalThis.__GSI_ROAD_CORNER_VERTEX_RAYS = false で等間隔だけ（従来）。
+  const 向き = [];
+  for (let i = 0; i < 本数; i++) 向き.push(2 * Math.PI * i / 本数);
+  if (!(typeof globalThis !== 'undefined' && globalThis.__GSI_ROAD_CORNER_VERTEX_RAYS === false)) {
+    const ε = 1e-4, 見た = new Set();
+    for (const [a, b] of 近) for (const v of [a, b]) {
+      const k = v.x + ',' + v.y; if (見た.has(k)) continue; 見た.add(k);
+      const d = Math.hypot(v.x - 中.x, v.y - 中.y);
+      if (d < 最小 || d > 上限) continue;
+      const th = Math.atan2(v.y - 中.y, v.x - 中.x);
+      向き.push(th - ε, th, th + ε);
+      if (向き.length > 4000) break;
+    }
+    for (let i = 0; i < 向き.length; i++) { let t = 向き[i] % (2 * Math.PI); if (t < 0) t += 2 * Math.PI; 向き[i] = t; }
+    向き.sort((p, q) => p - q);
+  }
+  const 点 = []; let 当 = 0;
+  for (const th of 向き) {
+    const dx = Math.cos(th), dy = Math.sin(th);
+    let best = Infinity;
+    for (const [a, b] of 近) {
+      const ex = b.x - a.x, ey = b.y - a.y, den = dx * ey - dy * ex;
+      if (Math.abs(den) < 1e-12) continue;
+      const t = ((a.x - 中.x) * ey - (a.y - 中.y) * ex) / den, u = ((a.x - 中.x) * dy - (a.y - 中.y) * dx) / den;
+      // 頂点ちょうどの向きは隣り合う2本の端（u=0 か 1）に当たる。丸め誤差で両方から外れないよう少し余裕を持つ
+      if (u < -1e-9 || u > 1 + 1e-9 || t < 最小 || t > 上限) continue;
+      if (t < best) best = t;
+    }
+    if (Number.isFinite(best)) { 点.push({ x: 中.x + dx * best, y: 中.y + dy * best }); 当++; }
+    else if (!点.length || 点[点.length - 1].x !== 中.x || 点[点.length - 1].y !== 中.y) 点.push({ x: 中.x, y: 中.y });
+  }
+  if (当 < 3) return null;
+  if (点.length > 1 && 点[0].x === 中.x && 点[0].y === 中.y && 点[点.length - 1].x === 中.x && 点[点.length - 1].y === 中.y) 点.pop();
+  return 点;
+}
 // 1本の（折れの緩い）折れ線を帯にする。hl・hr は点ごとの左右の半幅（無ければ h の一定幅）
 function _gsiBand(p, h, hl, hr) {
   const 左 = [], 右 = [];
@@ -1041,6 +1152,7 @@ async function gsiLoadBuildings(bounds, opts) {
   const o = opts || {};
   const items = []; let 穴 = 0, 範囲外 = 0, 余白 = 0, 切れ = 0, 上限超過 = false;
   let 範囲外の種類 = 0;   // ft範囲の外で取らなかった地物（道路の縁の線など）
+  let 交差点の角 = 0;     // 道路縁の線から角の形を取った交差点の数
   // 【上限はレイヤごと・2026-11-24】建物と道路で枠を分ける。混ぜると道路が枠を食って建物が途中で止まる
   const 層数 = {};
   const 鍵 = new Set();
@@ -1075,6 +1187,7 @@ async function gsiLoadBuildings(bounds, opts) {
         //   （帯にはしない。gsiMeasureRoadHalfWidths が中心線から縁までの距離を測るのに使う）。
         //   余白（タイルの外）にある縁も入れる＝タイルの縁の近くの中心線も両側を測れる。
         const 縁線 = [];
+        const 道路の芯 = [];   // このタイルの中心線（タイル内座標）。交差点の角を取るのに使う
         if (表.縁の範囲 && !(表.縁の旗 && typeof globalThis !== 'undefined' && globalThis[表.縁の旗] === false)) {
           for (const g of L.feats) {
             if (g.gtype !== 2) continue;
@@ -1115,9 +1228,10 @@ async function gsiLoadBuildings(bounds, opts) {
                 // 【実際の幅を縁の線から測る・2026-11-27】測れなければ幅員区分の幅（従来）。
                 //   上限＝区分の上限の半分＋1.5m（隣の道路の縁を拾わない）。端の余白＝上限（交差点で横道の縁まで伸びない）。
                 let _実 = null;
+                const _上m = ((表.区分の上限m && 表.区分の上限m[_rw] != null) ? 表.区分の上限m[_rw]
+                  : (表.区分の上限m && 表.区分の上限m.無) || 12) / 2 + 1.5;
+                道路の芯.push({ 細, 上m: _上m });
                 if (縁線.length) {
-                  const _上m = ((表.区分の上限m && 表.区分の上限m[_rw] != null) ? 表.区分の上限m[_rw]
-                    : (表.区分の上限m && 表.区分の上限m.無) || 12) / 2 + 1.5;
                   const _m = gsiMeasureRoadHalfWidths(細, 縁線, {
                     刻み: 2 / 単位m, 上限: _上m / 単位m, 最小: 0.3 / 単位m, 端の余白: _上m / 単位m });
                   if (_m.左 != null && _m.右 != null) _実 = { 左m: _m.左 * 単位m, 右m: _m.右 * 単位m, 標本: _m.標本 };
@@ -1198,6 +1312,29 @@ async function gsiLoadBuildings(bounds, opts) {
           }
           if (上限超過) break;
         }
+        // 【交差点の角（隅切り）・2026-11-27 ユーザー報告「十字路の面取りというか角の部分が違う」】
+        //   中心線の帯を交差させただけでは角が直角になる。交差点ごとに、道路縁の線から角の形を取って塗る
+        //   （gsiRoadNodes → gsiRoadCornerPatch）。自分のタイルの中の交差点だけ（隣のタイルと二重にしない）。
+        //   旗 globalThis.__GSI_ROAD_CORNER_FILL = false で従来（角を取らない）＝陽性対照。
+        if (表.縁の範囲 && 縁線.length && 道路の芯.length >= 2 && !上限超過
+            && !(typeof globalThis !== 'undefined' && globalThis.__GSI_ROAD_CORNER_FILL === false)) {
+          for (const 節 of gsiRoadNodes(道路の芯.map(d => d.細))) {
+            if (節.x < 0 || 節.x >= ext || 節.y < 0 || 節.y >= ext) continue;
+            // 届く距離＝その交差点に集まる道路の半幅の上限のうち最大＋隅切りの余裕10m
+            const _上 = Math.max(...節.線.map(i => 道路の芯[i].上m)) + 10;
+            const 輪 = gsiRoadCornerPatch(節, 縁線, { 上限: _上 / 単位m, 最小: 0.3 / 単位m, 本数: 72 });
+            if (!輪) continue;
+            const ll = 輪.map(pt => ({ lat: gsiTileYToLat(ty + pt.y / ext, z), lng: gsiTileXToLng(tx + pt.x / ext, z) }));
+            const cla = gsiTileYToLat(ty + 節.y / ext, z), clo = gsiTileXToLng(tx + 節.x / ext, z);
+            if (cla > bounds.north || cla < bounds.south || clo < bounds.west || clo > bounds.east) continue;
+            const key = L.name + ':角:' + cla.toFixed(6) + ',' + clo.toFixed(6);
+            if (鍵.has(key)) continue;
+            鍵.add(key);
+            items.push({ layer: L.name, ftCode: null, 種別: (表.名 || L.name) + '（交差点の角）', key,
+              塗る: !!表.塗る, 輪: ll, color: 表.色, srcAdd: { 交差点の角: true } });
+            交差点の角++;
+          }
+        }
         if (上限超過) break;
       }
     }
@@ -1222,5 +1359,5 @@ async function gsiLoadBuildings(bounds, opts) {
   }
   return { items: _縫.items, 穴, 範囲外, 余白, 切れ, つないだ: _縫.つないだ,
     縫いの試行: _縫.試した || 0, 縫いの理由: _縫.理由 || {},
-    層数, 線をつないだ: _繋.つないだ, タイル数: タイル総数, 上限超過, 範囲外の種類 };
+    層数, 線をつないだ: _繋.つないだ, タイル数: タイル総数, 上限超過, 範囲外の種類, 交差点の角 };
 }

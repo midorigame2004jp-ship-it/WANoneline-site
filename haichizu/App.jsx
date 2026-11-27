@@ -1679,6 +1679,14 @@ window.App = function App() {
     let c = bldCounter.current;
     for (const it of items) {
       if (it.塗る) {
+        // 【形（輪）で来る面・2026-11-27】交差点の角（隅切り）など、中心線でなく輪郭で持つ面
+        if (Array.isArray(it.輪) && it.輪.length >= 3) {
+          if (既.has(it.key)) { 重複++; continue; }
+          既.add(it.key);
+          新面.push({ id: 'ga' + (++c), key: it.key, 種別: it.種別, 輪: it.輪, color: it.color || "#9CA3AF",
+            _src: Object.assign({ 由来: "gsi-bvmap", key: it.key, 種別: it.種別 }, it.srcAdd || {}) });
+          continue;
+        }
         if (!Array.isArray(it.中心線) || it.中心線.length < 2) continue;
         if (既.has(it.key)) { 重複++; continue; }
         既.add(it.key);
@@ -6497,7 +6505,7 @@ window.App = function App() {
     // 建屋の中身（形・階・機器）を検査から読む
     // 観測（製品は読まない）: 地面に塗る面（道路）の中心線と幅。検査が「実際の幅で描いたか」を見る・2026-11-27
     window.__groundAreasForCheck = () => (groundAreasRef.current || []).map(a => ({
-      id: a.id, 種別: a.種別, 中心線: a.中心線, 幅m: a.幅m,
+      id: a.id, 種別: a.種別, 中心線: a.中心線 || null, 輪: a.輪 || null, 幅m: a.幅m,
       幅左m: a.幅左m || null, 幅右m: a.幅右m || null, 出所: a._src && a._src.幅の出所 }));
     window.__buildingsForCheck = () => (buildingsRef.current || []).map(b => ({
       id: b.id, label: b.label,
@@ -9791,7 +9799,10 @@ window.App = function App() {
       const _div = uiSettingValue(uiSettings, 'terrainGrid');
       const _mpp = _bldZMpp();
       for (const a of groundAreas) {
-        if (!a || !Array.isArray(a.中心線) || a.中心線.length < 2) continue;
+        if (!a) continue;
+        // 【形（輪）で持つ面＝交差点の角・2026-11-27】輪の辺を地面の格子の間隔で刻んで起伏に乗せる
+        const _輪あり = Array.isArray(a.輪) && a.輪.length >= 3;
+        if (!_輪あり && (!Array.isArray(a.中心線) || a.中心線.length < 2)) continue;
         // 【左右の幅を点ごとに・2026-11-27】幅は道路の縁の線から実測した左右の半幅（無ければ 幅m の一定幅）。
         //   先に帯（輪）を作ってから、**輪の辺**を地面の格子の間隔で刻む（中心線を刻んでから帯にすると、
         //   刻んで増えた点に左右の幅が無い）。旗 __ROAD_BAND_THEN_RESAMPLE=false で従来（中心線を刻んでから帯）。
@@ -9800,7 +9811,10 @@ window.App = function App() {
         const _右 = Array.isArray(a.幅右m) ? a.幅右m.map(v => v / _px) : null;
         const _後で刻む = !(typeof window !== 'undefined' && window.__ROAD_BAND_THEN_RESAMPLE === false);
         let 輪;
-        if (_後で刻む) {
+        if (_輪あり) {
+          輪 = (typeof terrainResample === 'function')
+            ? terrainResample(a.輪.concat([a.輪[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : a.輪;
+        } else if (_後で刻む) {
           const _帯 = gsiBandRing(a.中心線, (a.幅m || 2) / _px, _左, _右);
           輪 = (_帯 && typeof terrainResample === 'function')
             ? terrainResample(_帯.concat([_帯[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : _帯;
@@ -17222,18 +17236,25 @@ window.App = function App() {
             {(() => {
               if (!(groundAreas || []).length || typeof gsiBandRing !== 'function') return null;
               const _mpp = _bldZMpp();
-              return groundAreas.map(a => {
-                if (!a || !Array.isArray(a.中心線) || a.中心線.length < 2) return null;
+              // 【透明度は1枚の組にかける・2026-11-27】面ごとに半透明にすると、帯と交差点の角が重なる所だけ濃くなる。
+              //   組（g）に一度だけかければ重なっても1枚の面に見える（3次元図の canvas と同じ考え方）。
+              //   旗 window.__GROUND_AREA_GROUP_OPACITY = false で従来（面ごとに 0.55）。
+              const _組で = !(typeof window !== 'undefined' && window.__GROUND_AREA_GROUP_OPACITY === false);
+              const _面 = groundAreas.map(a => {
+                if (!a) return null;
                 const _px = (_mpp || 0.1);
-                const 輪 = gsiBandRing(a.中心線, (a.幅m || 2) / _px,
+                // 【形（輪）で持つ面＝交差点の角・2026-11-27】
+                const 輪 = (Array.isArray(a.輪) && a.輪.length >= 3) ? a.輪
+                  : (!Array.isArray(a.中心線) || a.中心線.length < 2) ? null : gsiBandRing(a.中心線, (a.幅m || 2) / _px,
                   Array.isArray(a.幅左m) ? a.幅左m.map(v => v / _px) : null,
                   Array.isArray(a.幅右m) ? a.幅右m.map(v => v / _px) : null);
                 if (!輪 || 輪.length < 3) return null;
                 return (<polygon key={`ga${a.id}`} data-ground-area="1"
                   points={輪.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join(' ')}
-                  fill={a.color || '#9CA3AF'} fillOpacity={0.55} stroke="none"
+                  fill={a.color || '#9CA3AF'} fillOpacity={_組で ? 1 : 0.55} stroke="none"
                   style={{ pointerEvents: 'none' }} />);
               });
+              return _組で ? (<g data-ground-areas="1" opacity={0.55} style={{ pointerEvents: 'none' }}>{_面}</g>) : _面;
             })()}
             {(() => {
               // 建屋ごとにグループ化して一体表示
