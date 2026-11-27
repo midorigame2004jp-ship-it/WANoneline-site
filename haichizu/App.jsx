@@ -1670,6 +1670,8 @@ window.App = function App() {
     }
     let 重複 = 0, 重なり = 0, 交差 = 0;
     const 新 = [];
+    // 地面の高さに乗せた建物（下で「乗せますか？」と聞き、いいえなら基準面 0 に戻す）
+    const 乗せた棟 = [];
     // 【塗る面（道路など）を分ける・2026-11-24】立体にせず「地面に塗る面」として持つ。
     //   振り分けは **it.塗る**（gsiTiles.js の GSI_IMPORT_LAYERS が渡す）。
     //   ここに `if (種別 === "道路")` を書かない＝レイヤを増やしてもここは変えない（SPEC §1）。
@@ -1727,7 +1729,7 @@ window.App = function App() {
       // 【地面の高さに乗せる（GL補正）・2026-11-26 ユーザー報告「すべて地下に建物があるかのよう」】
       //   地面を作っていればその高さに置く。作っていなければ従来どおり 0（fail-closed）。
       //   ★見るのは **terrainDraw**（海抜基準・地面の上下を反映した、面と道路の塗りが見るのと同じ物）。
-      //   ★強調倍率も**表示と同じ** terrainExag。1固定にすると強調したとき地面だけ伸びてまた埋まる。
+      //   ★強調倍率は**掛けない**（_gsiGroundZ の中のコメント＝ユーザー裁定 2026-11-26 を見よ）。
       //   ★サンプルは**頂点の最小**（重心は L字・凹形で建物の外に落ちる＝監査の指摘。
       //     最小なら斜面で食い込むが浮かない。浮いて隙間が見えるより自然）。
       //   ★mToPx に 1 を渡す＝**メートル**で返る（建屋の z はメートル。換算を増やさない）。
@@ -1745,6 +1747,7 @@ window.App = function App() {
                 ...(it.srcAdd || {}) },
       };
       if (shape) blk.shape = shape;
+      if (_GL.乗せた && Math.abs(高底) > 1e-6) 乗せた棟.push({ blk, 高 });
       // 【円と判定できなかった印・2026-11-23 ユーザー指示「どれかわかるように赤い図形にしろ」】
       //   地図でタンク（円）として描かれているのに shapeFromOutline が円と見なせなかったもの。
       //   形が崩れているか、タイルの境目で切れている。赤くして目で探せるようにする。
@@ -1757,11 +1760,34 @@ window.App = function App() {
       新.push({ id: "bld" + c, label: "取込" + c, color: 色, blocks: [blk] });
     }
     if (!新.length && !新面.length) return { 足した: 0, 重複, 重なり, 交差, 塗り: 0 };
+    // 【地面があれば、乗せるか聞く・2026-11-27 ユーザー報告
+    //   「地面を作った後、建物を作るにしたときに地面の上に置くか確認がなく地面を無視して配置される」】
+    //   逆の順（建物 → 地面）では _liftBuildingsToGround が「乗せますか？」と聞くのに、
+    //   この順（地面 → 建物）は黙って乗せていた＝**順番で振る舞いが違った**。同じく聞く。
+    //   いいえなら従来どおり基準面 0 に置き、_src.GL は null（＝後で地面を作り直したとき、もう一度聞かれる）。
+    //   聞くのは**高さが 0 から変わる建物があるときだけ**（地面が平らなら聞かない）。
+    //   旗 window.__ASK_GROUND_ON_IMPORT = false で聞かない（従来＝黙って乗せる）。
+    let 乗せた数 = 乗せた棟.length;
+    if (乗せた数 && !(typeof window !== 'undefined' && window.__ASK_GROUND_ON_IMPORT === false)
+        && typeof window !== 'undefined' && typeof window.confirm === 'function') {
+      const ok = window.confirm('地面があります。取り込む建物 ' + 乗せた数 + ' 件を地面の上に乗せますか？\n'
+        + '（いいえ＝高さ 0m の基準面に置きます。道路などの地面に塗る面は、どちらでも地面に沿います）');
+      if (!ok) {
+        for (const { blk, 高 } of 乗せた棟) {
+          blk.zBottom = 0; blk.zTop = 高;
+          blk._src = { ...blk._src, GL: null };
+        }
+        乗せた数 = 0;
+      }
+    }
+    if (乗せた棟.length) console.log('[地面] 取り込む建物 ' + 乗せた棟.length + ' 件のうち '
+      + 乗せた数 + ' 件を地面の上に乗せた');
     bldPushUndo();
     bldCounter.current = c;
     if (新.length) setBuildings(prev => [...prev, ...新]);
     if (新面.length) setGroundAreas(prev => [...prev, ...新面]);
-    return { 足した: 新.length, 重複, 重なり, 交差, 塗り: 新面.length };
+    return { 足した: 新.length, 重複, 重なり, 交差, 塗り: 新面.length,
+      地面に乗せた: 乗せた数, 地面に乗せなかった: 乗せた棟.length - 乗せた数 };
   };
   // 取り込んだ分を全部消す（付ける入口だけ作らない・SHAPE_MODEL_SPEC §3.7）
   const removeMapBuildings = () => {
@@ -6474,7 +6500,8 @@ window.App = function App() {
         shape: bl.shape ? JSON.parse(JSON.stringify(bl.shape)) : null,
         zBottom: bl.zBottom, zTop: bl.zTop, 壁厚: bl.wallThicknessM || 0,
         // 取り込み元（地面に乗せた標高・高さ）。検査が「地面に乗ったか」を見るのに使う
-        取込: bl._src ? { 由来: bl._src.由来, GL: bl._src.GL == null ? null : +Number(bl._src.GL).toFixed(3),
+        取込: bl._src ? { 由来: bl._src.由来, key: bl._src.key || null,
+                        GL: bl._src.GL == null ? null : +Number(bl._src.GL).toFixed(3),
                         高さm: bl._src.高さm == null ? null : +Number(bl._src.高さm).toFixed(3) } : null,
         // 上面の傾き（片流れ屋根・擁壁）・2026-10-03
         slope: bl.slope ? JSON.parse(JSON.stringify(bl.slope)) : null,
@@ -9674,8 +9701,18 @@ window.App = function App() {
             const d = _Pd(X, Y, Z * _mpp).depth;
             if (d < zN) zN = d; if (d > zF) zF = d; }
           const _pad = Math.max(1, (zF - zN) * 0.1);
+          // 【頂点の高さはグリッドpx・2026-11-27 ユーザー報告「地面を作った後に建物を作ると地面を無視して置かれる」】
+          //   terrainMesh の z はグリッドpx（zScale = 強調 × 1mのpx）。行列はメートルで受けるので、
+          //   canvas 2D の `_地面の投影`（`_P(x, y, z * _mpp)`）と**同じ換算**を zMul で渡す。
+          //   渡していなかったので地面だけ 1/mpp 倍（mpp=0.1 なら10倍）の高さで描かれ、
+          //   地面の高さに乗せた建物・道路の塗りが丘の中に埋まって見えた。
+          //   旗 window.__TERRAIN_GL_Z_PX = false で従来（換算しない＝10倍の高さ）＝陽性対照。
+          const _zMul = (typeof window !== 'undefined' && window.__TERRAIN_GL_Z_PX === false) ? 1 : _mpp;
           const _M = makeProjMatrix(_c5g[0], _c5g[1], _c5g[2], _c5g[3], _c5g[4],
-            { cw: b.cw, ch: b.ch, zNear: zN - _pad, zFar: zF + _pad });
+            { cw: b.cw, ch: b.ch, zNear: zN - _pad, zFar: zF + _pad, zMul: _zMul });
+          // 観測（製品は読まない）: 検査が「WebGL の地面と canvas 2D の地面が同じ所に写るか」を確かめる
+          if (typeof window !== 'undefined') window.__terrainGLProj = { M: Array.from(_M), zMul: _zMul,
+            cw: b.cw, ch: b.ch, cam: _c5g.slice(0, 5), mpp: _mpp };
           _gl描いた = terrainGLDraw(G, _M, b.cw, b.ch, b.dpr || 1);
         }
       } catch (e) { terrainGLRef.current = { gl: null, 失敗: String(e && e.message).slice(0, 120) }; }

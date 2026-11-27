@@ -62,6 +62,9 @@ function calcInitPan(az, el, zoom, blds) {
 //   project3D は呼ぶたびに Math.cos/sin を4回計算するので、同じカメラで何万点も投影するときは
 //   係数を使い回した方が速い。**式はここ1本**（project3D もこれを使う）。
 // 使い方: const P = makeProjector(az, el, zoom, panX, panY); P(wx, wy, wz)
+// 【wz の単位は**メートル**】中で `/mpp` してグリッドpx に直す（project3D と同じ）。
+//   グリッドpx の高さ（機器の wz・地形の面の z）を渡すときは、呼ぶ側で `* mpp` してから渡す
+//   （3次元図の proj・地形の _地面の投影 がそうしている）。
 function makeProjector(az, el, zoom, panX, panY) {
   const mpp = (typeof METERS_PER_PX === 'number' && METERS_PER_PX > 0) ? METERS_PER_PX : 1;
   const cosA = Math.cos(az), sinA = Math.sin(az);
@@ -80,7 +83,15 @@ function makeProjector(az, el, zoom, panX, panY) {
 // ══ 同じ投影を 4×4 行列にする（WebGL 用）・2026-11-24 ══
 // 【式を2つ作らない】makeProjector と**同じ係数**から作る。向こうを直したらここも直す。
 //   平行投影（アフィン）なので行列で厳密に表せる（検査 terrain_webgl.cjs で代表点を突き合わせる）。
-// 【入力】wx, wy はグリッド座標、wz は**グリッドpx**（makeProjector と同じ約束）。
+// 【入力】wx, wy はグリッド座標、wz は**メートル**（makeProjector と同じ約束）。
+//   opts.zMul を渡すと、wz にその倍率を掛けてから投影する（＝ M * vec4(wx, wy, wz, 1) の wz が
+//   wz*zMul として扱われる）。**グリッドpx の高さをそのまま頂点に入れるときは zMul = mpp**
+//   （canvas 2D の地面が `_P(x, y, z * _mpp)` と直しているのと同じ換算）。
+//   【2026-11-27 ユーザー報告「地面を作った後に建物を取り込むと、地面を無視して置かれる」】
+//   以前はコメントが「wz はグリッドpx」と誤っていて、地面の WebGL が px の高さをそのまま渡していた。
+//   行列が `/mpp` するので**地面だけ 1/mpp 倍（mpp=0.1 なら10倍）の高さ**で描かれ、
+//   地面の高さに乗せた建物が丘の中に埋まって見えた。3次元範囲で mpp が変わるので
+//   「取込範囲によって地面の高さが違う」（2026-11-24・11-26 のご報告）も同じ原因。
 // 【出力】列優先の16要素。gl_Position = M * vec4(wx, wy, wz, 1) が **そのまま NDC**。
 // 【画面への写り方】CAB 座標（CAB_W×CAB_H）を letterbox（sc・ox・oy）で canvas へ、
 //   さらに NDC（中心原点・y上向き・-1..1）へ直す。ここを落とすと図が伸びる／上下が逆になる。
@@ -99,6 +110,8 @@ function makeProjMatrix(az, el, zoom, panX, panY, opts) {
   const ox = (cw - CAB_W * sc) / 2, oy = (ch - CAB_H * sc) / 2;
   const zN = Number.isFinite(o.zNear) ? o.zNear : -10000;
   const zF = Number.isFinite(o.zFar) ? o.zFar : 10000;
+  // 入力の高さに掛ける倍率（既定 1＝wz はメートル）。上の【入力】を見よ
+  const zMul = (Number.isFinite(o.zMul) && o.zMul > 0) ? o.zMul : 1;
   // ── CAB 座標（makeProjector と同じ）──
   //   rx =  (wx-hw)*cosA + (wy-hh)*sinA          ← cy = -(wy-hh) なので符号に注意
   //   ry =  (wx-hw)*sinA - (wy-hh)*cosA
@@ -108,9 +121,9 @@ function makeProjMatrix(az, el, zoom, panX, panY, opts) {
   const Xx = zoom * cosA, Xy = zoom * sinA, Xz = 0;
   const X0 = px - zoom * (hw * cosA + hh * sinA);
   // Y = -zoom*sinE*ry - zoom*cosE*(wz/mpp) + py。ry の定数項は -(hw*sinA - hh*cosA)
-  const Yx = -zoom * sinE * sinA, Yy = zoom * sinE * cosA, Yz = -zoom * cosE / mpp;
+  const Yx = -zoom * sinE * sinA, Yy = zoom * sinE * cosA, Yz = -zoom * cosE * zMul / mpp;
   const Y0b = py + zoom * sinE * (hw * sinA - hh * cosA);
-  const Dx = cosE * sinA, Dy = -cosE * cosA, Dz = -sinE / mpp;
+  const Dx = cosE * sinA, Dy = -cosE * cosA, Dz = -sinE * zMul / mpp;
   const D0 = -cosE * (hw * sinA - hh * cosA);
   // ── 画面（canvas 画素）へ ──  sx = X*sc + ox,  sy = Y*sc + oy
   // ── NDC へ ──  ndcX = sx/cw*2 - 1,  ndcY = 1 - sy/ch*2

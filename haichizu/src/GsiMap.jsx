@@ -139,6 +139,9 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       行.push('取り込み ' + ((res ? res.足した : items.length) + (res && res.塗り ? res.塗り : 0)) + ' 件'
         + (明細 ? '（' + 明細 + '）' : ''));
       if (res && res.塗り) 行.push('そのうち ' + res.塗り + ' 件は**地面に塗る面**です（厚みを持たせず、地面の起伏に沿って色を置きます）');
+      // 【地面に乗せたかを言う・2026-11-27】地面がある状態で取り込むと「乗せますか？」と聞く（App の importMapBuildings）
+      if (res && res.地面に乗せた) 行.push(res.地面に乗せた + ' 件は地面の上に乗せました');
+      if (res && res.地面に乗せなかった) 行.push(res.地面に乗せなかった + ' 件は地面に乗せず、高さ 0m の基準面に置きました');
       if (res && res.重複) 行.push('すでにある ' + res.重複 + ' 件は足していません');
       if (res && res.重なり) 行.push('手で作った建屋と重なる ' + res.重なり + ' 件は足していません');
       if (r.穴) 行.push('中庭などの穴 ' + r.穴 + ' 件は落としました');
