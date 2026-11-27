@@ -1684,6 +1684,8 @@ window.App = function App() {
         既.add(it.key);
         新面.push({ id: 'ga' + (++c), key: it.key, 種別: it.種別,
           中心線: it.中心線, 幅m: it.幅m || 2, color: it.color || "#9CA3AF",
+          // 【左右の半幅（道路の縁の線から実測）・2026-11-27】中心線の各点ぶん。無ければ 幅m の一定幅
+          ...(Array.isArray(it.幅左m) && Array.isArray(it.幅右m) ? { 幅左m: it.幅左m, 幅右m: it.幅右m } : {}),
           _src: Object.assign({ 由来: "gsi-bvmap", key: it.key, ftCode: it.ftCode, 種別: it.種別 }, it.srcAdd || {}) });
         continue;
       }
@@ -6493,6 +6495,10 @@ window.App = function App() {
                zB: bl.zBottom, zT: bl.zTop, 取込: !!bl._src, 形: bl.shape ? bl.shape.type : null };
     }).filter(Boolean);
     // 建屋の中身（形・階・機器）を検査から読む
+    // 観測（製品は読まない）: 地面に塗る面（道路）の中心線と幅。検査が「実際の幅で描いたか」を見る・2026-11-27
+    window.__groundAreasForCheck = () => (groundAreasRef.current || []).map(a => ({
+      id: a.id, 種別: a.種別, 中心線: a.中心線, 幅m: a.幅m,
+      幅左m: a.幅左m || null, 幅右m: a.幅右m || null, 出所: a._src && a._src.幅の出所 }));
     window.__buildingsForCheck = () => (buildingsRef.current || []).map(b => ({
       id: b.id, label: b.label,
       棟: (b.blocks || []).map(bl => ({
@@ -9786,9 +9792,23 @@ window.App = function App() {
       const _mpp = _bldZMpp();
       for (const a of groundAreas) {
         if (!a || !Array.isArray(a.中心線) || a.中心線.length < 2) continue;
-        const 刻 = (typeof terrainResample === 'function')
-          ? terrainResample(a.中心線, terrainDraw, TW, TH, _div) : a.中心線;
-        const 輪 = gsiBandRing(刻, (a.幅m || 2) / (_mpp || 0.1));
+        // 【左右の幅を点ごとに・2026-11-27】幅は道路の縁の線から実測した左右の半幅（無ければ 幅m の一定幅）。
+        //   先に帯（輪）を作ってから、**輪の辺**を地面の格子の間隔で刻む（中心線を刻んでから帯にすると、
+        //   刻んで増えた点に左右の幅が無い）。旗 __ROAD_BAND_THEN_RESAMPLE=false で従来（中心線を刻んでから帯）。
+        const _px = (_mpp || 0.1);
+        const _左 = Array.isArray(a.幅左m) ? a.幅左m.map(v => v / _px) : null;
+        const _右 = Array.isArray(a.幅右m) ? a.幅右m.map(v => v / _px) : null;
+        const _後で刻む = !(typeof window !== 'undefined' && window.__ROAD_BAND_THEN_RESAMPLE === false);
+        let 輪;
+        if (_後で刻む) {
+          const _帯 = gsiBandRing(a.中心線, (a.幅m || 2) / _px, _左, _右);
+          輪 = (_帯 && typeof terrainResample === 'function')
+            ? terrainResample(_帯.concat([_帯[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : _帯;
+        } else {
+          const 刻 = (typeof terrainResample === 'function')
+            ? terrainResample(a.中心線, terrainDraw, TW, TH, _div) : a.中心線;
+          輪 = gsiBandRing(刻, (a.幅m || 2) / _px);
+        }
         if (!輪 || 輪.length < 3) continue;
         ctx.beginPath();
         for (let i = 0; i < 輪.length; i++) {
@@ -17204,7 +17224,10 @@ window.App = function App() {
               const _mpp = _bldZMpp();
               return groundAreas.map(a => {
                 if (!a || !Array.isArray(a.中心線) || a.中心線.length < 2) return null;
-                const 輪 = gsiBandRing(a.中心線, (a.幅m || 2) / (_mpp || 0.1));
+                const _px = (_mpp || 0.1);
+                const 輪 = gsiBandRing(a.中心線, (a.幅m || 2) / _px,
+                  Array.isArray(a.幅左m) ? a.幅左m.map(v => v / _px) : null,
+                  Array.isArray(a.幅右m) ? a.幅右m.map(v => v / _px) : null);
                 if (!輪 || 輪.length < 3) return null;
                 return (<polygon key={`ga${a.id}`} data-ground-area="1"
                   points={輪.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join(' ')}

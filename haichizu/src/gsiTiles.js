@@ -376,6 +376,9 @@ const GSI_STRUCTURE_FT = { 4302: 'タンク' };
 //   0=3m未満 1=3m以上5.5m未満 2=5.5m以上13m未満 3=13m以上19.5m未満 4=19.5m以上 5=その他 6=不明
 //   代表幅は**範囲の中央**を採る。区分なので最大±3.5mずれる（_src.幅未確定 で印を立てる）。
 const GSI_ROAD_WIDTH = { 0: 2.5, 1: 4.2, 2: 9.2, 3: 16.2, 4: 22, 5: 4, 6: 4 };
+// 幅員区分の上限（m）。縁の線から幅を測るとき「これより遠い当たりは隣の道路の縁」とみなす目安（2026-11-27）。
+//   4（19.5m以上）・5（その他）・6（不明）は上限が無いので広めに取る。区分が無い道路（徒歩道など）は「無」。
+const GSI_ROAD_WIDTH_MAX = { 0: 3, 1: 5.5, 2: 13, 3: 19.5, 4: 40, 5: 16, 6: 16, 無: 12 };
 // 【rdCtg の仕様】同じ出典。0=国道 1=都道府県道 2=市区町村道 3=高速自動車国道等 5=その他 6=不明
 const GSI_ROAD_CTG = { 0: '国道', 1: '都道府県道', 2: '市区町村道', 3: '高速自動車国道等', 5: 'その他', 6: '不明' };
 
@@ -473,18 +476,92 @@ function _gsiSelfCross(c) {
 // 【なぜ切らないか・2026-11-24】立体（面）は自己交差できないので gsiThickenLine は急な折れで
 //   切っていた。その切れ目がユーザー報告の「帯が切れる」「海苔で弁当作ったみたい」。
 //   **塗りなら自己交差は無害**（非ゼロ則で塗られる）ので、切る必要がそもそも無い。
-function gsiBandRing(pts, 幅) {
+// 【左右の幅を点ごとに受ける・2026-11-27 ユーザー指摘「本来の道路幅にならないのでは」】
+//   左列・右列（中心線の各点の、進行方向に向かって左・右の半幅。pts と同じ単位）を渡すと、その幅で帯を作る。
+//   道路の縁の線から実測した幅を使う（gsiMeasureRoadHalfWidths）。無ければ 幅/2 の一定幅（従来）。
+function gsiBandRing(pts, 幅, 左列, 右列) {
   if (!pts || pts.length < 2 || !(幅 > 0)) return null;
-  const p = [pts[0]];
+  const _有 = (a) => Array.isArray(a) && a.length === pts.length;
+  const 左あり = _有(左列), 右あり = _有(右列);
+  const p = [pts[0]], hl = [左あり && 左列[0] > 0 ? 左列[0] : 幅 / 2], hr = [右あり && 右列[0] > 0 ? 右列[0] : 幅 / 2];
   for (let i = 1; i < pts.length; i++) {
     const q = pts[i], r = p[p.length - 1];
-    if (Math.hypot(q.x - r.x, q.y - r.y) > 1e-6) p.push(q);
+    if (Math.hypot(q.x - r.x, q.y - r.y) > 1e-6) {
+      p.push(q);
+      hl.push(左あり && 左列[i] > 0 ? 左列[i] : 幅 / 2);
+      hr.push(右あり && 右列[i] > 0 ? 右列[i] : 幅 / 2);
+    }
   }
   if (p.length < 2) return null;
-  return _gsiBand(p, 幅 / 2);
+  return _gsiBand(p, 幅 / 2, hl, hr);
 }
-// 1本の（折れの緩い）折れ線を帯にする
-function _gsiBand(p, h) {
+// ══ 道路の実際の幅を、道路の縁の線から測る・2026-11-27 ══
+// 【なぜ】中心線の幅員区分（rnkWidth）は「3m以上5.5m未満」のような**区分**しか無く、実幅員は配信されていない。
+//   一方、道路縁（ftCode 22xx・道路の両側の線）は**実際の道路の輪郭**なので、中心線から縁までの距離が本来の幅になる。
+// 【測り方】中心線の途中を 刻み おきに、進行方向に垂直な線を左右へ伸ばし、最初に当たった縁の線までの距離を取る。
+//   ・両端の近く（端から 端の余白 以内）は測らない＝交差点では横道の縁まで伸びて誤るため
+//   ・最小 より近い当たりは無視（縁が中心線に接している所）・上限 より遠い当たりも無視（隣の道路の縁）
+//   ・左右それぞれ**中央値**をその線の半幅にする（交差点・切れ目の外れ値に強い）
+//   ・片側だけ測れたら反対側も同じ幅にする。両側とも測れなければ null（呼ぶ側が幅員区分の幅に落とす）
+// 【単位】pts・縁・刻み・上限 はすべて同じ単位（タイル内座標）。戻りも同じ単位。
+// 戻り: { 左: 半幅 | null, 右: 半幅 | null, 標本: 測った点の数, 当たり左, 当たり右 }
+function gsiMeasureRoadHalfWidths(pts, 縁, opt) {
+  const o = opt || {};
+  const 刻み = o.刻み > 0 ? o.刻み : 1, 上限 = o.上限 > 0 ? o.上限 : Infinity, 最小 = o.最小 > 0 ? o.最小 : 0;
+  const 端の余白 = o.端の余白 > 0 ? o.端の余白 : 0;
+  const 出 = { 左: null, 右: null, 標本: 0, 当たり左: 0, 当たり右: 0 };
+  if (!pts || pts.length < 2 || !縁 || !縁.length) return 出;
+  // 区間の長さの累積
+  const 累 = [0];
+  for (let i = 1; i < pts.length; i++) 累.push(累[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  const 全 = 累[累.length - 1];
+  if (!(全 > 0)) return 出;
+  // 測る位置（端の余白を除く。短すぎる線は真ん中1点）
+  const 位置 = [];
+  const 余白 = Math.min(端の余白, 全 * 0.25);
+  for (let s = 余白; s <= 全 - 余白 + 1e-9; s += 刻み) 位置.push(s);
+  if (!位置.length) 位置.push(全 / 2);
+  // 1本の半直線と縁の線分の交点までの距離（無ければ Infinity）
+  const 当てる = (px, py, dx, dy) => {
+    let best = Infinity;
+    for (const g of 縁) {
+      for (let k = 1; k < g.length; k++) {
+        const ax = g[k - 1].x, ay = g[k - 1].y, bx = g[k].x, by = g[k].y;
+        const ex = bx - ax, ey = by - ay;
+        const den = dx * ey - dy * ex;
+        if (Math.abs(den) < 1e-12) continue;            // 平行
+        const t = ((ax - px) * ey - (ay - py) * ex) / den;   // 半直線上の距離
+        const u = ((ax - px) * dy - (ay - py) * dx) / den;   // 線分上の位置
+        if (u < 0 || u > 1 || t < 最小 || t > 上限) continue;
+        if (t < best) best = t;
+      }
+    }
+    return best;
+  };
+  const 左ら = [], 右ら = [];
+  let j = 1;
+  for (const s of 位置) {
+    while (j < 累.length - 1 && 累[j] < s) j++;
+    const a = pts[j - 1], b = pts[j];
+    const L = (累[j] - 累[j - 1]) || 1, f = (s - 累[j - 1]) / L;
+    const px = a.x + (b.x - a.x) * f, py = a.y + (b.y - a.y) * f;
+    const tx = (b.x - a.x) / L, ty = (b.y - a.y) / L;
+    // 左＝進行方向に向かって左（_gsiBand の「左」と同じ向き: (-ty, tx)）
+    const dl = 当てる(px, py, -ty, tx), dr = 当てる(px, py, ty, -tx);
+    if (Number.isFinite(dl)) 左ら.push(dl);
+    if (Number.isFinite(dr)) 右ら.push(dr);
+    出.標本++;
+  }
+  const 中央 = (a) => { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+  出.当たり左 = 左ら.length; 出.当たり右 = 右ら.length;
+  let 左 = 中央(左ら), 右 = 中央(右ら);
+  if (左 == null && 右 != null) 左 = 右;
+  if (右 == null && 左 != null) 右 = 左;
+  出.左 = 左; 出.右 = 右;
+  return 出;
+}
+// 1本の（折れの緩い）折れ線を帯にする。hl・hr は点ごとの左右の半幅（無ければ h の一定幅）
+function _gsiBand(p, h, hl, hr) {
   const 左 = [], 右 = [];
   for (let i = 0; i < p.length; i++) {
     let dx = 0, dy = 0;
@@ -499,8 +576,9 @@ function _gsiBand(p, h) {
       const cos半 = Math.abs((ax / La) * dx + (ay / La) * dy);
       倍 = (cos半 > 0.5) ? 1 / cos半 : 2;
     }
-    左.push({ x: p[i].x - dy * h * 倍, y: p[i].y + dx * h * 倍 });
-    右.push({ x: p[i].x + dy * h * 倍, y: p[i].y - dx * h * 倍 });
+    const _hl = (hl && hl[i] > 0) ? hl[i] : h, _hr = (hr && hr[i] > 0) ? hr[i] : h;
+    左.push({ x: p[i].x - dy * _hl * 倍, y: p[i].y + dx * _hl * 倍 });
+    右.push({ x: p[i].x + dy * _hr * 倍, y: p[i].y - dx * _hr * 倍 });
   }
   const 輪 = 左.concat(右.reverse());
   return 輪.length >= 3 ? 輪 : null;
@@ -570,7 +648,12 @@ const GSI_IMPORT_LAYERS = {
   //   ftCode で絞らずに全部を帯にしていたので、1本の道路が「中心線の帯＋左右の縁の帯」の**3本**になっていた。
   //   中心線（徒歩道 2721〜・庭園路 2711〜・石段 2731〜 も中心線）だけを取る。範囲は ft範囲 1か所。
   //   旗 globalThis.__GSI_ROAD_CENTERLINE_ONLY = false で従来（縁の線も帯にする）＝陽性対照。
+  // 【幅は縁の線から実測・2026-11-27 ユーザー指摘「それだと本来の道路幅にならないのでは」】
+  //   取り込まない縁の線（22xx）は**幅を測る物差し**として使う（gsiMeasureRoadHalfWidths）。
+  //   24xx（トンネル内・分離帯）は使わない（分離帯は道路の内側にあるので、そこで止まると幅が半分になる）。
+  //   上限は幅員区分の上限の半分＋余裕（隣の道路の縁を拾わないため）。旗 __GSI_ROAD_WIDTH_FROM_EDGE=false で従来（区分の幅）。
   road:       { ft: null, ft範囲: [2700, 2799], ft範囲の旗: '__GSI_ROAD_CENTERLINE_ONLY',
+                縁の範囲: [2200, 2299], 縁の旗: '__GSI_ROAD_WIDTH_FROM_EDGE', 区分の上限m: GSI_ROAD_WIDTH_MAX,
                 型: 2, 名: '道路', 区分: GSI_ROAD_CTG, 幅の表: GSI_ROAD_WIDTH,
                 既定幅m: 2, 高さm: 0.12, 色: '#9CA3AF', 上限: 300,
                 // 段階フラグ（globalThis.__GSI_ROAD = false で道路を取らない＝陽性対照）
@@ -917,17 +1000,29 @@ function gsiJoinLines(items) {
       if (i === j) continue;                        // 自分で閉じている輪
       const A = 生[i], B = 生[j];
       if (!A || !B) continue;
-      if (A.幅m !== B.幅m) continue;                // 幅が違う＝別の道路
+      // 幅員区分が違う＝別の道路（2026-11-27: 幅m は縁の線からの実測でタイルごとに少し違うので、区分の幅で比べる）
+      if ((A.区分幅m != null ? A.区分幅m : A.幅m) !== (B.区分幅m != null ? B.区分幅m : B.幅m)) continue;
       const a0 = 鍵(A.中心線[0]), a1 = 鍵(A.中心線[A.中心線.length - 1]);
       const b0 = 鍵(B.中心線[0]), b1 = 鍵(B.中心線[B.中心線.length - 1]);
       // A の終わりに B の始まりが来るよう向きをそろえる
       let 甲 = A.中心線.slice(), 乙 = B.中心線.slice();
-      if (a0 === k) 甲.reverse();                   // A の「始まり」が継ぎ目なら反転
+      // 【左右の幅も一緒につなぐ・2026-11-27】線を反転したら左右も入れ替わる（進行方向に向かって左・右なので）
+      const _幅列 = (X) => {
+        const n = X.中心線.length;
+        const 左 = (Array.isArray(X.幅左m) && X.幅左m.length === n) ? X.幅左m.slice() : X.中心線.map(() => X.幅m / 2);
+        const 右 = (Array.isArray(X.幅右m) && X.幅右m.length === n) ? X.幅右m.slice() : X.中心線.map(() => X.幅m / 2);
+        return { 左, 右 };
+      };
+      const _幅あり = Array.isArray(A.幅左m) || Array.isArray(B.幅左m);
+      let 甲幅 = _幅列(A), 乙幅 = _幅列(B);
+      const _反 = (w) => ({ 左: w.右.slice().reverse(), 右: w.左.slice().reverse() });
+      if (a0 === k) { 甲.reverse(); 甲幅 = _反(甲幅); }   // A の「始まり」が継ぎ目なら反転
       else if (a1 !== k) continue;
-      if (b1 === k) 乙.reverse();                   // B の「終わり」が継ぎ目なら反転
+      if (b1 === k) { 乙.reverse(); 乙幅 = _反(乙幅); }   // B の「終わり」が継ぎ目なら反転
       else if (b0 !== k) continue;
-      乙.shift();                                   // 継ぎ目の点は1つでよい
-      生[i] = Object.assign({}, A, { 中心線: 甲.concat(乙) });
+      乙.shift(); 乙幅.左.shift(); 乙幅.右.shift();   // 継ぎ目の点は1つでよい
+      生[i] = Object.assign({}, A, { 中心線: 甲.concat(乙) },
+        _幅あり ? { 幅左m: 甲幅.左.concat(乙幅.左), 幅右m: 甲幅.右.concat(乙幅.右) } : {});
       生[j] = null;
       つないだ++; 変 = true;
       break;                                        // 端の表が古くなるので作り直す
@@ -976,6 +1071,18 @@ async function gsiLoadBuildings(bounds, opts) {
         if (表.旗 && typeof globalThis !== 'undefined' && globalThis[表.旗] === false) continue;
         const ext = L.extent || 4096;
         const 単位m = タイル幅m / ext;
+        // 【幅を測る物差し＝道路の縁の線・2026-11-27】表に 縁の範囲 があれば、その ftCode の線を先に集める
+        //   （帯にはしない。gsiMeasureRoadHalfWidths が中心線から縁までの距離を測るのに使う）。
+        //   余白（タイルの外）にある縁も入れる＝タイルの縁の近くの中心線も両側を測れる。
+        const 縁線 = [];
+        if (表.縁の範囲 && !(表.縁の旗 && typeof globalThis !== 'undefined' && globalThis[表.縁の旗] === false)) {
+          for (const g of L.feats) {
+            if (g.gtype !== 2) continue;
+            const _c = Number(g.props && g.props.ftCode);
+            if (!(_c >= 表.縁の範囲[0] && _c <= 表.縁の範囲[1])) continue;
+            for (const 線 of gsiMvtRings(g.geom)) if (線.length >= 2) 縁線.push(線);
+          }
+        }
         for (const f of L.feats) {
           // 【型の門はレイヤの表で決める】面（3）だけでなく線（2）も受ける
           if (f.gtype !== 表.型) continue;
@@ -1005,6 +1112,16 @@ async function gsiLoadBuildings(bounds, opts) {
                 // 間引きは幅の 0.6 倍（描く側が地面の格子で刻み直すので、ここは粗くてよい）
                 const 細 = gsiThinLine(片, 単位m, Math.max(GSI_MIN_EDGE_M, _幅m * 0.6));
                 if (細.length < 2) continue;
+                // 【実際の幅を縁の線から測る・2026-11-27】測れなければ幅員区分の幅（従来）。
+                //   上限＝区分の上限の半分＋1.5m（隣の道路の縁を拾わない）。端の余白＝上限（交差点で横道の縁まで伸びない）。
+                let _実 = null;
+                if (縁線.length) {
+                  const _上m = ((表.区分の上限m && 表.区分の上限m[_rw] != null) ? 表.区分の上限m[_rw]
+                    : (表.区分の上限m && 表.区分の上限m.無) || 12) / 2 + 1.5;
+                  const _m = gsiMeasureRoadHalfWidths(細, 縁線, {
+                    刻み: 2 / 単位m, 上限: _上m / 単位m, 最小: 0.3 / 単位m, 端の余白: _上m / 単位m });
+                  if (_m.左 != null && _m.右 != null) _実 = { 左m: _m.左 * 単位m, 右m: _m.右 * 単位m, 標本: _m.標本 };
+                }
                 const 芯 = 細.map(pt => ({
                   lat: gsiTileYToLat(ty + pt.y / ext, z),
                   lng: gsiTileXToLng(tx + pt.x / ext, z),
@@ -1018,9 +1135,15 @@ async function gsiLoadBuildings(bounds, opts) {
                 if ((層数[L.name] || 0) >= (表.上限 || GSI_IMPORT_MAX)) { 上限超過 = true; break; }
                 層数[L.name] = (層数[L.name] || 0) + 1;
                 // ★**輪（ring）を作らない**。中心線と幅だけ。帯は描く側が地面に乗せて作る
+                //   幅m＝帯の幅（実測なら左＋右）。区分幅m＝幅員区分の幅（線をつなぐときの「同じ道路か」に使う）。
+                //   幅左m・幅右m＝中心線の各点の左右の半幅（実測できたときだけ。描く側の gsiBandRing が受ける）。
+                const _帯幅m = _実 ? (_実.左m + _実.右m) : _幅m;
                 items.push({ layer: L.name, ftCode: f.props.ftCode, 種別, key, 塗る: !!表.塗る,
-                  中心線: 芯, 幅m: _幅m, color: 表.色,
-                  srcAdd: { rnkWidth: _rw, rdCtg: f.props.rdCtg, 幅m: _幅m, 幅未確定: _幅未確定 } });
+                  中心線: 芯, 幅m: _帯幅m, 区分幅m: _幅m, color: 表.色,
+                  ...(_実 ? { 幅左m: 芯.map(() => _実.左m), 幅右m: 芯.map(() => _実.右m) } : {}),
+                  srcAdd: { rnkWidth: _rw, rdCtg: f.props.rdCtg, 幅m: _帯幅m, 区分幅m: _幅m,
+                    幅の出所: _実 ? '道路の縁の線から実測' : '幅員区分',
+                    幅未確定: _実 ? false : _幅未確定 } });
               }
               if (上限超過) break;
             }

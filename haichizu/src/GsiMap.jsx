@@ -156,8 +156,11 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (_仮の高さ) 行.push('そのうち ' + _仮の高さ + ' 件は高さが分からないので仮の '
         + (typeof NEW_BLD_H_M !== 'undefined' ? NEW_BLD_H_M : 10) + 'm です。建物エディタで直してください');
       // 道路は幅員**区分**からの推定（実幅員は配信されていない）。ずれる幅を数で言う
-      const _幅推定 = items.filter(it => it.srcAdd && it.srcAdd.幅m).length;
-      if (_幅推定) 行.push('道路 ' + _幅推定 + ' 件の幅は幅員区分からの推定です（区分の幅は最大 13m 幅なので±数mずれます）');
+      // 【幅の出所を分けて言う・2026-11-27】道路の縁の線から実際の幅を測れた道路と、測れず幅員区分の幅を使った道路
+      const _実測 = items.filter(it => it.srcAdd && it.srcAdd.幅の出所 === '道路の縁の線から実測').length;
+      const _幅推定 = items.filter(it => it.srcAdd && it.srcAdd.幅m && it.srcAdd.幅の出所 !== '道路の縁の線から実測').length;
+      if (_実測) 行.push('道路 ' + _実測 + ' 件は道路の縁の線から実際の幅を測りました');
+      if (_幅推定) 行.push('道路 ' + _幅推定 + ' 件は縁の線が無いので幅員区分からの推定です（区分の幅は最大 13m 幅なので±数mずれます）');
       行.push('出典: 国土地理院ベクトルタイル提供実験');
       setMsg(行.join('／'));
     } catch (e) { setMsg('取り込みに失敗: ' + (e && e.message)); }
