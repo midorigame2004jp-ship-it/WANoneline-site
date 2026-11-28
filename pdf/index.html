@@ -5927,11 +5927,16 @@ window.PakuribatText ??= (()=>{
     const a={type:cloud?'cloud':({Ink:'ink',Polygon:'polygon',PolyLine:'polyline'})[item.subtype],...(cloud?{cloudIntensity:intensity}:{}),points,rect:{x,y,width:Math.max(.001,right-x),height:Math.max(.001,bottom-y)},style,preservedProperties:nativeAnnotationProperties(values)};if(strokes)a.strokes=strokes;return a;
   }
 
-  function pdfStringValue(value){
-    if(!value)return '';let bytes=[];
+  function pdfStringBytes(value){
+    let bytes=[];
     if(value.startsWith('<')&&!value.startsWith('<<')){let hex=value.slice(1,-1).replace(/\s/g,'');if(hex.length%2)hex+='0';if(!/^[a-f0-9]*$/i.test(hex))throw Error('Invalid string');bytes=Array.from(hex.match(/../g)||[],h=>parseInt(h,16));}
     else if(value.startsWith('(')){const s=value.slice(1,-1);for(let i=0;i<s.length;i++){let c=s[i];if(c==='\\'){c=s[++i];if(c==='\r'||c==='\n'){if(c==='\r'&&s[i+1]==='\n')i++;continue;}if(/[0-7]/.test(c||'')){let oct=c;for(let n=0;n<2&&/[0-7]/.test(s[i+1]||'');n++)oct+=s[++i];bytes.push(parseInt(oct,8)&255);continue;}c=({n:'\n',r:'\r',t:'\t',b:'\b',f:'\f'})[c]??c;}bytes.push(c.charCodeAt(0)&255);}}
     else throw Error('Indirect text unsupported');
+    return bytes;
+  }
+  function pdfStringValue(value){
+    if(!value)return '';
+    const bytes=pdfStringBytes(value);
     if(bytes[0]===254&&bytes[1]===255)return new TextDecoder('utf-16be').decode(Uint8Array.from(bytes.slice(2)));
     if(bytes[0]===239&&bytes[1]===187&&bytes[2]===191)return new TextDecoder().decode(Uint8Array.from(bytes.slice(3)));
     // XML/CSS in literal strings is normally ASCII; refuse ambiguous PDFDocEncoding.
@@ -6415,6 +6420,123 @@ window.PakuribatText ??= (()=>{
     const page = doc.pages[number - 1];
     const contents = await ocrPageContents(doc, page);
     return (await pakuribatOcrLayers(doc, page, contents, signal)).size > 0;
+  }
+
+  async function buildVerticalTextUpdate({sourceFile, page, expectedText, text, signal}) {
+    const eastAsian = /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]+$/u;
+    if (!eastAsian.test(expectedText) || !eastAsian.test(text) ||
+        text.length !== expectedText.length || /[\uD800-\uDFFF]/.test(text)) {
+      fail('縦書き本文は、漢字・ひらがな・カタカナを同じ文字数で置換できます。');
+    }
+    const doc = await pageImportDocument(sourceFile, signal);
+    if (doc.catalog.has('StructTreeRoot')) fail('タグ付きPDFの本文編集にはまだ対応していません。');
+    const original = doc.pages[page - 1];
+    if (!original) fail('対象ページがありません。');
+    const resources = dictionaryValues(await doc.resolve(original.effective.Resources || '<<>>'));
+    const fonts = dictionaryValues(await doc.resolve(resources.get('Font') || '<<>>'));
+    const supportedFonts = new Map();
+    for (const [name, raw] of fonts) {
+      const font = dictionaryValues(await doc.resolve(raw));
+      if (font.get('Subtype') !== '/Type0') continue;
+      const encoding = font.get('Encoding');
+      if (/^\/UniJIS(?:2004)?-UCS2-V$/.test(encoding) && !font.has('ToUnicode')) {
+        supportedFonts.set('/' + name, null);
+        continue;
+      }
+      const ref = parsedReference(font.get('ToUnicode'));
+      if (encoding !== '/Identity-V' || !ref) continue;
+      const cmap = pdfBinaryString(await decodePdfStream(sourceFile, await doc.read(ref), doc.structure.entries));
+      const unicode = new Map();
+      const codes = new Map();
+      const record = (code, text) => {
+        unicode.set(code, text);
+        codes.set(text, codes.has(text) ? null : code);
+      };
+      for (const [, block] of cmap.matchAll(/\bbeginbfchar\b([\s\S]*?)\bendbfchar\b/g)) {
+        for (const [, code, value] of block.matchAll(/<([\da-f]{4})>\s*<([\da-f]{4})>/gi)) {
+          record(parseInt(code, 16), String.fromCharCode(parseInt(value, 16)));
+        }
+      }
+      for (const [, block] of cmap.matchAll(/\bbeginbfrange\b([\s\S]*?)\bendbfrange\b/g)) {
+        for (const [, first, last, initial, array] of block.matchAll(/<([\da-f]{4})>\s*<([\da-f]{4})>\s*(?:<([\da-f]{4})>|\[([^\]]*)\])/gi)) {
+          const start = parseInt(first, 16), end = parseInt(last, 16);
+          const values = array?.match(/<([\da-f]{4})>/gi);
+          if (array && values?.length !== end - start + 1) continue;
+          for (let code = start; code <= end; code++) {
+            const point = initial ? parseInt(initial, 16) + code - start : parseInt(values[code - start].slice(1, -1), 16);
+            if (point <= 0xffff) record(code, String.fromCharCode(point));
+          }
+        }
+      }
+      if (unicode.size) supportedFonts.set('/' + name, {unicode, codes});
+    }
+    const contents = await ocrPageContents(doc, original);
+    const matches = [];
+    const decoder = new TextDecoder('utf-16be', {fatal: true, ignoreBOM: true});
+    let font = null, renderMode = 0, inText = false;
+    const textStateStack = [];
+    for (let index = 0; supportedFonts.size && index < contents.length; index++) {
+      signal.throwIfAborted();
+      const ref = parsedReference(contents[index]);
+      if (!ref) fail('縦書きの描画内容を確認できません。');
+      const stream = pdfBinaryString(await decodePdfStream(sourceFile, await doc.read(ref), doc.structure.entries));
+      let pos = 0;
+      let operands = [];
+      while ((pos = skipPdfSpace(stream, pos)) < stream.length) {
+        const end = pdfValueEnd(stream, pos);
+        const token = stream.slice(pos, end);
+        if (/^[A-Za-z*'"]+$/.test(token)) {
+          if (token === 'BI') fail('インライン画像を含むページの縦書き編集には対応していません。');
+          if (token === 'q') textStateStack.push({font, renderMode});
+          if (token === 'Q') ({font, renderMode} = textStateStack.pop() || {font: null, renderMode: 0});
+          if (token === 'BT') inText = true;
+          if (token === 'ET') inText = false;
+          if (token === 'Tf') font = operands.at(-2)?.value;
+          if (token === 'Tr') renderMode = Number(operands.at(-1)?.value);
+          if (token === 'Tj' && inText && renderMode === 0 && supportedFonts.has(font) && operands.length === 1) {
+            const operand = operands[0];
+            const bytes = pdfStringBytes(operand.value);
+            const map = supportedFonts.get(font);
+            if (bytes.length === expectedText.length * 2) {
+              const decoded = map
+                ? expectedText.split('').map((_, i) => map.unicode.get(bytes[2 * i] * 256 + bytes[2 * i + 1])).join('')
+                : decoder.decode(Uint8Array.from(bytes));
+              if (decoded === expectedText) matches.push({index, stream, operand, map});
+            }
+          }
+          operands = [];
+        } else {
+          operands.push({value: token, start: pos, end});
+        }
+        pos = end;
+      }
+    }
+    if (matches.length !== 1) fail('この縦書き文字列を一意に特定できません。対応する縦書きフォントの単独の文字列を選んでください。');
+    const {index, stream, operand, map} = matches[0];
+    const codes = Array.from(text, ch => map ? map.codes.get(ch) : ch.charCodeAt(0));
+    if (!codes.every(Number.isInteger)) fail('元の縦書きフォントに置換先の字形がありません。');
+    const hex = codes.map(code => code.toString(16).padStart(4, '0')).join('');
+    const updated = stream.slice(0, operand.start) + '<' + hex + '>' + stream.slice(operand.end);
+    const streamRef = {num: doc.structure.size, gen: 0};
+    contents[index] = refText(streamRef);
+    const values = new Map(original.values);
+    values.set('Contents', '[' + contents.join(' ') + ']');
+    const dictionary = '<<\n' + [...values].map(([key, value]) => '/' + key + ' ' + value).join('\n') + '\n>>';
+    let output = '\n';
+    const xref = [];
+    for (const [ref, body] of [
+      [streamRef, '<< /Length ' + updated.length + ' >>\nstream\n' + updated + '\nendstream'],
+      [original.reference, dictionary]
+    ]) {
+      xref.push({...ref, offset: sourceFile.size + output.length});
+      output += objectText(ref.num, ref.gen, body);
+    }
+    output += buildXrefText(xref, doc.structure, sourceFile.size + output.length, streamRef.num + 1);
+    return {
+      bytes: encodePdfBytes(output), pageCount: doc.pages.length,
+      pages: doc.pages.map(({reference, rotation}) => ({reference, rotation})),
+      order: doc.pages.map((_, i) => i + 1)
+    };
   }
 
   async function buildOcrUpdate({sourceFile, recognized, signal}) {
@@ -7072,6 +7194,7 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
     buildImagePlacementUpdate,
     buildWatermarkUpdate,
     buildOcrUpdate,
+    buildVerticalTextUpdate,
     hasPakuribatOcrLayer,
     selectLayerImageRegion, buildLayerRegionUpdate, inheritLayerImageFile, imageLayers, readLayerImage, buildLayerImageUpdate,
     prepareImageEdit(sourceFile,page){return preserveBodyTextSpacing(sourceFile,null,{page,prepareOnly:true});},
@@ -11591,8 +11714,40 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
   async function ensureBodyTextWorker(signal){if(bodyTextWorker){await bodyTextWorker.ready;return;}const assets=getSmallPdfiumAssets(),font=document.getElementById('pkBodyEditFont');if(!assets||!font)throw Error('本文編集用のエンジンまたは日本語フォントがありません。');const source=assets.workerSource+'\n'+createBodyTextEngine.toString()+'\n;('+bodyTextWorkerMain.toString()+')();',url=URL.createObjectURL(new Blob([source],{type:'text/javascript'})),worker=new Worker(url);bodyTextWorker={worker,url};worker.onmessage=event=>{const {id,result,error}=event.data,job=bodyTextJobs.get(id);if(!job)return;bodyTextJobs.delete(id);if(error)job.reject(Error(error));else job.resolve(result);};worker.onerror=()=>stopBodyTextWorker('本文編集エンジンを起動できません。');bodyTextWorker.ready=bodyTextRequest({type:'init',wasmBinary:assets.binary,fontBytes:null,serifBytes:null},signal);await bodyTextWorker.ready;}
   async function bodyTextNative(file,key,options,signal){await ensureBodyTextWorker(signal);if(options.type==='edit'&&!bodyTextWorker.fonts){bodyTextWorker.fonts=bodyTextRequest({type:'fonts',fontBytes:base64ToBytes(document.getElementById('pkBodyEditFont').textContent.trim()),serifBytes:base64ToBytes(document.getElementById('pkBodyEditSerifFont')?.textContent.trim()||'')},signal);bodyTextWorker.fonts.catch(()=>{if(bodyTextWorker)bodyTextWorker.fonts=null;});}if(options.type==='edit')await bodyTextWorker.fonts;return bodyTextRequest({...options,file,key},signal);}
   function bodyTextPlanKey(options){const {previewWidth,previewHeight,preview,selectionAnchor,...edit}=options;return JSON.stringify(edit);}
+  async function verticalBodyTextItems(page) {
+    const content = await page.getTextContent({disableNormalization: true});
+    const items = [];
+    for (const [index, item] of content.items.entries()) {
+      if (!content.styles[item.fontName]?.vertical ||
+          !/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]+$/u.test(item.str)) continue;
+      const [a, b, c, d, x, y] = item.transform;
+      const size = Math.hypot(c, d);
+      if (Math.abs(b) + Math.abs(c) > .001 || a <= 0 || d <= 0 || !item.height) continue;
+      items.push({
+        index, vertical: true, text: item.str, editable: true,
+        rect: [x - size / 2, y - item.height + size / 6, x + size / 2, y + size / 6],
+        size, fontName: content.styles[item.fontName].fontFamily, color: '#000000'
+      });
+    }
+    return {content, items};
+  }
+
   async function prepareBodyTextPlan(file,doc,options,signal){
     const check=()=>{if(signal?.aborted||!isActiveDocument(doc)||doc.closed)throw new DOMException('本文編集を中止しました。','AbortError');};check();
+    if (options.vertical) {
+      const page = await getCachedPage(doc, options.page);
+      const {content, items} = await verticalBodyTextItems(page);
+      if (!items.some(item => item.index === options.index && item.text === options.expectedText)) {
+        throw Error('縦書きの本文が変わりました。文字を選び直してください。');
+      }
+      const result = await window.PDFAnnotationSave.buildVerticalTextUpdate({...options, sourceFile: file, signal});
+      check();
+      return {...result, bodyText: {page: options.page, objects: []},
+        bodyPreviewLayout: content.items.flatMap((item, index) => typeof item.str === 'string' ? [{
+          text: index === options.index ? options.text : item.str,
+          transform: [...item.transform], width: item.width, height: item.height
+        }] : [])};
+    }
     const structure=await window.PDFAnnotationSave.inspectBodyTextSource(file);check();if(structure.tagged)throw Error('タグ付きPDFの本文編集にはまだ対応していません。');
     const result=await bodyTextNative(file,doc.id,{type:'edit',options},signal);check();const generated=new File([file,result.bytes],file.name,{type:'application/pdf'}),spacing=await window.PDFAnnotationSave.preserveBodyTextSpacing(file,generated,{page:options.page,index:options.index,textObjectIndices:result.textObjectIndices,replacementCount:result.replacementCount,removedIndices:result.removedIndices,textStateMap:result.textStateMap},signal);check();
     return{...result,bytes:spacing.bytes,pageCount:structure.pageCount,pages:structure.pages,order:structure.pages.map((_,i)=>i+1),bodyText:{page:options.page,objects:result.expectedTextObjects}};
@@ -11624,6 +11779,12 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
   window.PakuribatBodyText=Object.freeze({
     context(){return pageEditorContext();},
     async list(documentId){const doc=activeDocument();if(doc?.id!==documentId||doc.closed)return null;const number=doc.currentPage,result=await bodyTextNative(doc.file,doc.id,{type:'list',page:number});if(!isActiveDocument(doc)||doc.currentPage!==number)return null;return{documentId,...result};},
+    async listVertical(documentId) {
+      const doc = activeDocument();
+      if (doc?.id !== documentId || doc.closed) return [];
+      const page = await getCachedPage(doc, doc.currentPage);
+      return (await verticalBodyTextItems(page)).items;
+    },
     async geometry(documentId){return window.PakuribatLinkEditor.geometry(documentId);},
     async preview(documentId,options){return previewBodyText(documentId,options);},
     async edit(documentId,options){const doc=activeDocument();if(doc?.id!==documentId||doc.closed)throw Error('PDFが切り替わりました。');if(doc.pageDraft)throw Error('ページ整理を終了してから本文を編集してください。');return runPageEdit(documentId,'bodyText',options);}
@@ -13160,19 +13321,29 @@ const bodyStatus=bodySection.querySelector('[data-body-status]'),bodyForm=bodySe
 let bodyEditorKey='',bodyEditorVersion=0,bodyEditorBusy=false,bodySelection=null,bodyTextOverlay=null,bodyDraftValue='',bodyDraftUndo=[],bodyDraftRedo=[];
 const bodyEditorOpen=()=>!panel.hidden&&!bodySection.hidden;
 function bodyClearSelection(){bodyDraftUndo=[];bodyDraftRedo=[];bodyDraftValue='';bodySelection=null;bodyForm.hidden=true;bodyTextOverlay?.remove();bodyTextOverlay=null;document.body.classList.remove('pk-editing-body-text');}
-function bodySyncBusy(){const c=window.PakuribatBodyText?.context(),h=window.PakuribatHistory?.context();for(const [key,can]of [['undo','canUndo'],['redo','canRedo']])bodySection.querySelector('[data-body-'+key+']').disabled=bodyEditorBusy||!!h?.busy||!h?.[can];for(const input of bodyForm.querySelectorAll('input,select,textarea,button'))input.disabled=bodyEditorBusy||!c||c.busy;}
+function bodySyncBusy(){const c=window.PakuribatBodyText?.context(),h=window.PakuribatHistory?.context();for(const [key,can]of [['undo','canUndo'],['redo','canRedo']])bodySection.querySelector('[data-body-'+key+']').disabled=bodyEditorBusy||!!h?.busy||!h?.[can];for(const input of bodyForm.querySelectorAll('input,select,textarea,button'))input.disabled=bodyEditorBusy||!c||c.busy;
+ if(bodySelection?.item.vertical) for(const input of [bodyFont,bodySize,bodyColor,bodyForm.querySelector('[data-body-delete]')]) input.disabled=true;}
 async function refreshBodyText(){
  if(!bodyEditorOpen()){bodyEditorVersion++;bodyEditorKey='';bodyClearSelection();return;}const c=window.PakuribatBodyText?.context(),key=c?c.documentId+':'+c.currentPage:'';bodySyncBusy();if(key===bodyEditorKey)return;bodyEditorKey=key;const version=++bodyEditorVersion;bodyClearSelection();if(!c){bodyStatus.textContent='PDFを開いてください。';return;}
  bodyStatus.textContent='本文を読み込んでいます…';
- try{const listing=await window.PakuribatBodyText.list(c.documentId);if(version!==bodyEditorVersion||!listing||!bodyEditorOpen())return;const g=await window.PakuribatBodyText.geometry(c.documentId);if(version!==bodyEditorVersion||!bodyEditorOpen()||listing.page!==g.page)return;
+ try{const [listing,verticalItems]=await Promise.all([window.PakuribatBodyText.list(c.documentId),window.PakuribatBodyText.listVertical(c.documentId)]);if(version!==bodyEditorVersion||!listing||!bodyEditorOpen())return;const g=await window.PakuribatBodyText.geometry(c.documentId);if(version!==bodyEditorVersion||!bodyEditorOpen()||listing.page!==g.page)return;
   $('handToolButton')?.click();document.body.classList.add('pk-editing-body-text');const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');svg.setAttribute('class','pk-body-text-overlay');svg.setAttribute('viewBox','0 0 '+g.viewport.width+' '+g.viewport.height);bodyTextOverlay=svg;
-  for(const item of (listing.groups||listing.items).flatMap(item=>(item.regions||[item.rect]).map(rect=>({...item,rect})))){const a=g.viewport.convertToViewportPoint(item.rect[0],item.rect[1]),b=g.viewport.convertToViewportPoint(item.rect[2],item.rect[3]),rect=document.createElementNS(ns,'rect');rect.setAttribute('x',Math.min(a[0],b[0]));rect.setAttribute('y',Math.min(a[1],b[1]));rect.setAttribute('width',Math.max(3,Math.abs(a[0]-b[0])));rect.setAttribute('height',Math.max(3,Math.abs(a[1]-b[1])));rect.setAttribute('class','pk-body-text-hit');rect.pkBodyTextBounds=[...item.rect];rect.pkBodyGroupId=item.groupId||String(item.index);rect.setAttribute('tabindex',item.editable?'0':'-1');rect.setAttribute('role','button');rect.setAttribute('aria-label','本文を編集：'+item.text);const title=document.createElementNS(ns,'title');title.textContent=item.editable?item.text:item.reason;rect.append(title);
-   const select=()=>{if(bodyEditorBusy||version!==bodyEditorVersion)return;if(!item.editable){bodyStatus.textContent=item.reason;return;}for(const node of svg.querySelectorAll('rect'))node.classList.toggle('is-selected',node.pkBodyGroupId===rect.pkBodyGroupId);bodySelection={documentId:g.documentId||c.documentId,page:g.page,item};bodySection.querySelector('[data-body-target]').textContent='編集対象：「'+item.text+'」';bodyText.value=item.text;bodyDraftValue=item.text;bodyDraftUndo=[];bodyDraftRedo=[];bodyFont.value='auto';bodySize.value=String(Math.round(item.size*100)/100);bodyColor.value=item.color;bodyForm.hidden=false;bodySection.querySelector('[data-body-font-name]').textContent='元のフォント：'+item.fontName.replace(/^[A-Z]{6}\+/,'');bodyStatus.textContent='書き換えて「適用」を押してください。';bodySyncBusy();bodyText.focus();};
+  const isVertical = item => verticalItems.some(vertical => {
+   const a = item.rect, b = vertical.rect;
+   return item.text === vertical.text && a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1];
+  });
+  const nativeItems = new Map(listing.items.map(item => [item.index, item]));
+  const horizontalItems = (listing.groups || listing.items).flatMap(item => {
+   const members = item.members?.map(member => nativeItems.get(member.index)) || [item];
+   return members.some(isVertical) ? members.filter(member => !isVertical(member)) : [item];
+  });
+  for(const item of [...horizontalItems,...verticalItems].flatMap(item=>(item.regions||[item.rect]).map(rect=>({...item,rect})))){const a=g.viewport.convertToViewportPoint(item.rect[0],item.rect[1]),b=g.viewport.convertToViewportPoint(item.rect[2],item.rect[3]),rect=document.createElementNS(ns,'rect');rect.setAttribute('x',Math.min(a[0],b[0]));rect.setAttribute('y',Math.min(a[1],b[1]));rect.setAttribute('width',Math.max(3,Math.abs(a[0]-b[0])));rect.setAttribute('height',Math.max(3,Math.abs(a[1]-b[1])));rect.setAttribute('class','pk-body-text-hit');rect.pkBodyTextBounds=[...item.rect];rect.pkBodyGroupId=item.vertical?'vertical-'+item.index:item.groupId||String(item.index);rect.setAttribute('tabindex',item.editable?'0':'-1');rect.setAttribute('role','button');rect.setAttribute('aria-label','本文を編集：'+item.text);const title=document.createElementNS(ns,'title');title.textContent=item.editable?item.text:item.reason;rect.append(title);
+   const select=()=>{if(bodyEditorBusy||version!==bodyEditorVersion)return;if(!item.editable){bodyStatus.textContent=item.reason;return;}for(const node of svg.querySelectorAll('rect'))node.classList.toggle('is-selected',node.pkBodyGroupId===rect.pkBodyGroupId);bodySelection={documentId:g.documentId||c.documentId,page:g.page,item};bodySection.querySelector('[data-body-target]').textContent='編集対象：「'+item.text+'」';bodyText.value=item.text;bodyDraftValue=item.text;bodyDraftUndo=[];bodyDraftRedo=[];bodyFont.value='auto';bodySize.value=String(Math.round(item.size*100)/100);bodyColor.value=item.color;bodyForm.hidden=false;bodySection.querySelector('[data-body-font-name]').textContent='元のフォント：'+item.fontName.replace(/^[A-Z]{6}\+/,'');bodyStatus.textContent=item.vertical?'縦書きは同じ文字数で置換できます。本文を書き換えて「適用」を押してください。':'書き換えて「適用」を押してください。';bodySyncBusy();bodyText.focus();};
    rect.addEventListener('pointerdown',event=>{event.preventDefault();event.stopPropagation();});rect.addEventListener('pointerup',event=>{event.preventDefault();event.stopPropagation();});rect.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();select();});rect.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();event.stopPropagation();select();}});svg.append(rect);
-  }g.host.append(svg);bodyStatus.textContent=listing.items.length?'PDF上の文字をクリックして編集します。':'このページに直接編集できる本文文字はありません。'+(listing.forms?'図やまとまりの内部の文字は、今回の編集対象に含まれません。':'');
+  }g.host.append(svg);bodyStatus.textContent=listing.items.length||verticalItems.length?'PDF上の文字をクリックして編集します。':'このページに直接編集できる本文文字はありません。'+(listing.forms?'図やまとまりの内部の文字は、今回の編集対象に含まれません。':'');
  }catch(error){if(version===bodyEditorVersion){bodyEditorKey='';bodyStatus.textContent=error.message;}}
 }
-async function bodyApply(text){const selected=bodySelection,c=window.PakuribatBodyText?.context();if(bodyEditorBusy){bodyStatus.textContent='本文の変更処理中です。';return;}if(!selected){bodyStatus.textContent='編集する本文の文字をPDF上で選択してください。';return;}if(!c||selected.documentId!==c.documentId||selected.page!==c.currentPage){bodyStatus.textContent='表示中のPDFまたはページが変わりました。編集する文字を選び直してください。';return;}if(!Number.isFinite(Number(bodySize.value))||Number(bodySize.value)<1||Number(bodySize.value)>300||!/^#[0-9a-f]{6}$/i.test(bodyColor.value)||!['auto','original','japanese','serif'].includes(bodyFont.value)){bodyStatus.textContent='文字サイズは1〜300pt、文字色は#RRGGBBで指定してください。';return;}bodyEditorBusy=true;bodySyncBusy();bodyStatus.textContent='本文を保存しています…';try{const result=await window.PakuribatBodyText.edit(c.documentId,{page:selected.page,index:selected.item.index,groupId:selected.item.groupId,expectedText:selected.item.text,text,font:bodyFont.value,size:Number(bodySize.value)===Math.round(selected.item.size*100)/100?selected.item.size:Number(bodySize.value),color:bodyColor.value});bodyEditorKey='';await refreshBodyText();bodyStatus.textContent=result.bodyExpanded&&!result.bodyWrapped?'編集対象を横へ広げて本文を変更しました。「名前を付けて保存」で保存してください。':result.bodyWrapped?'編集対象だけを折り返して本文を変更しました。「名前を付けて保存」で保存してください。':'本文を変更しました。「名前を付けて保存」で保存してください。';if(result.bodyFontFallback)bodyStatus.textContent+=' 元フォントにない字形のため、'+result.bodyFontUsed+'で表示しました。';}catch(error){bodyStatus.textContent=error.message;}finally{bodyEditorBusy=false;bodySyncBusy();}}
+async function bodyApply(text){const selected=bodySelection,c=window.PakuribatBodyText?.context();if(bodyEditorBusy){bodyStatus.textContent='本文の変更処理中です。';return;}if(!selected){bodyStatus.textContent='編集する本文の文字をPDF上で選択してください。';return;}if(!c||selected.documentId!==c.documentId||selected.page!==c.currentPage){bodyStatus.textContent='表示中のPDFまたはページが変わりました。編集する文字を選び直してください。';return;}if(!Number.isFinite(Number(bodySize.value))||Number(bodySize.value)<1||Number(bodySize.value)>300||!/^#[0-9a-f]{6}$/i.test(bodyColor.value)||!['auto','original','japanese','serif'].includes(bodyFont.value)){bodyStatus.textContent='文字サイズは1〜300pt、文字色は#RRGGBBで指定してください。';return;}bodyEditorBusy=true;bodySyncBusy();bodyStatus.textContent='本文を保存しています…';try{const result=await window.PakuribatBodyText.edit(c.documentId,{page:selected.page,index:selected.item.index,groupId:selected.item.groupId,vertical:selected.item.vertical,expectedText:selected.item.text,text,font:bodyFont.value,size:Number(bodySize.value)===Math.round(selected.item.size*100)/100?selected.item.size:Number(bodySize.value),color:bodyColor.value});bodyEditorKey='';await refreshBodyText();bodyStatus.textContent=result.bodyExpanded&&!result.bodyWrapped?'編集対象を横へ広げて本文を変更しました。「名前を付けて保存」で保存してください。':result.bodyWrapped?'編集対象だけを折り返して本文を変更しました。「名前を付けて保存」で保存してください。':'本文を変更しました。「名前を付けて保存」で保存してください。';if(result.bodyFontFallback)bodyStatus.textContent+=' 元フォントにない字形のため、'+result.bodyFontUsed+'で表示しました。';}catch(error){bodyStatus.textContent=error.message;}finally{bodyEditorBusy=false;bodySyncBusy();}}
 function bodyConfirmDelete(){if(!bodySelection||bodyEditorBusy)return;bodyStatus.textContent='選択した本文の文字を削除しますか？';const confirm=document.createElement('button');confirm.type='button';confirm.textContent='削除する';confirm.addEventListener('click',()=>void bodyApply(''));bodyStatus.append(confirm);}
 function bodySubmit(){if(!bodyText.value)bodyConfirmDelete();else void bodyApply(bodyText.value);}bodyForm.noValidate=true;bodyForm.querySelector('[data-body-apply]').addEventListener('click',event=>{event.preventDefault();event.stopPropagation();bodyText.blur?.();bodySubmit();});bodyForm.addEventListener('submit',event=>{event.preventDefault();bodySubmit();});bodyForm.querySelector('[data-body-delete]').addEventListener('click',bodyConfirmDelete);bodyForm.querySelector('[data-body-cancel]').addEventListener('click',()=>{bodyEditorKey='';void refreshBodyText();});
 // Draft typing and committed PDF edits form a continuous Undo route.
