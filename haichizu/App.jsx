@@ -9835,6 +9835,15 @@ window.App = function App() {
         ctx.closePath();
         ctx.fillStyle = a.color || '#9CA3AF';
         ctx.fill();
+        // 【継ぎ目を隠す・2026-11-27 ユーザー指摘「貼り合わせているのがバレてないか」】隣り合う面は同じ線を共有するが、
+        //   縁の滑らかさ（アンチエイリアス）で継ぎ目が薄い線に見える。同じ色の細い線（画面で約1px）で縁をなぞって埋める。
+        //   旗 window.__GROUND_AREA_SEAM_STROKE = false で従来（なぞらない）
+        if (!(typeof window !== 'undefined' && window.__GROUND_AREA_SEAM_STROKE === false)) {
+          ctx.strokeStyle = a.color || '#9CA3AF';
+          ctx.lineWidth = 1 / ((b && b.sc) || 1);
+          ctx.lineJoin = 'round';
+          ctx.stroke();
+        }
         塗数++;
       }
     }
@@ -17249,9 +17258,13 @@ window.App = function App() {
                   Array.isArray(a.幅左m) ? a.幅左m.map(v => v / _px) : null,
                   Array.isArray(a.幅右m) ? a.幅右m.map(v => v / _px) : null);
                 if (!輪 || 輪.length < 3) return null;
+                // 継ぎ目を隠す（隣の面と共有する線のアンチエイリアスの薄い線を同じ色の細い線で埋める）。
+                //   組の透明度は1回なので線を重ねても濃くならない。旗 window.__GROUND_AREA_SEAM_STROKE = false で従来
                 return (<polygon key={`ga${a.id}`} data-ground-area="1"
                   points={輪.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join(' ')}
-                  fill={a.color || '#9CA3AF'} fillOpacity={_組で ? 1 : 0.55} stroke="none"
+                  fill={a.color || '#9CA3AF'} fillOpacity={_組で ? 1 : 0.55}
+                  {...(_組で && !(typeof window !== 'undefined' && window.__GROUND_AREA_SEAM_STROKE === false)
+                    ? { stroke: a.color || '#9CA3AF', strokeWidth: 1, vectorEffect: 'non-scaling-stroke', strokeLinejoin: 'round' } : { stroke: 'none' })}
                   style={{ pointerEvents: 'none' }} />);
               });
               return _組で ? (<g data-ground-areas="1" opacity={0.55} style={{ pointerEvents: 'none' }}>{_面}</g>) : _面;

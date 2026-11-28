@@ -616,6 +616,266 @@ function gsiRoadNodes(lines) {
   }
   return 節ら;
 }
+// ══ 道路の面を道路縁の線から作る・2026-11-27 ══
+// 【ユーザー指摘】「貼り合わせているのがバレてないか？」「交差点も含めた点を取得しそれらを結べば一つの面になるのではないのか？」
+//   「すべてで一つというのが難しければ交差点のような複雑な形でないところで区切って貼り合わせるのもあり」
+// 【作り方】道路の輪郭そのもの（道路縁の線）で囲まれた領域を面にする。
+//   1) 線分の集まり＝道路縁の線＋タイルの四辺＋**切り線**（交差点の近くで道路を横切る短い線）
+//      ・切り線は中心線に垂直に、左右の縁の線まで（最初に当たった所）。交差点から 上半幅×2＋6m の所（交差点の面と区間の面を分ける）
+//      ・縁の線の端どうしが 継ぎ 以内で離れていれば短い線でつなぐ（データの小さな切れ目で面が漏れないように）
+//   2) 交点で割って平面のグラフにし、行き止まりの枝を落とし、囲まれた面（面積が正）をたどる
+//   3) 中心線の点（3mおき）を含む面＝道路の面。タイルの外の面は捨てる
+//   4) 漏れの検査: 面の中の点（格子）のうち、どの中心線からも 上半幅×2＋2m より遠い点が5%を超える面は捨てる
+//      （縁の線が切れている所＝敷地の出入口などから街区へ漏れた面）
+//   隣の面とは切り線・タイルの境目の線を**まったく同じ点で**共有する＝貼り合わせの継ぎ目が出ない。
+// 戻り: { 面: [{ 輪（タイル内座標）, 線: [含む中心線の番号] }], 覆う線: Set（全部が面に入った中心線）, 節ら, 理由 }
+function gsiRoadFacesInTile(芯ら, 縁線, ext, 単位m, opt) {
+  const o = opt || {};
+  const 出 = { 面: [], 覆う線: new Set(), 節ら: [], 理由: {} };
+  const 数 = (k) => { 出.理由[k] = (出.理由[k] || 0) + 1; };
+  if (!縁線 || !縁線.length || !芯ら || !芯ら.length) return 出;
+  const 継ぎ = (o.継ぎm || 0.5) / 単位m, 最小 = 0.3 / 単位m;
+  const 節ら = gsiRoadNodes(芯ら.map(d => d.細)); 出.節ら = 節ら;
+  // ── 中心線の長さと点 ──
+  const 線 = 芯ら.map(d => {
+    const P = d.細, 累 = [0];
+    for (let k = 1; k < P.length; k++) 累.push(累[k - 1] + Math.hypot(P[k].x - P[k - 1].x, P[k].y - P[k - 1].y));
+    return { P, 累, 全: 累[累.length - 1] };
+  });
+  const 点at = (L, s) => {
+    let k = 1; while (k < L.P.length - 1 && L.累[k] < s) k++;
+    const a = L.P[k - 1], b = L.P[k], len = (L.累[k] - L.累[k - 1]) || 1, f = Math.max(0, Math.min(1, (s - L.累[k - 1]) / len));
+    return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f, tx: (b.x - a.x) / len, ty: (b.y - a.y) / len };
+  };
+  const 位置 = (L, q) => {
+    let bs = 0, bd = Infinity;
+    for (let k = 1; k < L.P.length; k++) {
+      const a = L.P[k - 1], b = L.P[k], ex = b.x - a.x, ey = b.y - a.y, L2 = ex * ex + ey * ey;
+      let t = L2 > 0 ? ((q.x - a.x) * ex + (q.y - a.y) * ey) / L2 : 0; t = Math.max(0, Math.min(1, t));
+      const dd = Math.hypot(a.x + ex * t - q.x, a.y + ey * t - q.y);
+      if (dd < bd) { bd = dd; bs = L.累[k - 1] + Math.sqrt(L2) * t; }
+    }
+    return bs;
+  };
+  const 当てる = (px, py, dx, dy, lim) => {
+    let best = Infinity;
+    for (const g of 縁線) for (let k = 1; k < g.length; k++) {
+      const a = g[k - 1], b = g[k], ex = b.x - a.x, ey = b.y - a.y, den = dx * ey - dy * ex;
+      if (Math.abs(den) < 1e-12) continue;
+      const t = ((a.x - px) * ey - (a.y - py) * ex) / den, u = ((a.x - px) * dy - (a.y - py) * dx) / den;
+      if (u < -1e-9 || u > 1 + 1e-9 || t < 最小 || t > lim) continue;
+      if (t < best) best = t;
+    }
+    return best;
+  };
+  // ── 1) 線分の集まり ──
+  const 段 = [];
+  const 足す = (a, b) => { if (Math.hypot(b.x - a.x, b.y - a.y) > 1e-9) 段.push([{ x: a.x, y: a.y }, { x: b.x, y: b.y }]); };
+  for (const g of 縁線) for (let k = 1; k < g.length; k++) 足す(g[k - 1], g[k]);
+  // 縁の線の小さな切れ目を閉じる（端点が他のどの端点とも一致しないものどうし）
+  const 端 = new Map();
+  縁線.forEach((g, gi) => { for (const e of [0, g.length - 1]) { const q = g[e], k = q.x + ',' + q.y; if (!端.has(k)) 端.set(k, []); 端.get(k).push({ q, gi }); } });
+  const 浮く = [...端.values()].filter(a => a.length === 1).map(a => a[0]);
+  const 使った = new Set();
+  for (let i = 0; i < 浮く.length; i++) {
+    if (使った.has(i)) continue;
+    let bj = -1, bd = 継ぎ;
+    for (let j = 0; j < 浮く.length; j++) {
+      if (j === i || 使った.has(j) || 浮く[j].gi === 浮く[i].gi) continue;
+      const d = Math.hypot(浮く[j].q.x - 浮く[i].q.x, 浮く[j].q.y - 浮く[i].q.y);
+      if (d <= bd) { bd = d; bj = j; }
+    }
+    if (bj >= 0) { 足す(浮く[i].q, 浮く[bj].q); 使った.add(i); 使った.add(bj); 数('切れ目を閉じた'); }
+  }
+  // 道路の側面の切れ目（敷地の出入口・踏切など、数m）も閉じる。条件: 2つの端点が 隙間の上限 以内／つなぐ線が
+  //   どの中心線とも交わらない（横道の入口はその中心線が通るので閉じない）／一番近い中心線と平行（25°以内）／
+  //   両端の中心線からの距離の差が 1m 以内＝同じ側面の続き。実データで道路の縁が5mほど切れて面が街区へ漏れていた。
+  const 隙間の上限 = (o.隙間m || 12) / 単位m;
+  const 中心線と交わる = (a, b) => 線.some(L => { for (let k = 1; k < L.P.length; k++) {
+    const c = L.P[k - 1], d = L.P[k], ex = b.x - a.x, ey = b.y - a.y, fx = d.x - c.x, fy = d.y - c.y, den = ex * fy - ey * fx;
+    if (Math.abs(den) < 1e-12) continue;
+    const t = ((c.x - a.x) * fy - (c.y - a.y) * fx) / den, u = ((c.x - a.x) * ey - (c.y - a.y) * ex) / den;
+    if (t >= 0 && t <= 1 && u >= 0 && u <= 1) return true; } return false; });
+  const 一番近い線 = (q) => { let best = null;
+    for (let i = 0; i < 線.length; i++) { const L = 線[i]; for (let k = 1; k < L.P.length; k++) {
+      const a = L.P[k - 1], b = L.P[k], ex = b.x - a.x, ey = b.y - a.y, L2 = ex * ex + ey * ey; if (!(L2 > 0)) continue;
+      let t = ((q.x - a.x) * ex + (q.y - a.y) * ey) / L2; t = Math.max(0, Math.min(1, t));
+      const d = Math.hypot(a.x + ex * t - q.x, a.y + ey * t - q.y);
+      if (!best || d < best.d) best = { d, i, tx: ex / Math.sqrt(L2), ty: ey / Math.sqrt(L2) }; } }
+    return best; };
+  //   旗 globalThis.__GSI_ROAD_SIDE_GAP = false で閉じない・切り線もずらさない（従来）＝陽性対照
+  const _側面 = !(typeof globalThis !== 'undefined' && globalThis.__GSI_ROAD_SIDE_GAP === false);
+  for (let i = 0; i < 浮く.length && _側面; i++) {
+    if (使った.has(i)) continue;
+    const p = 浮く[i].q, np = 一番近い線(p); if (!np || np.d > 芯ら[np.i].上半幅 * 2) continue;
+    let bj = -1, bd = 隙間の上限;
+    for (let j = 0; j < 浮く.length; j++) {
+      if (j === i || 使った.has(j)) continue;
+      const q = 浮く[j].q, d = Math.hypot(q.x - p.x, q.y - p.y);
+      if (d > bd || d < 1e-9) continue;
+      const nq = 一番近い線(q); if (!nq || nq.i !== np.i || Math.abs(nq.d - np.d) > 1 / 単位m) continue;
+      if (Math.abs(((q.x - p.x) * np.ty - (q.y - p.y) * np.tx) / d) > Math.sin(25 * Math.PI / 180)) continue;
+      if (中心線と交わる(p, q)) continue;
+      bd = d; bj = j;
+    }
+    if (bj >= 0) { 足す(p, 浮く[bj].q); 使った.add(i); 使った.add(bj); 数('側面の切れ目を閉じた'); }
+  }
+  // 切り線: 交差点の近く（交差点から 離れ）で道路を横切る＝交差点の面と道路の区間の面を分ける。
+  //   区間ごとに別の面にしておくと、縁の線の切れ目から漏れても、その区間の面1つだけで済む（その区間は帯に戻る）。
+  //   交差点が無い端（行き止まり・タイルの縁）の側は切らない。区間が短く両側の切り線が近すぎるときは真ん中に1本。
+  const 切る = (i, s0) => {
+    // 予定の位置で左右の縁に当たらなければ（縁の切れ目）、1mずつ前後にずらして探す（最大6m）
+    let c, nx, ny, hl, hr; const lim = 芯ら[i].上半幅 * 2.5;
+    for (const d of (_側面 ? [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6] : [0])) {
+      const s = s0 + d / 単位m; if (s <= 0 || s >= 線[i].全) continue;
+      c = 点at(線[i], s); nx = -c.ty; ny = c.tx;
+      hl = 当てる(c.x, c.y, nx, ny, lim); hr = 当てる(c.x, c.y, -nx, -ny, lim);
+      if (Number.isFinite(hl) && Number.isFinite(hr)) break;
+    }
+    if (!Number.isFinite(hl) || !Number.isFinite(hr)) { 数('切り線の縁が無い'); return; }
+    const 越 = 0.05 / 単位m;   // 縁の線を確実に横切る（はみ出した先は行き止まりの枝として落ちる）
+    足す({ x: c.x + nx * (hl + 越), y: c.y + ny * (hl + 越) }, { x: c.x - nx * (hr + 越), y: c.y - ny * (hr + 越) });
+    数('切り線');
+  };
+  for (let i = 0; i < 線.length; i++) {
+    const L = 線[i], 離れ = 2 * 芯ら[i].上半幅 + 6 / 単位m, 間あき = 4 / 単位m;
+    const ss = 節ら.filter(n => n.線.includes(i)).map(n => 位置(L, n)).sort((a, b) => a - b);
+    if (!ss.length) continue;
+    const 区 = [[0, ss[0], false, true]];
+    for (let k = 1; k < ss.length; k++) 区.push([ss[k - 1], ss[k], true, true]);
+    区.push([ss[ss.length - 1], L.全, true, false]);
+    for (const [a, b, 頭, 尾] of 区) {
+      const len = b - a; if (len < 1e-6) continue;
+      if (頭 && 尾) {
+        if (len >= 2 * 離れ + 間あき) { 切る(i, a + 離れ); 切る(i, b - 離れ); }
+        else if (len >= 離れ) 切る(i, (a + b) / 2);
+      } else if (頭 && len >= 離れ + 間あき) 切る(i, a + 離れ);
+      else if (尾 && len >= 離れ + 間あき) 切る(i, b - 離れ);
+    }
+  }
+  // タイルの四辺
+  const 角 = [{ x: 0, y: 0 }, { x: ext, y: 0 }, { x: ext, y: ext }, { x: 0, y: ext }];
+  for (let k = 0; k < 4; k++) 足す(角[k], 角[(k + 1) % 4]);
+  // ── 2) 交点で割る（格子で組を絞る）──
+  const N = 段.length, 割 = 段.map(([a, b]) => [{ t: 0, p: a }, { t: 1, p: b }]);
+  const C = 64, 格 = new Map();
+  段.forEach(([a, b], i) => {
+    const x0 = Math.floor(Math.min(a.x, b.x) / C), x1 = Math.floor(Math.max(a.x, b.x) / C);
+    const y0 = Math.floor(Math.min(a.y, b.y) / C), y1 = Math.floor(Math.max(a.y, b.y) / C);
+    for (let gx = x0; gx <= x1; gx++) for (let gy = y0; gy <= y1; gy++) { const k = gx + ',' + gy; if (!格.has(k)) 格.set(k, []); 格.get(k).push(i); }
+  });
+  const 見た組 = new Set(), ε = 1e-9;
+  for (const 群 of 格.values()) for (let m = 0; m < 群.length; m++) for (let n = m + 1; n < 群.length; n++) {
+    const i = 群[m], j = 群[n], 鍵 = i < j ? i * N + j : j * N + i;
+    if (見た組.has(鍵)) continue; 見た組.add(鍵);
+    const [a, b] = 段[i], [c, d] = 段[j];
+    const ex = b.x - a.x, ey = b.y - a.y, fx = d.x - c.x, fy = d.y - c.y, den = ex * fy - ey * fx;
+    if (Math.abs(den) < 1e-12) {
+      // 平行: 一直線上で重なっていれば、互いの端点で割る
+      const L2 = ex * ex + ey * ey; if (!(L2 > 0)) continue;
+      if (Math.abs(ex * (c.y - a.y) - ey * (c.x - a.x)) / Math.sqrt(L2) > 1e-6) continue;
+      for (const q of [c, d]) { const t = ((q.x - a.x) * ex + (q.y - a.y) * ey) / L2; if (t > ε && t < 1 - ε) 割[i].push({ t, p: q }); }
+      const M2 = fx * fx + fy * fy;
+      for (const q of [a, b]) { const u = ((q.x - c.x) * fx + (q.y - c.y) * fy) / M2; if (u > ε && u < 1 - ε) 割[j].push({ t: u, p: q }); }
+      continue;
+    }
+    const t = ((c.x - a.x) * fy - (c.y - a.y) * fx) / den, u = ((c.x - a.x) * ey - (c.y - a.y) * ex) / den;
+    if (t < -ε || t > 1 + ε || u < -ε || u > 1 + ε) continue;
+    // 端点に当たるときは端点そのものを使う（丸めで別の点にしない）
+    const p = t <= ε ? a : t >= 1 - ε ? b : u <= ε ? c : u >= 1 - ε ? d : { x: a.x + ex * t, y: a.y + ey * t };
+    if (t > ε && t < 1 - ε) 割[i].push({ t, p });
+    if (u > ε && u < 1 - ε) 割[j].push({ t: u, p });
+  }
+  // ── グラフ ──
+  const 頂 = [], 番 = new Map();
+  const 頂番 = (p) => { const k = p.x.toFixed(5) + ',' + p.y.toFixed(5); let v = 番.get(k); if (v == null) { v = 頂.length; 頂.push({ x: p.x, y: p.y }); 番.set(k, v); } return v; };
+  const 辺 = new Set(), 隣 = [];
+  for (const L of 割) {
+    L.sort((p, q) => p.t - q.t);
+    let 前 = 頂番(L[0].p);
+    for (let k = 1; k < L.length; k++) {
+      const v = 頂番(L[k].p); if (v === 前) continue;
+      const 鍵 = 前 < v ? 前 + ',' + v : v + ',' + 前;
+      if (!辺.has(鍵)) { 辺.add(鍵); (隣[前] = 隣[前] || []).push(v); (隣[v] = 隣[v] || []).push(前); }
+      前 = v;
+    }
+  }
+  // 行き止まりの枝を落とす
+  const 次数 = 頂.map((_, v) => (隣[v] || []).length), 消 = new Uint8Array(頂.length), 待 = [];
+  for (let v = 0; v < 頂.length; v++) if (次数[v] <= 1) 待.push(v);
+  while (待.length) {
+    const v = 待.pop(); if (消[v]) continue; 消[v] = 1;
+    for (const w of 隣[v] || []) if (!消[w]) { 次数[w]--; if (次数[w] <= 1) 待.push(w); }
+  }
+  for (let v = 0; v < 頂.length; v++) if (隣[v]) {
+    隣[v] = 隣[v].filter(w => !消[w]);
+    const p = 頂[v];
+    隣[v].sort((a, b) => Math.atan2(頂[a].y - p.y, 頂[a].x - p.x) - Math.atan2(頂[b].y - p.y, 頂[b].x - p.x));
+  }
+  // ── 面をたどる（囲まれた面は面積が正）──
+  const 通 = new Set(), 面ら = [];
+  for (let u0 = 0; u0 < 頂.length; u0++) {
+    if (消[u0] || !隣[u0]) continue;
+    for (const v0 of 隣[u0]) {
+      if (通.has(u0 + '>' + v0)) continue;
+      const 輪 = []; let u = u0, v = v0, 歩 = 0;
+      do {
+        通.add(u + '>' + v); 輪.push(u);
+        const A = 隣[v], i = A.indexOf(u), w = A[(i - 1 + A.length) % A.length];
+        u = v; v = w;
+      } while (!(u === u0 && v === v0) && ++歩 < 200000);
+      let a2 = 0; for (let k = 0; k < 輪.length; k++) { const p = 頂[輪[k]], q = 頂[輪[(k + 1) % 輪.length]]; a2 += p.x * q.y - q.x * p.y; }
+      if (a2 > 0) 面ら.push({ 番: 輪, 面積: a2 / 2 });
+    }
+  }
+  // ── 3) 道路の面を選ぶ ──
+  const 標 = [], 間 = 3 / 単位m;
+  線.forEach((L, i) => {
+    for (let s = 間 / 2; s < L.全; s += 間) { const q = 点at(L, s); if (q.x > 0 && q.x < ext && q.y > 0 && q.y < ext) 標.push({ x: q.x, y: q.y, i }); }
+  });
+  const 中 = (P, q) => { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j]; if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
+  const 近さ = (q) => {   // どれかの中心線に 上半幅×2＋2m 以内か
+    for (let i = 0; i < 線.length; i++) {
+      const L = 線[i], lim = 芯ら[i].上半幅 * 2 + 2 / 単位m;
+      for (let k = 1; k < L.P.length; k++) {
+        const a = L.P[k - 1], b = L.P[k], ex = b.x - a.x, ey = b.y - a.y, L2 = ex * ex + ey * ey;
+        let t = L2 > 0 ? ((q.x - a.x) * ex + (q.y - a.y) * ey) / L2 : 0; t = Math.max(0, Math.min(1, t));
+        if (Math.hypot(a.x + ex * t - q.x, a.y + ey * t - q.y) <= lim) return true;
+      }
+    }
+    return false;
+  };
+  const 採 = [];
+  for (const f of 面ら) {
+    const P = f.番.map(v => 頂[v]);
+    let cx = 0, cy = 0; for (const q of P) { cx += q.x; cy += q.y; } cx /= P.length; cy /= P.length;
+    if (cx < 0 || cx > ext || cy < 0 || cy > ext) continue;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const q of P) { if (q.x < x0) x0 = q.x; if (q.y < y0) y0 = q.y; if (q.x > x1) x1 = q.x; if (q.y > y1) y1 = q.y; }
+    const 入 = 標.filter(q => q.x >= x0 && q.x <= x1 && q.y >= y0 && q.y <= y1 && 中(P, q));
+    if (!入.length) continue;
+    // 4) 漏れの検査
+    const 面積m2 = f.面積 * 単位m * 単位m;
+    if (面積m2 > 40000) { 数('大きすぎて漏れ'); if (o.記録) o.記録.push({ 理由: '大きすぎて漏れ', 輪: P }); continue; }
+    const 歩幅 = Math.max(2 / 単位m, Math.sqrt(f.面積 / 1500));
+    let 全数 = 0, 遠 = 0;
+    for (let x = x0 + 歩幅 / 2; x < x1; x += 歩幅) for (let y = y0 + 歩幅 / 2; y < y1; y += 歩幅) {
+      const q = { x, y }; if (!中(P, q)) continue; 全数++; if (!近さ(q)) 遠++;
+    }
+    if (全数 && 遠 / 全数 > 0.05) { 数('街区へ漏れた'); if (o.記録) o.記録.push({ 理由: '街区へ漏れた', 輪: P, 遠: 遠, 全: 全数 }); continue; }
+    // 一直線上の点を落とす
+    const 簡 = P.filter((q, k) => { const a = P[(k - 1 + P.length) % P.length], b = P[(k + 1) % P.length];
+      return Math.abs((q.x - a.x) * (b.y - a.y) - (q.y - a.y) * (b.x - a.x)) > 1e-6 * Math.max(1, Math.hypot(b.x - a.x, b.y - a.y)); });
+    if (簡.length < 3) continue;
+    採.push({ 輪: 簡, 元: P, 線: [...new Set(入.map(q => q.i))] });
+  }
+  出.面 = 採;
+  // 全部が面に入った中心線
+  const 外 = new Set();
+  for (const q of 標) if (!採.some(f => 中(f.元, q))) 外.add(q.i);
+  for (let i = 0; i < 線.length; i++) if (!外.has(i) && 標.some(q => q.i === i)) 出.覆う線.add(i);
+  return 出;
+}
 // 中心線1本ぶんの記録（交差点の角を取るのに使う）。半幅はタイル内座標。測れなければ 左・右 は null（既定半幅＝区分の幅の半分）。
 //   幅の実測の決まり（2026-11-27）: 上限＝区分の上限の半分＋1.5m（隣の道路の縁を拾わない）・端の余白＝上限（交差点で横道の縁まで伸びない）
 function gsiRoadCoreEntry(細, 縁線, 単位m, 幅m, 上m) {
@@ -953,6 +1213,11 @@ const GSI_IMPORT_LAYERS = {
    //   レイヤごとに1色なら、同じレイヤの隣接は同じ色＝1棟に見える。
   building:   { ft: GSI_BUILDING_FT,  型: 3, ズーム: 15, 色: '#A8B2BD' },
   structurea: { ft: GSI_STRUCTURE_FT, 型: 3, ズーム: 15, 色: '#B3ACA2' },
+  // 【水面（池・プール・海）を地面に塗る・2026-11-27 ユーザー要望「この青いのって池？これも青くて面として生成してくれねぇか」】
+  //   地理院地図の青い輪郭は waterarea（水域・ftCode 5000）の面。厚みを持たせず道路と同じく地面に塗る。
+  //   タイルの境目をまたぐ水面は、各タイルの枠で切ってから塗る（余白の分が重ならない・隣と同じ線で接する）。
+  //   中の島（穴）は落とさず水面のまま塗る。旗 globalThis.__GSI_WATER = false で取らない＝陽性対照。
+  waterarea:  { ft: null, 型: 3, ズーム: 15, 名: '水面', 色: '#8EC5EE', 塗る: true, 枠で切る: true, 旗: '__GSI_WATER' },
   // 道路は線。幅は rnkWidth（無ければ既定）。高さは薄い板。色は灰色
   // 【中心線だけ取り込む・2026-11-27 ユーザー報告「なぜ幅を3つに分割するのか」】
   //   road レイヤには **27xx＝道路中心線**（区分 rdCtg・幅員 rnkWidth を持つ）のほかに
@@ -1290,7 +1555,7 @@ function gsiStitchCut(items) {
       if (R.length < 3 || !(gsiRingArea2(R) > 0)) continue;
       const 細 = gsiThinRing(R, a._単位m || 1);
       if (細.length < 3) continue;
-      生[i] = { ...a, _生: R, ring: 細.map(q => ({ lat: gsiTileYToLat(q.y / e, a._z), lng: gsiTileXToLng(q.x / e, a._z) })) };
+      生[i] = { ...a, _生: R, _枠で切った: true, ring: 細.map(q => ({ lat: gsiTileYToLat(q.y / e, a._z), lng: gsiTileXToLng(q.x / e, a._z) })) };
       枠で切った++;
     }
   }
@@ -1328,7 +1593,35 @@ function gsiStitchCut(items) {
     }
     if (!変) break;
   }
-  return { items: 生.filter(Boolean), つないだ, 試した, 理由, 枠で切った };
+  // 【隣のタイルの完全な形に丸ごと含まれる断片は捨てる・2026-11-27】
+  //   境目をまたぐ建物でも、片方のタイルの余白に全部収まるなら、そのタイルは**完全な形**を持つ。もう片方のタイルの
+  //   余白の端で切られた断片（重心が自分のタイルの内側なので採られる）は、枠で切っても完全な形の中に残る（実測: タンク 414m² が 1578m² の中）。
+  //   枠で切った断片の点が全部、別のタイルの同じ種類の形の中（縁の上を含む）にあれば捨てる。
+  let 含まれて捨てた = 0;
+  const _内か縁 = (P, q) => {
+    let c = false;
+    for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+      const a = P[i], b = P[j];
+      const ex = b.x - a.x, ey = b.y - a.y, L2 = ex * ex + ey * ey;
+      let t = L2 > 0 ? ((q.x - a.x) * ex + (q.y - a.y) * ey) / L2 : 0; t = Math.max(0, Math.min(1, t));
+      if (Math.hypot(a.x + ex * t - q.x, a.y + ey * t - q.y) <= 1) return true;   // 縁の上（1単位以内）
+      if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) c = !c;
+    }
+    return c;
+  };
+  if (!(typeof globalThis !== 'undefined' && globalThis.__GSI_CLIP_BUFFER_CUT === false)) {
+    for (const i of 順) {
+      const a = 生[i]; if (!a || !a._枠で切った || !Array.isArray(a._生)) continue;
+      for (const j of 順) {
+        if (j === i) continue;
+        const b = 生[j]; if (!b || !Array.isArray(b._生)) continue;
+        if (a.layer !== b.layer || a.ftCode !== b.ftCode || a._z !== b._z) continue;
+        if (a._tx === b._tx && a._ty === b._ty) continue;
+        if (a._生.every(q => _内か縁(b._生, q))) { 生[i] = null; 含まれて捨てた++; 数('隣の完全な形に含まれた'); break; }
+      }
+    }
+  }
+  return { items: 生.filter(Boolean), つないだ, 試した, 理由, 枠で切った, 含まれて捨てた };
 }
 // ══ 中心線を端点でつなぐ・2026-11-24 ══
 // 【なぜ】ベクトルタイルは1本の道路を、属性の変わり目やタイルの境目で**複数の地物**に分けて配信する。
@@ -1406,7 +1699,8 @@ async function gsiLoadBuildings(bounds, opts) {
   const o = opts || {};
   const items = []; let 穴 = 0, 範囲外 = 0, 余白 = 0, 切れ = 0, 上限超過 = false;
   let 範囲外の種類 = 0;   // ft範囲の外で取らなかった地物（道路の縁の線など）
-  let 交差点の角 = 0;     // 道路縁の線から角の形を取った交差点の数
+  let 交差点の角 = 0;
+  let 道路の面 = 0, 面に置き換えた線 = 0;   // 縁の線から作った道路の面の数・面に置き換えた中心線の数     // 道路縁の線から角の形を取った交差点の数
   // 【上限はレイヤごと・2026-11-24】建物と道路で枠を分ける。混ぜると道路が枠を食って建物が途中で止まる
   const 層数 = {};
   const 鍵 = new Set();
@@ -1442,6 +1736,7 @@ async function gsiLoadBuildings(bounds, opts) {
         //   余白（タイルの外）にある縁も入れる＝タイルの縁の近くの中心線も両側を測れる。
         const 縁線 = [];
         const 道路の芯 = [];   // このタイルの中心線（タイル内座標）。交差点の角を取るのに使う
+        const 帯の候補 = [];   // 道路の面を作るとき、面に入らなかった中心線だけ帯にする
         if (表.縁の範囲 && !(表.縁の旗 && typeof globalThis !== 'undefined' && globalThis[表.縁の旗] === false)) {
           for (const g of L.feats) {
             if (g.gtype !== 2) continue;
@@ -1450,6 +1745,10 @@ async function gsiLoadBuildings(bounds, opts) {
             for (const 線 of gsiMvtRings(g.geom)) if (線.length >= 2) 縁線.push(線);
           }
         }
+        // 【道路の面を縁の線から作る・2026-11-27 ユーザー指摘「貼り合わせているのがバレてないか」】
+        //   旗 globalThis.__GSI_ROAD_FACES = false で従来（中心線の帯＋交差点の角）＝陽性対照
+        const _面にする = !!(表.縁の範囲 && 縁線.length
+          && !(typeof globalThis !== 'undefined' && globalThis.__GSI_ROAD_FACES === false));
         for (const f of L.feats) {
           // 【型の門はレイヤの表で決める】面（3）だけでなく線（2）も受ける
           if (f.gtype !== 表.型) continue;
@@ -1503,12 +1802,14 @@ async function gsiLoadBuildings(bounds, opts) {
                 //   幅m＝帯の幅（実測なら左＋右）。区分幅m＝幅員区分の幅（線をつなぐときの「同じ道路か」に使う）。
                 //   幅左m・幅右m＝中心線の各点の左右の半幅（実測できたときだけ。描く側の gsiBandRing が受ける）。
                 const _帯幅m = _実 ? (_実.左m + _実.右m) : _幅m;
-                items.push({ layer: L.name, ftCode: f.props.ftCode, 種別, key, 塗る: !!表.塗る,
+                const _帯 = { layer: L.name, ftCode: f.props.ftCode, 種別, key, 塗る: !!表.塗る,
                   中心線: 芯, 幅m: _帯幅m, 区分幅m: _幅m, color: 表.色,
                   ...(_実 ? { 幅左m: 芯.map(() => _実.左m), 幅右m: 芯.map(() => _実.右m) } : {}),
                   srcAdd: { rnkWidth: _rw, rdCtg: f.props.rdCtg, 幅m: _帯幅m, 区分幅m: _幅m,
                     幅の出所: _実 ? '道路の縁の線から実測' : '幅員区分',
-                    幅未確定: _実 ? false : _幅未確定 } });
+                    幅未確定: _実 ? false : _幅未確定 } };
+                // 道路の面を縁の線から作るときは、面に入った中心線の帯は出さない（下でまとめて決める）
+                if (_面にする) 帯の候補.push({ it: _帯, ci: 道路の芯.length - 1 }); else items.push(_帯);
               }
               if (上限超過) break;
             }
@@ -1517,6 +1818,25 @@ async function gsiLoadBuildings(bounds, opts) {
           }
           for (const ring of gsiMvtRings(f.geom)) {
             if (ring.length < 3) continue;
+            // 【地面に塗る面（水面）・2026-11-27】タイルの枠で切って、形（輪）で運ぶ。重心の規則は使わない（切った片は全部採る）
+            if (表.塗る && 表.枠で切る) {
+              if (gsiRingArea(ring) < 0) continue;   // 中の島は水面のまま塗る（穴として数えない）
+              let R = ring;
+              for (const [軸, v, 向] of [['x', 0, 1], ['x', ext, -1], ['y', 0, 1], ['y', ext, -1]]) R = gsiClipRingAxis(R, 軸, v, 向);
+              if (R.length < 3 || !(gsiRingArea2(R) > 0)) continue;
+              const 細w = gsiThinRing(R, 単位m); if (細w.length < 3) continue;
+              const ll = 細w.map(pt => ({ lat: gsiTileYToLat(ty + pt.y / ext, z), lng: gsiTileXToLng(tx + pt.x / ext, z) }));
+              let n = -Infinity, sth = Infinity, w = Infinity, e = -Infinity, la = 0, lo = 0;
+              for (const q of ll) { if (q.lat > n) n = q.lat; if (q.lat < sth) sth = q.lat; if (q.lng < w) w = q.lng; if (q.lng > e) e = q.lng; la += q.lat; lo += q.lng; }
+              if (sth > bounds.north || n < bounds.south || e < bounds.west || w > bounds.east) { 範囲外++; continue; }
+              const key = L.name + ':' + tx + '/' + ty + ':' + (la / ll.length).toFixed(6) + ',' + (lo / ll.length).toFixed(6);
+              if (鍵.has(key)) continue;
+              鍵.add(key);
+              if ((層数[L.name] || 0) >= (表.上限 || GSI_IMPORT_MAX)) { 上限超過 = true; break; }
+              層数[L.name] = (層数[L.name] || 0) + 1;
+              items.push({ layer: L.name, ftCode: f.props.ftCode, 種別, key, 塗る: true, 輪: ll, color: 表.色 });
+              continue;
+            }
             if (gsiRingArea(ring) < 0) { 穴++; continue; }
             const 細 = gsiThinRing(ring, 単位m); if (細.length < 3) continue;
             // 【タイルの余白にはみ出した分は採らない・2026-11-23 ユーザー報告「1つの建物が3つに分かれる」】
@@ -1567,9 +1887,32 @@ async function gsiLoadBuildings(bounds, opts) {
         //   中心線の帯を交差させただけでは角が直角になる。交差点ごとに、道路縁の線から角の形を取って塗る
         //   （gsiRoadNodes → gsiRoadCornerFill＝角を取るだけの面取り）。自分のタイルの中の交差点だけ（隣のタイルと二重にしない）。
         //   旗 globalThis.__GSI_ROAD_CORNER_FILL = false で従来（角を取らない）＝陽性対照。
+        // 道路の面（縁の線で囲まれた領域）。面に入った中心線の帯と、面の中の交差点の角は出さない
+        let _面ら = [];
+        if (_面にする && !上限超過) {
+          const F = gsiRoadFacesInTile(道路の芯, 縁線, ext, 単位m);
+          for (const f of F.面) {
+            const ll = f.輪.map(pt => ({ lat: gsiTileYToLat(ty + pt.y / ext, z), lng: gsiTileXToLng(tx + pt.x / ext, z) }));
+            let n = -Infinity, s = Infinity, w = Infinity, e = -Infinity, la = 0, lo = 0;
+            for (const q of ll) { if (q.lat > n) n = q.lat; if (q.lat < s) s = q.lat; if (q.lng < w) w = q.lng; if (q.lng > e) e = q.lng; la += q.lat; lo += q.lng; }
+            if (s > bounds.north || n < bounds.south || e < bounds.west || w > bounds.east) continue;
+            const key = L.name + ':面:' + (la / ll.length).toFixed(6) + ',' + (lo / ll.length).toFixed(6);
+            if (鍵.has(key)) continue;
+            鍵.add(key);
+            items.push({ layer: L.name, ftCode: null, 種別: (表.名 || L.name) + '（縁の線から作った面）', key,
+              塗る: !!表.塗る, 輪: ll, color: 表.色, srcAdd: { 道路の面: true, 中心線: f.線.length } });
+            道路の面++;
+          }
+          _面ら = F.面;
+          for (const c of 帯の候補) { if (F.覆う線.has(c.ci)) { 面に置き換えた線++; continue; } items.push(c.it); }
+        } else for (const c of 帯の候補) items.push(c.it);
+        const _面の中 = (q) => _面ら.some(f => { const P = f.元; let c = false;
+          for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j];
+            if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; });
         if (表.縁の範囲 && 縁線.length && 道路の芯.length >= 2 && !上限超過
             && !(typeof globalThis !== 'undefined' && globalThis.__GSI_ROAD_CORNER_FILL === false)) {
           for (const { 節, 輪 } of gsiRoadCornersInTile(道路の芯, 縁線, ext, 単位m)) {
+            if (_面の中(節)) continue;   // 交差点が道路の面に入っている＝縁の線どおりに塗れている
             const ll = 輪.map(pt => ({ lat: gsiTileYToLat(ty + pt.y / ext, z), lng: gsiTileXToLng(tx + pt.x / ext, z) }));
             const cla = gsiTileYToLat(ty + 節.y / ext, z), clo = gsiTileXToLng(tx + 節.x / ext, z);
             if (cla > bounds.north || cla < bounds.south || clo < bounds.west || clo > bounds.east) continue;
@@ -1601,9 +1944,9 @@ async function gsiLoadBuildings(bounds, opts) {
     ? { items: _繋.items, つないだ: 0, 試した: 0, 理由: {} } : gsiStitchCut(_繋.items);
   // 生の座標は取り込みの中だけで使う（App へ渡すと重いし、形の正は ring 1つにする）
   for (const it of _縫.items) {
-    if (it && it._生) { delete it._生; delete it._z; delete it._ext; delete it._単位m; delete it._tx; delete it._ty; }
+    if (it && it._生) { delete it._生; delete it._z; delete it._ext; delete it._単位m; delete it._tx; delete it._ty; delete it._枠で切った; }
   }
   return { items: _縫.items, 穴, 範囲外, 余白, 切れ, つないだ: _縫.つないだ,
-    縫いの試行: _縫.試した || 0, 縫いの理由: _縫.理由 || {}, 枠で切った: _縫.枠で切った || 0,
-    層数, 線をつないだ: _繋.つないだ, タイル数: タイル総数, 上限超過, 範囲外の種類, 交差点の角 };
+    縫いの試行: _縫.試した || 0, 縫いの理由: _縫.理由 || {}, 枠で切った: _縫.枠で切った || 0, 含まれて捨てた: _縫.含まれて捨てた || 0,
+    層数, 線をつないだ: _繋.つないだ, タイル数: タイル総数, 上限超過, 範囲外の種類, 交差点の角, 道路の面, 面に置き換えた線 };
 }
