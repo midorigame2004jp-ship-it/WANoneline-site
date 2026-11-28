@@ -944,6 +944,14 @@ const SETTING_DEFS = [
       ? GSI_BASEMAPS.map((b, i) => ({ v: i, label: b.label }))
       : [{ v: 0, label: '標準地図' }],
     note: '国土地理院の窓に出す地図。色別標高図・陰影起伏図・傾斜量図・赤色立体地図は土地の凹凸が見える（すぐ効く）' },
+  // 【取り込みの上限・2026-11-28 ユーザー要望「建物読み込みの上限もっと上げてくれ。というか設定できるようにしてくれ」】
+  //   選択肢は gsiTiles.js の GSI_IMPORT_MAX_CHOICES 1か所から作る。上限より多いときは取り込む前に「すべて読み込むか」を聞く
+  { id: 'gsiImportMax', label: '建物を取り込む上限（1つの種類あたり）',
+    既定: (typeof GSI_IMPORT_MAX_DEFAULT !== 'undefined') ? GSI_IMPORT_MAX_DEFAULT : 2, min: 0, max: 5, step: 1,
+    選: (typeof GSI_IMPORT_MAX_CHOICES !== 'undefined')
+      ? GSI_IMPORT_MAX_CHOICES.map(c => ({ v: c.v, label: c.label }))
+      : [{ v: 2, label: '2,000件' }],
+    note: '国土地理院の窓の「建物を取り込む」で一度に取り込む数。多いと3次元図が重くなる。超えたときは取り込む前に聞く（次に取り込むとき効く）' },
   { id: 'terrainSource', label: '標高データ', 既定: 0, min: 0, max: 3, step: 1,
     選: [{ v: 0, label: '自動（5m→10m）' }, { v: 1, label: '1mメッシュ（細かい・重い）' },
          { v: 2, label: '5mメッシュ' }, { v: 3, label: '10mメッシュ（軽い）' }],
@@ -6452,6 +6460,10 @@ window.App = function App() {
           + `1回の作り直し ${(_perfRef.current.renderMs || 0).toFixed(1)} ms\n`
           + `3次元図の作り直し ${cps} 回/秒\n3次元図1回 ${(_perfRef.current.cabRenderMs || 0).toFixed(1)} ms\n`
           + `奥行き順の計算 ${(_perfRef.current.orderMs || 0).toFixed(1)} ms\n盤の描画 ${drawMs.toFixed(1)} ms\n`
+          // 動かしている間の建物を GPU で描いているか（2026-11-28）。GPU が無ければ「従来」と理由
+          + (() => { const gi = window.__cabSolidsGLInfo; if (window.__CAB_SOLIDS_WEBGL === false) return '建物（動かしている間） 従来（旗で切っている）\n';
+              if (!gi) return '建物（動かしている間） まだ動かしていない\n';
+              return gi.失敗 ? ('建物（動かしている間） 従来（' + String(gi.失敗).slice(0, 40) + '）\n') : ('建物（動かしている間） GPU 1回 ' + gi.ms + ' ms\n'); })()
           + `盤 ${placedPanelsRef.current ? placedPanelsRef.current.length : 0} 台\n`
           + `受け口 ${document.querySelectorAll('[data-icon-box="true"]').length} 枚\n`
           + `SVG ${document.querySelectorAll('svg *').length} 要素`;
@@ -9617,6 +9629,15 @@ window.App = function App() {
     });
     // 奥から手前へソート（painter's algorithm）。JS の sort は安定
     allFaces.sort((a, b) => b.depth - a.depth);
+    const { frontSign, solidSign } = _cabFaceSigns(allFaces);
+    if (typeof window !== 'undefined') {
+      const a = window.__cabFaceListStat || (window.__cabFaceListStat = { 回: 0, ms: 0, 面: 0 });
+      a.回++; a.ms += (performance.now() - _t0); a.面 = allFaces.length;
+    }
+    return { allFaces, frontSign, solidSign };
+  }, [proj]);
+  // 並べた面の列（奥→手前）から、裏面を落とす向きの符号を決める（SVG・canvas・WebGL が同じこれを呼ぶ）
+  const _cabFaceSigns = (allFaces) => {
     // ══ CSG立体は裏を向いた三角形を描かない ・2026-09-27 Codex監査済み ══
     //   一番手前の三角形の回り方を「手前向き」と決める（投影はアフィンなので図の中で一定）
     const _csgCull = !(typeof window !== 'undefined' && window.__CSG_CAB_CULL === false);
@@ -9641,12 +9662,24 @@ window.App = function App() {
       const cur = solidSign.get(k);
       if (!cur || it.depth < cur.depth) solidSign.set(k, { depth: it.depth, sign: it.area2 > 0 ? 1 : -1 });
     }
-    if (typeof window !== 'undefined') {
-      const a = window.__cabFaceListStat || (window.__cabFaceListStat = { 回: 0, ms: 0, 面: 0 });
-      a.回++; a.ms += (performance.now() - _t0); a.面 = allFaces.length;
-    }
-    return { allFaces, frontSign, solidSign };
-  }, [proj]);
+    return { frontSign, solidSign };
+  };
+  // ── 面の明るさ・円柱の側面の段の色（SVG・canvas・WebGL が同じこれを呼ぶ）・2026-11-28 ──
+  //   WebGL は形を置くときに1回だけ色を決めるので、段の決め方を _cabSolidsPlan の中に閉じ込めず外へ出した（式は1つのまま）
+  const _cabFaceBright = (n0) => { const _n = n0 || { nx: 0, ny: 0, nz: 1 };
+    return (typeof bcFaceShade === 'function') ? bcFaceShade(_n)
+      : Math.min(1, 0.62 + 0.42 * Math.max(0, _n.nx * 0.40 + _n.ny * (-0.28) + _n.nz * 0.87)); };
+  const _CAB_CYL_BANDS = 20;
+  // 同じ色・同じ明るさの段の色は何度も作らない（回すたびに円柱の側面の数だけ呼ばれる・2026-11-28 実測で1コマ約1ms）。
+  //   中身は csgShadeColor そのもの（覚えておくだけ）。上限を超えたら捨てて作り直す
+  const _cabCylFillMemo = useRef(new Map()).current;
+  const _cabCylFill = (solid, 明) => { const _地 = (solid && solid.color) || '#6B7A8D';
+    if (typeof csgShadeColor !== 'function') return _地;
+    const k = _地 + '|' + 明; let v = _cabCylFillMemo.get(k);
+    if (v === undefined) { if (_cabCylFillMemo.size > 4096) _cabCylFillMemo.clear(); v = csgShadeColor(_地, 明); _cabCylFillMemo.set(k, v); }
+    return v; };
+  const _cabCylBright = (normal) => Math.round(_cabFaceBright(normal) * _CAB_CYL_BANDS) / _CAB_CYL_BANDS;
+  const _cabCylBand = (solid, normal) => { const 明 = _cabCylBright(normal); return { 明, fill: _cabCylFill(solid, 明) }; };
   // ══ 面を「描くか・どう束ねるか」を決める（SVG と canvas が同じこれを使う）・2026-11-28 ══
   // 【なぜ切り出すか】カメラを動かしている間は建物を canvas に描く（下の _useCabSolidsCanvas）。
   //   描く・描かない（裏面）と円柱の側面の束ね方を2か所に書くと、止めた瞬間に絵が変わる。
@@ -9656,9 +9689,7 @@ window.App = function App() {
     const _cylOne = !(typeof window !== 'undefined' && window.__CYL_AS_ONE === false);
     const _cullOn = (typeof window !== 'undefined' && window.__CAB_BACKFACE_CULL === true);
     const _帯色 = !(typeof window !== 'undefined' && window.__CYL_SHADE_BANDS === false);
-    const _明 = (n0) => { const _n = n0 || { nx: 0, ny: 0, nz: 1 };
-      return (typeof bcFaceShade === 'function') ? bcFaceShade(_n)
-        : Math.min(1, 0.62 + 0.42 * Math.max(0, _n.nx * 0.40 + _n.ny * (-0.28) + _n.nz * 0.87)); };
+    const _明 = _cabFaceBright;
     // 円柱の側面を立体ごとに先に集める（allFaces の順＝奥→手前）
     const 側ら = new Map();
     if (_cylOne) for (const it of allFaces) {
@@ -9684,18 +9715,16 @@ window.App = function App() {
         const _符 = _近 ? (_近.area2 > 0 ? 1 : -1) : 0;
         const _側 = (_符 && !solid._preview) ? _全側.filter(q => q.area2 * _符 > 0) : _全側;
         if (!_側.length) { 決.set(it, { 飛ばす: true }); continue; }
-        const _地 = solid.color || '#6B7A8D';
-        const _段数 = 20;
         let 束;
         if (!_帯色) {
           const _b = _側.reduce((a, q) => a + _明(q.face.normal), 0) / _側.length;
           束 = [{ 明: _b, 面ら: _側 }];
         } else {
           const m = new Map();
-          for (const q of _側) { const _b = Math.round(_明(q.face.normal) * _段数) / _段数; if (!m.has(_b)) m.set(_b, []); m.get(_b).push(q); }
+          for (const q of _側) { const _b = _cabCylBright(q.face.normal); if (!m.has(_b)) m.set(_b, []); m.get(_b).push(q); }
           束 = [...m.keys()].sort((a, b) => a - b).map(_b => ({ 明: _b, 面ら: m.get(_b) }));
         }
-        for (const t of 束) t.fill = (typeof csgShadeColor === 'function') ? csgShadeColor(_地, t.明) : _地;
+        for (const t of 束) t.fill = _cabCylFill(solid, t.明);
         決.set(it, { 円柱: 束, 帯色: _帯色 });
         continue;
       }
@@ -15179,13 +15208,148 @@ window.App = function App() {
   //   （makeProjector: x = rx*zoom + panX + CAB_W/2）。canvas の変換で合わせる＝面の列を作り直さない。
   //   旗 window.__CAB_SOLIDS_REUSE_LIST = false で毎コマ作り直す
   const cabSolidsListRef = useRef(null);
+  // ══ 動かしている間の建物を WebGL（GPU）で描く・2026-11-28 ユーザー要望 ══
+  // 【要望】「画像の規模（約600件）にしたらさすがに重くなった。国土地理院の地球儀モードのように軽くできんのか」
+  // 【発生源（実測・大分の製油所の範囲を本物のタイルで取り込み、建物 292棟・面 2,323枚）】
+  //   回転のたびに全部の面を JS で投影し直し（約7ms）、canvas に線を引き直していた（約9ms）＝面の数に比例して重い。
+  // 【直し方】地面と同じく形を1回だけ GPU に置き、動かしている間は「見る向き（行列）」だけを送る（src/solidsGL.js）。
+  //   回転のときは面ごとの奥行き（重心）と回り方（面積ベクトルとの内積）だけ計算して並べ直す（頂点は投影しない）。
+  //   色・不透明度・線（_cabFaceLook）、描く・描かない・円柱の束ね方（_cabSolidsPlan）、裏面の符号（_cabFaceSigns）は
+  //   SVG・canvas と同じ関数を呼ぶ＝見た目の決め方は1つ。WebGL が使えなければ従来の canvas 2D に落ちる。
+  //   旗 window.__CAB_SOLIDS_WEBGL = false で従来（canvas 2D）
+  const solidsGLCanvasRef = useRef(null);
+  const solidsGLRef = useRef(null);        // { gl, ... } or { gl: null, 失敗 }
+  const solidsGLDataRef = useRef(null);    // 形を置いたときの面の列と版
+  const _sglOn = () => !(typeof window !== 'undefined' && window.__CAB_SOLIDS_WEBGL === false)
+    && typeof solidsGLCreate === 'function' && typeof makeProjMatrix === 'function';
+  const _sglInfo = (o) => { if (typeof window !== 'undefined') { const 前 = window.__cabSolidsGLInfo || {}; window.__cabSolidsGLInfo = { ...前, ...o, 回: (前.回 || 0) + 1 }; } };
+  const _drawSolidsGL = () => {
+    const cv = solidsGLCanvasRef.current, cab = cabRef.current;
+    if (!cv || !cab) return false;
+    // 段の色を平均で決める旗（陽性対照）のときは、色がカメラで変わるので canvas 2D に任せる
+    if (typeof window !== 'undefined' && window.__CYL_SHADE_BANDS === false) return false;
+    if (!solidsGLRef.current) solidsGLRef.current = solidsGLCreate(cv);
+    // GPU がリセットされて戻ったら作り直す（頂点・シェーダは消えている）
+    if (solidsGLRef.current && solidsGLRef.current.gl && solidsGLUsable(solidsGLRef.current) === '作り直す') {
+      solidsGLRef.current = solidsGLCreate(cv);
+    }
+    const G = solidsGLRef.current;
+    if (!G || !G.gl) { _sglInfo({ 失敗: (G && G.失敗) || 'webgl が使えない' }); return false; }
+    if (solidsGLUsable(G) !== '使える') { _sglInfo({ 失敗: 'GPU がリセット中' }); return false; }
+    const rect = cab.getBoundingClientRect();
+    const cw = rect.width, ch = rect.height;
+    if (cw <= 0 || ch <= 0) return false;
+    const t0 = performance.now();
+    const 立体ら = [solids, csgSolids, sketchSolids, previewSolids];
+    const _zk = _bldZPx(1);
+    let D = solidsGLDataRef.current;
+    const _同じ形 = D && D.look === _cabFaceLook && D.zk === _zk && D.立体ら.every((a, k) => a === 立体ら[k]);
+    if (!_同じ形) {
+      // 形を置く（立体が変わったときだけ）。面の並び（立体の順・面の順）は _cabFaceList と同じ
+      const 全 = [...(solids || []), ...((csgSolids && csgSolids.length) ? csgSolids : []), ...(sketchSolids || []), ...(previewSolids || [])];
+      const _cylOne = !(typeof window !== 'undefined' && window.__CYL_AS_ONE === false);
+      const 列 = [], pieces = [];
+      const hw = TW / 2, hh = TH / 2;
+      for (const solid of 全) {
+        if (!solid || !solid.faces) continue;
+        for (const f of solid.faces) {
+          if (!f.vertices || f.vertices.length < 3) continue;
+          const V = f.vertices, n = V.length;
+          // 重心（奥行きの計算用・makeProjector と同じ座標: cx = x - hw, cy = -(y - hh), cz = グリッドpx の高さ）
+          let mx = 0, my = 0, mz = 0;
+          for (const v of V) { mx += v.x; my += v.y; mz += (v.z || 0); }
+          mx /= n; my /= n; mz /= n;
+          // 面積ベクトル（x, y, グリッドpx の高さ）。画面上の回り方 area2 = zoom² ×（向きのベクトル・これ）
+          let Nx = 0, Ny = 0, Nz = 0;
+          for (let i = 0; i < n; i++) {
+            const a = V[i], b = V[(i + 1) % n];
+            const az_ = (a.z || 0) * _zk, bz_ = (b.z || 0) * _zk;
+            Nx += a.y * bz_ - az_ * b.y; Ny += az_ * b.x - a.x * bz_; Nz += a.x * b.y - a.y * b.x;
+          }
+          const 明 = _cabFaceBright(f.normal);
+          let fill, stroke = null, lw = 0;
+          if (_cylOne && solid._circle && f.type !== 'top' && f.type !== 'bottom') {
+            // 円柱の側面は段の色（_cabSolidsPlan と同じ）。不透明度 0.95・線なし（canvas と同じ）
+            const c = sglParseColor(_cabCylBand(solid, f.normal).fill) || [107, 122, 141, 1];
+            fill = [c[0], c[1], c[2], 0.95 * c[3]];
+          } else {
+            const 見 = _cabFaceLook(solid, 明, false);
+            const c = sglParseColor(見.fill) || [107, 122, 141, 1];
+            fill = [c[0], c[1], c[2], (見.fillOpacity == null ? 1 : 見.fillOpacity) * c[3]];
+            if (見.stroke && 見.stroke !== 'none' && 見.strokeWidth > 0) {
+              const k = sglParseColor(見.stroke);
+              if (k) { stroke = k; lw = 見.strokeWidth; }
+            }
+          }
+          pieces.push({ pts: V.map(v => ({ x: v.x, y: v.y, z: v.z || 0 })), fill, stroke, lw });
+          列.push({ face: f, solid, depth: 0, area2: 0, piece: pieces.length - 1,
+            cx: mx - hw, cy: -(my - hh), cz: mz * _zk, Nx, Ny, Nz });
+        }
+      }
+      const B = solidsGLBuild(pieces);
+      const 版 = ((D && D.版) || 0) + 1;
+      D = { 立体ら, look: _cabFaceLook, zk: _zk, 列, 版, B, az: null, el: null, 面: 列.length, 頂点: B.頂点 };
+      solidsGLDataRef.current = D;
+    }
+    // GPU に置いた形が今の版でなければ送る（形が変わったとき・GPU がリセットから戻って作り直したとき）
+    if (G.版 !== D.版 && !solidsGLUpload(G, D.B, D.版)) { _sglInfo({ 失敗: '頂点が多すぎる（この GPU では 65,536 まで）' }); return false; }
+    // 並べ直し（向きが変わったときだけ。移動・拡大縮小は平行投影なので順序も裏表も変わらない）
+    const c5 = _camNow();
+    let 並べた = false;
+    if (D.az !== c5[0] || D.el !== c5[1] || G.並べ !== D.版) {
+      const cosA = Math.cos(c5[0]), sinA = Math.sin(c5[0]), cosE = Math.cos(c5[1]), sinE = Math.sin(c5[1]);
+      const z2 = (c5[2] || 1) * (c5[2] || 1);
+      const wx = -sinA * cosE, wy = cosA * cosE, wz = sinE;
+      for (const it of D.列) {
+        it.depth = (it.cx * sinA + it.cy * cosA) * cosE - it.cz * sinE;
+        it.area2 = z2 * (wx * it.Nx + wy * it.Ny + wz * it.Nz);
+      }
+      // 奥→手前（JS の sort は安定＝同じ奥行きは元の並び順。_cabFaceList と同じ）
+      const _t1 = performance.now();
+      const allFaces = D.列.slice().sort((a, b) => b.depth - a.depth);
+      const _t2 = performance.now();
+      const { frontSign, solidSign } = _cabFaceSigns(allFaces);
+      const 決 = _cabSolidsPlan(allFaces, frontSign, solidSign);
+      D.内訳 = { 並べ: +(_t2 - _t1).toFixed(1), 決め: +(performance.now() - _t2).toFixed(1) };
+      const 順 = D.順 || (D.順 = new Int32Array(allFaces.length));
+      let m = 0;
+      for (const it of allFaces) {
+        const d = 決.get(it); if (!d || d.飛ばす) continue;
+        if (d.円柱) { for (const t of d.円柱) for (const q of t.面ら) 順[m++] = q.piece; continue; }
+        順[m++] = it.piece;
+      }
+      solidsGLOrder(G, 順, m);
+      G.並べ = D.版; D.az = c5[0]; D.el = c5[1]; D.描く面 = m;
+      並べた = true;
+    }
+    const _M = makeProjMatrix(c5[0], c5[1], c5[2], c5[3], c5[4], { cw, ch, zMul: _zk * (_mpp || 1) });
+    const sc = Math.min(cw / CAB_W, ch / CAB_H);
+    const dpr = window.devicePixelRatio || 1;
+    const 三角 = solidsGLDraw(G, _M, cw, ch, dpr, sc);
+    cv._描いた = true;
+    _sglInfo({ 失敗: null, 面: D.面, 描く面: D.描く面, 頂点: D.頂点, 番号: 三角, 送った: !!G.送った, 並べた, 内訳: D.内訳,
+      並べ直し: ((window.__cabSolidsGLInfo || {}).並べ直し || 0) + (並べた ? 1 : 0), ms: +(performance.now() - t0).toFixed(1) });
+    return true;
+  };
   const _drawSolidsCanvas = (moving) => {
     const cv = solidsCanvasRef.current; if (!cv) return;
+    const gcv = solidsGLCanvasRef.current;
     if (!moving) {
       if (cv._描いた) { const c0 = cv.getContext('2d'); c0.setTransform(1, 0, 0, 1, 0, 0); c0.clearRect(0, 0, cv.width, cv.height); cv._描いた = false; }
+      if (gcv && gcv._描いた) { solidsGLClear(solidsGLRef.current); gcv._描いた = false; }
       cabSolidsListRef.current = null;
       return;
     }
+    if (_sglOn()) {
+      let ok = false;
+      try { ok = _drawSolidsGL(); } catch (e) { solidsGLRef.current = { gl: null, 失敗: String(e && e.message).slice(0, 120) }; _sglInfo({ 失敗: solidsGLRef.current.失敗 }); }
+      if (ok) {
+        // 2D の canvas に前の絵が残っていたら消す（片方だけが描く）
+        if (cv._描いた) { const c0 = cv.getContext('2d'); c0.setTransform(1, 0, 0, 1, 0, 0); c0.clearRect(0, 0, cv.width, cv.height); cv._描いた = false; }
+        return;
+      }
+    }
+    if (gcv && gcv._描いた) { solidsGLClear(solidsGLRef.current); gcv._描いた = false; }
     const t0 = performance.now();
     const b = _cabCanvasBegin(cv); if (!b) return;
     const ctx = b.ctx;
@@ -16948,6 +17112,7 @@ window.App = function App() {
           overflow="hidden">
           <GsiMapPanel
             demSource={uiSettingValue(uiSettings, 'terrainSource')}
+            importMax={(typeof gsiImportMaxOf === 'function') ? gsiImportMaxOf(uiSettingValue(uiSettings, 'gsiImportMax')) : 2000}
             baseMap={(typeof GSI_BASEMAPS !== 'undefined')
               ? (GSI_BASEMAPS[uiSettingValue(uiSettings, 'gsiBaseMap')] || GSI_BASEMAPS[0]).id : 'std'}
             terrain={terrain}
@@ -19859,6 +20024,9 @@ window.App = function App() {
               pointerEvents: 'none', opacity: 0.7 }} />
           {/* 建物の面（ドラッグで動かしている間だけ。ボタンを離すと SVG の面に戻る）・2026-11-28 */}
           <canvas ref={solidsCanvasRef} data-cab-solids-canvas="1"
+            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }} />
+          {/* 同じ役目の WebGL 版（地球儀モードと同じく形は GPU に置いたまま・2026-11-28）。描くのはどちらか一方 */}
+          <canvas ref={solidsGLCanvasRef} data-cab-solids-gl="1"
             style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }} />
           <svg viewBox={`0 0 ${CAB_W} ${CAB_H}`} preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}>
             {/* 地形の輪郭・等高線・崖（面は上の canvas）。線なので SVG のままで軽い */}

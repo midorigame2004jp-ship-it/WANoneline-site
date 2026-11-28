@@ -13,7 +13,7 @@
 // ・「地面を作る」は terrain.js の parseTerrainJSON が受ける形を作って onTerrain へ渡す。
 //   3次元図は既存の terrainMesh の経路でそのまま描く（描き手を増やさない）。
 
-function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuildings, onRemoveBuildings, baseMap }) {
+function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuildings, onRemoveBuildings, baseMap, importMax }) {
   const boxRef = React.useRef(null);
   const [size, setSize] = React.useState({ w: 480, h: 320 });
   const [view, setView] = React.useState(() => {
@@ -35,6 +35,8 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   const 範囲の案内 = 'ドラッグで四角を囲む／クリックで点をつなぎ、始点をクリックで閉じる（Backspace で1点戻す・Esc でやめる）';
   const [busy, setBusy] = React.useState(null);       // 取得中の進捗の文字
   const [msg, setMsg] = React.useState('');
+  // 取り込み対象が上限より多いときの確認（すべて読み込む／上限まで／やめる）。{ items, 情報, 超え: [{名, 数}], 上限 }
+  const [取り込み確認, set取り込み確認] = React.useState(null);
   const dragRef = React.useRef(null);
 
   // 窓の大きさに合わせる
@@ -119,9 +121,13 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     if (!b) { setMsg('図面の範囲が決まっていません（先に「3次元範囲を設定」）'); return; }
     if (typeof gsiLoadBuildings !== 'function') { setMsg('ベクトルタイルの読み取りが読み込まれていません'); return; }
     if (typeof geoToGrid !== 'function') { setMsg('座標の変換が読み込まれていません'); return; }
-    setBusy(true); setMsg('建物を取り寄せています…');
+    setBusy(true); setMsg('建物を取り寄せています…'); set取り込み確認(null);
     try {
+      // 【まず全部数える・2026-11-28 ユーザー要望「読み込み対象の数が上限よりも多いという趣旨と、すべて読み込むかどうかのボタンを出す」】
+      //   上限で途中止めにすると「本当は何件あるか」が分からない。読み取りは上限なしで行い（安全のため1種類 10万件で止める）、
+      //   取り込む前に上限と比べて、多ければ聞く。
       const r = await gsiLoadBuildings(b, {
+        上限: 100000,
         onProgress: (i, n, c) => setMsg('タイル ' + i + '/' + n + '…（' + c + '件）'),
       });
       // 【ring 以外は機械的に運ぶ・2026-11-24】
@@ -180,6 +186,47 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
         delete 他._G;
         return Object.assign(他, { points: it._G || _グ(it.ring || []) });
       });
+      const 情報 = { r, 範囲の外, 切り取った };
+      // 上限と比べる（1つの種類＝レイヤごと）
+      // 検査用の口（製品は使わない）: window.__GSI_IMPORT_MAX_OVERRIDE に数を入れると上限をそれにする
+      const _試 = (typeof window !== 'undefined' && Number.isFinite(window.__GSI_IMPORT_MAX_OVERRIDE)) ? window.__GSI_IMPORT_MAX_OVERRIDE : null;
+      const 上限 = _試 != null ? _試 : ((Number.isFinite(importMax) || importMax === Infinity) ? importMax : 2000);
+      const 数え = {};
+      for (const it of items) 数え[it.layer] = (数え[it.layer] || 0) + 1;
+      const 超え = Object.keys(数え).filter(k => 数え[k] > 上限).map(k => ({ 層: k, 名: _層の名前(k), 数: 数え[k] }));
+      if (超え.length && !(typeof window !== 'undefined' && window.__GSI_IMPORT_ASK_OVER_MAX === false)) {
+        set取り込み確認({ items, 情報, 超え, 上限, 合計: items.length });
+        setMsg('');
+        return;
+      }
+      _取り込みを仕上げる(items, 情報, null);
+    } catch (e) { setMsg('取り込みに失敗: ' + (e && e.message)); }
+    finally { setBusy(false); }
+  };
+  // 層の名前（知らせに出す）
+  const _層の名前 = (k) => ({ building: '建物', structurea: '構造物（タンクなど）', waterarea: '水面', road: '道路' })[k] || k;
+  // 上限まで: 1つの種類ごとに、図面の真ん中に近い順に上限の数だけ残す（取り寄せた順＝北西から並ぶので、順に切ると片寄る）
+  const _上限まで = (items, 上限) => {
+    const cx = (typeof TW !== 'undefined' ? TW : 0) / 2, cy = (typeof TH !== 'undefined' ? TH : 0) / 2;
+    const 中心 = (it) => { const P = it.points || it.輪 || it.中心線 || []; if (!P.length) return 0;
+      let x = 0, y = 0; for (const q of P) { x += q.x; y += q.y; } x /= P.length; y /= P.length; return (x - cx) * (x - cx) + (y - cy) * (y - cy); };
+    const 層ごと = {};
+    items.forEach((it, i) => { (層ごと[it.layer] = 層ごと[it.layer] || []).push({ it, i, d: 中心(it) }); });
+    const 残す = new Set();
+    for (const k of Object.keys(層ごと)) { const a = 層ごと[k].sort((p, q) => p.d - q.d); a.slice(0, 上限).forEach(e => 残す.add(e.i)); }
+    return items.filter((_, i) => 残す.has(i));
+  };
+  const 確認に答える = (どれ) => {
+    const c = 取り込み確認; if (!c) return;
+    set取り込み確認(null);
+    if (どれ === 'やめる') { setMsg('取り込みをやめました（読み込み対象 ' + c.合計 + ' 件）'); return; }
+    const 選んだ = どれ === 'すべて' ? c.items : _上限まで(c.items, c.上限);
+    _取り込みを仕上げる(選んだ, c.情報, どれ === 'すべて' ? null : { 上限: c.上限, 落とした: c.items.length - 選んだ.length });
+  };
+  // 取り込んで知らせを作る（上限の確認の後もここ1か所）
+  const _取り込みを仕上げる = (items, 情報, 上限で削った) => {
+    const { r, 範囲の外, 切り取った } = 情報;
+    try {
       const res = (typeof onBuildings === 'function') ? onBuildings(items) : null;
       const 内訳 = {};
       for (const it of items) 内訳[it.種別] = (内訳[it.種別] || 0) + 1;
@@ -205,7 +252,8 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (r.範囲外の種類 && !r.道路の面) 行.push('道路の縁の線など ' + r.範囲外の種類 + ' 本は取り込んでいません（道路は中心線だけを帯にします）');
       if (r.切れ) 行.push('タイルの境目で切れた形 ' + r.切れ + ' 件（端がまっすぐに見えます）');
       if (res && res.交差) 行.push('形が自分と交わっていた ' + res.交差 + ' 件は落としました');
-      if (r.上限超過) 行.push('上限に達したので途中で止めました（範囲を狭めてください）');
+      if (r.上限超過) 行.push('読み取りの安全上限（1種類 10万件）に達したので途中で止めました（範囲を狭めてください）');
+      if (上限で削った) 行.push('上限（1種類 ' + 上限で削った.上限.toLocaleString() + ' 件）を超えた ' + 上限で削った.落とした + ' 件は取り込んでいません（図面の真ん中に近いものから残しました。上限は歯車で変えられます）');
       // 【高さの知らせは「実データの高さを持たないもの」だけに言う・2026-11-24】
       //   道路は 0.12m の板なので『高さは仮の10m』は嘘になる（Codex監査の指摘）。
       // 【地面に塗る面（道路・交差点の角）は高さを持たないので数えない・2026-11-27】
@@ -221,7 +269,6 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       行.push('出典: 国土地理院ベクトルタイル提供実験');
       setMsg(行.join('／'));
     } catch (e) { setMsg('取り込みに失敗: ' + (e && e.message)); }
-    finally { setBusy(false); }
   };
   // ── 操作 ──
   const 閉じる距離px = 10;   // 始点からこの距離以内をクリックしたら閉じる
@@ -492,6 +539,19 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
         </div>
       </div>
 
+      {/* 取り込み対象が上限より多いときの確認（2026-11-28） */}
+      {取り込み確認 && (
+        <div data-gsi-import-ask="1" style={{ fontSize: 12, padding: '6px 8px', background: '#422006', borderTop: '1px solid #f59e0b', lineHeight: '17px' }}>
+          <div>読み込み対象が上限（1つの種類あたり {取り込み確認.上限.toLocaleString()} 件）より多くあります：
+            {取り込み確認.超え.map(x => x.名 + ' ' + x.数.toLocaleString() + ' 件').join('・')}（合計 {取り込み確認.合計.toLocaleString()} 件）。
+            すべて読み込むと3次元図が重くなることがあります。</div>
+          <div style={{ display: 'flex', gap: 6, marginTop: 5, flexWrap: 'wrap' }}>
+            <button data-gsi-import-ask-btn="all" style={ボタン('rgba(234,88,12,0.95)')} onClick={() => 確認に答える('すべて')}>すべて読み込む（{取り込み確認.合計.toLocaleString()} 件）</button>
+            <button data-gsi-import-ask-btn="max" style={ボタン('rgba(59,130,246,0.9)')} onClick={() => 確認に答える('上限まで')}>上限まで読み込む</button>
+            <button data-gsi-import-ask-btn="cancel" style={ボタン('rgba(100,116,139,0.9)')} onClick={() => 確認に答える('やめる')}>やめる</button>
+          </div>
+        </div>
+      )}
       {/* 知らせ */}
       <div style={{ fontSize: 11, padding: '3px 6px', background: '#1e293b', minHeight: 18, lineHeight: '14px' }}>
         {busy ? busy : (msg || (pickMode ? 範囲の案内 : '水色の点線＝いまの図面の範囲／黄色＝フィールド'))}

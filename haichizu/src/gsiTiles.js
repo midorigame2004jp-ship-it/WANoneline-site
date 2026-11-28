@@ -1345,7 +1345,15 @@ const GSI_IMPORT_LAYERS = {
                 ズーム: 16,
                 旗: '__GSI_ROAD' },
 };
-const GSI_IMPORT_MAX = 400;      // 一度に取り込む上限（3次元図が重くなるため）
+const GSI_IMPORT_MAX = 400;      // 一度に取り込む上限（3次元図が重くなるため）。opts.上限 を渡せばそちらが優先
+// 【取り込みの上限は歯車で選ぶ・2026-11-28 ユーザー要望「建物読み込みの上限もっと上げてくれ。というか設定できるようにしてくれ」】
+//   値は「1つの種類（建物・構造物・水面・道路）あたりの件数」。選択肢の表はここ1か所（App.jsx の歯車の台帳もこれから作る）。
+const GSI_IMPORT_MAX_CHOICES = [
+  { v: 0, 件: 400, label: '400件（従来）' }, { v: 1, 件: 1000, label: '1,000件' }, { v: 2, 件: 2000, label: '2,000件' },
+  { v: 3, 件: 5000, label: '5,000件' }, { v: 4, 件: 10000, label: '10,000件' }, { v: 5, 件: Infinity, label: '上限なし' },
+];
+const GSI_IMPORT_MAX_DEFAULT = 2;   // 2,000件
+function gsiImportMaxOf(v) { const r = GSI_IMPORT_MAX_CHOICES.find(c => c.v === v); return r ? r.件 : GSI_IMPORT_MAX_CHOICES[GSI_IMPORT_MAX_DEFAULT].件; }
 const GSI_MIN_EDGE_M = 0.1;      // これより短い辺は落とす
 const GSI_STRAIGHT_M = 0.05;     // 一直線とみなす許容
 
@@ -1803,6 +1811,8 @@ async function gsiLoadBuildings(bounds, opts) {
   let 交差点の角 = 0;
   let 道路の面 = 0, 面に置き換えた線 = 0, 道路の島 = 0, 水面の島 = 0;   // 縁の線から作った道路の面の数・面に置き換えた中心線の数     // 道路縁の線から角の形を取った交差点の数
   // 【上限はレイヤごと・2026-11-24】建物と道路で枠を分ける。混ぜると道路が枠を食って建物が途中で止まる
+  //   opts.上限（数）を渡せば全レイヤ共通でそれを使う（Infinity で止めない）。渡さなければ従来（表の上限か GSI_IMPORT_MAX）
+  const _上限 = (表) => (Number.isFinite(o.上限) || o.上限 === Infinity) ? o.上限 : (表.上限 || GSI_IMPORT_MAX);
   const 層数 = {};
   const 鍵 = new Set();
   let タイル総数 = 0;
@@ -1897,7 +1907,7 @@ async function gsiLoadBuildings(bounds, opts) {
                 const key = L.name + ':' + tx + '/' + ty + ':' + la.toFixed(6) + ',' + lo.toFixed(6) + ':' + (_n++);
                 if (鍵.has(key)) continue;
                 鍵.add(key);
-                if ((層数[L.name] || 0) >= (表.上限 || GSI_IMPORT_MAX)) { 上限超過 = true; break; }
+                if ((層数[L.name] || 0) >= _上限(表)) { 上限超過 = true; break; }
                 層数[L.name] = (層数[L.name] || 0) + 1;
                 // ★**輪（ring）を作らない**。中心線と幅だけ。帯は描く側が地面に乗せて作る
                 //   幅m＝帯の幅（実測なら左＋右）。区分幅m＝幅員区分の幅（線をつなぐときの「同じ道路か」に使う）。
@@ -1957,7 +1967,7 @@ async function gsiLoadBuildings(bounds, opts) {
               const key = L.name + ':' + tx + '/' + ty + ':' + (la / ll.length).toFixed(6) + ',' + (lo / ll.length).toFixed(6);
               if (鍵.has(key)) continue;
               鍵.add(key);
-              if ((層数[L.name] || 0) >= (表.上限 || GSI_IMPORT_MAX)) { 上限超過 = true; break; }
+              if ((層数[L.name] || 0) >= _上限(表)) { 上限超過 = true; break; }
               層数[L.name] = (層数[L.name] || 0) + 1;
               const _水 = { layer: L.name, ftCode: f.props.ftCode, 種別, key, 塗る: true, 輪: ll, color: 表.色 };
               if (_穴w.length) { _水.穴 = _穴w; 水面の島 += _穴w.length; }
@@ -1994,7 +2004,7 @@ async function gsiLoadBuildings(bounds, opts) {
             const key = L.name + ':' + la.toFixed(6) + ',' + lo.toFixed(6);
             if (鍵.has(key)) continue;
             鍵.add(key);
-            if ((層数[L.name] || 0) >= (表.上限 || GSI_IMPORT_MAX)) { 上限超過 = true; break; }
+            if ((層数[L.name] || 0) >= _上限(表)) { 上限超過 = true; break; }
             層数[L.name] = (層数[L.name] || 0) + 1;
             // 色は表から運ぶ（ここに `if (レイヤ名 === …)` を書かない＝SPEC §1）。
             //   旗 globalThis.__GSI_BLD_ONE_COLOR = false で渡さない＝App が通し番号で振る（従来・陽性対照）
