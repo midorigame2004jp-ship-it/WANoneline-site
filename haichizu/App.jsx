@@ -6476,7 +6476,38 @@ window.App = function App() {
       + 'font:11px/1.5 monospace;padding:4px 8px;border-radius:4px;pointer-events:none;white-space:pre';
     document.body.appendChild(el);
     let raf, last = performance.now(), frames = 0, acc = 0, fps = 0;
+    // 【1コマの内訳・2026-11-28 ユーザー報告「余計重くなった」（5 fps なのに 3次元図1回 9.7ms・GPU 1回 18.8ms＝JS は合計 30ms ほど）】
+    //   残りがどこで使われているかを、ブラウザの「長いコマ」の記録（long-animation-frame・Chrome 123 以降）で分ける。
+    //   ・スクリプト … JS（イベント・rAF・タイマー）。うち「強制レイアウト」は JS が寸法を読んで配置計算を割り込ませた分
+    //   ・配置と塗り … スタイル・レイアウト・塗りの記録（ページ側の描画）
+    //   ・ページの外での待ち … コマの間隔のうち、ページ（主スレッド）が何もしていなかった分＝GPU・合成の待ち
+    //   観測専用（表示を出しているときだけ動く）
+    let 長 = { n: 0, 合: 0, 脚: 0, 強: 0, 描: 0, 配: 0, 重: new Map() }, 長表 = null;
+    let _loaf = null;
+    try {
+      if (typeof PerformanceObserver !== 'undefined' && (PerformanceObserver.supportedEntryTypes || []).includes('long-animation-frame')) {
+        _loaf = new PerformanceObserver((list) => {
+          for (const e of list.getEntries()) {
+            長.n++; 長.合 += e.duration;
+            // 検査用の通算（表示を出してからの合計。製品は読まない）
+            if (typeof window !== 'undefined') { const T = window.__perfFrameTotal || (window.__perfFrameTotal = { n: 0, 合: 0, 脚: 0, 強: 0 });
+              T.n++; T.合 += e.duration; for (const sc of (e.scripts || [])) { T.脚 += sc.duration; T.強 += (sc.forcedStyleAndLayoutDuration || 0); } }
+            const 終 = e.startTime + e.duration;
+            if (e.renderStart > 0) 長.描 += Math.max(0, (e.styleAndLayoutStart > 0 ? e.styleAndLayoutStart : 終) - e.renderStart);
+            if (e.styleAndLayoutStart > 0) 長.配 += Math.max(0, 終 - e.styleAndLayoutStart);
+            for (const sc of (e.scripts || [])) {
+              長.脚 += sc.duration; 長.強 += (sc.forcedStyleAndLayoutDuration || 0);
+              const _f = String(sc.sourceURL || '').split('/').pop().split('?')[0];
+              const 名 = String(sc.invoker || sc.invokerType || '?').slice(0, 40) + (_f && !/\.html$/.test(_f) ? '（' + _f.slice(0, 24) + '）' : '');
+              長.重.set(名, (長.重.get(名) || 0) + sc.duration);
+            }
+          }
+        });
+        _loaf.observe({ type: 'long-animation-frame', buffered: false });
+      }
+    } catch (e) { _loaf = null; }
     let rend0 = _perfRef.current.renders, mv0 = _perfRef.current.camMoves;
+    let ces0 = null, 地表 = '';
     let rps = 0, mps = 0, drawMs = 0, cab0 = _perfRef.current.cabRenders || 0, cps = 0;
     const tick = (t) => {
       acc += t - last; last = t; frames++;
@@ -6488,8 +6519,32 @@ window.App = function App() {
         cps = Math.round(((_perfRef.current.cabRenders || 0) - cab0) * 1000 / acc);
         rend0 = _perfRef.current.renders; mv0 = _perfRef.current.camMoves; cab0 = _perfRef.current.cabRenders || 0;
         drawMs = _perfRef.current.drawMs;
+        // Cesium の窓（CesiumJS 3D / 2D）が1秒にどれだけ描き、1コマ何 ms 使ったか（窓を開いていなければ出ない）
+        { const st = (typeof window !== 'undefined') && window.__cesiumLoopStat;
+          if (st) { const 今 = {}; for (const k of Object.keys(st)) 今[k] = { ...st[k] };
+            地表 = ces0 ? Object.keys(今).map(k => { const a = 今[k], b = ces0[k] || { 回: 0, ms: 0, 描: 0 }; const n = a.回 - b.回;
+              return 'Cesium ' + k + ' 描いた ' + Math.round((a.描 - b.描) * 1000 / acc) + ' 回/秒・1コマ ' + (n > 0 ? ((a.ms - b.ms) / n).toFixed(1) : '0') + ' ms\n'; }).join('') : '';
+            ces0 = 今; } }
+        // 長いコマ（50ms を超えたコマ）の内訳を1コマあたりに直す
+        if (_loaf) {
+          if (長.n) {
+            const 一 = (v) => (v / 長.n).toFixed(0);
+            const 間 = fps > 0 ? 1000 / fps : 0;
+            const 外 = Math.max(0, 間 - 長.合 / 長.n);
+            const 首 = [...長.重].sort((a, b) => b[1] - a[1])[0];
+            長表 = '長いコマ ' + 長.n + ' 回・1回 ' + 一(長.合) + ' ms\n'
+              + '  スクリプト ' + 一(長.脚) + ' ms（強制レイアウト ' + 一(長.強) + '）\n'
+              + '  rAF ' + 一(長.描) + ' ms・配置と塗り ' + 一(長.配) + ' ms\n'
+              + '  ページの外での待ち ' + 外.toFixed(0) + ' ms\n'
+              + (首 ? '  重い呼び元 ' + 首[0] + ' ' + (首[1] / 長.n).toFixed(0) + ' ms\n' : '');
+            if (typeof window !== 'undefined') window.__perfFrameBreakdown = { 回: 長.n, 一コマ: +(長.合 / 長.n).toFixed(1), スクリプト: +(長.脚 / 長.n).toFixed(1),
+              強制レイアウト: +(長.強 / 長.n).toFixed(1), rAF: +(長.描 / 長.n).toFixed(1), 配置と塗り: +(長.配 / 長.n).toFixed(1), 外での待ち: +外.toFixed(1),
+              呼び元: [...長.重].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => [k, +(v / 長.n).toFixed(1)]) };
+          } else 長表 = '長いコマ 0 回' + (fps > 0 && fps < 30 ? '（ページの中は1コマ 50ms 未満＝遅さはページの外）' : '') + '\n';
+          長 = { n: 0, 合: 0, 脚: 0, 強: 0, 描: 0, 配: 0, 重: new Map() };
+        }
         acc = 0; frames = 0;
-        el.textContent = `${fps} fps\nマウス ${mps} 回/秒\n画面の作り直し ${rps} 回/秒\n`
+        el.textContent = `${fps} fps\n` + (長表 || '') + `マウス ${mps} 回/秒\n画面の作り直し ${rps} 回/秒\n`
           + `1回の作り直し ${(_perfRef.current.renderMs || 0).toFixed(1)} ms\n`
           + `3次元図の作り直し ${cps} 回/秒\n3次元図1回 ${(_perfRef.current.cabRenderMs || 0).toFixed(1)} ms\n`
           + `奥行き順の計算 ${(_perfRef.current.orderMs || 0).toFixed(1)} ms\n盤の描画 ${drawMs.toFixed(1)} ms\n`
@@ -6497,6 +6552,7 @@ window.App = function App() {
           + (() => { const gi = window.__cabSolidsGLInfo; if (window.__CAB_SOLIDS_WEBGL === false) return '建物（動かしている間） 従来（旗で切っている）\n';
               if (!gi) return '建物（動かしている間） まだ動かしていない\n';
               return gi.失敗 ? ('建物（動かしている間） 従来（' + String(gi.失敗).slice(0, 40) + '）\n') : ('建物（動かしている間） GPU 1回 ' + gi.ms + ' ms\n'); })()
+          + 地表
           + `盤 ${placedPanelsRef.current ? placedPanelsRef.current.length : 0} 台\n`
           + `受け口 ${document.querySelectorAll('[data-icon-box="true"]').length} 枚\n`
           + `SVG ${document.querySelectorAll('svg *').length} 要素`;
@@ -6504,7 +6560,7 @@ window.App = function App() {
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
-    return () => { cancelAnimationFrame(raf); el.remove(); };
+    return () => { cancelAnimationFrame(raf); el.remove(); if (_loaf) try { _loaf.disconnect(); } catch (e) {} };
   }, [perfHud]);
   // 検査（checks/）から中身を見る・盤を1台置くための口。表示や操作は変えない
   useEffect(() => { window.__equipmentRecords = equipmentRecords; }, [equipmentRecords]);

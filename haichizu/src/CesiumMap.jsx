@@ -245,7 +245,13 @@ function _cesiumStartOwnLoop(viewer, el, mode) {
     if (viewer._ownLoopPaused) return;
     if (休み > 0) { 休み--; return; }
     try {
+      // 観測（速度表示 __perfHud() の「Cesium」の行・2026-11-28）: 1コマに使った時間と、本当に描いた回数
+      const _t0 = performance.now();
+      const _fs = viewer.scene && viewer.scene.frameState, _fn0 = _fs ? _fs.frameNumber : 0;
       viewer.resize(); viewer.render();
+      if (typeof window !== 'undefined') { const st = window.__cesiumLoopStat || (window.__cesiumLoopStat = {});
+        const m = st[mode || '?'] || (st[mode || '?'] = { 回: 0, ms: 0, 描: 0 });
+        m.回++; m.ms += performance.now() - _t0; if (_fs && _fs.frameNumber !== _fn0) m.描++; }
       if (連続) { 連続 = 0; _cesiumHideNote(el); }
     } catch (e) {
       const 情報 = _cesiumNoteError(e, '描画', mode);
@@ -263,6 +269,39 @@ function _cesiumStartOwnLoop(viewer, el, mode) {
   };
   viewer._ownLoopRaf = requestAnimationFrame(tick);
   return true;
+}
+// ══ 建物の頂点の印は entity でなく点の集まり（PointPrimitiveCollection）に置く・2026-11-28 ══
+// 【ユーザー報告】「余計重くなったんだが。とにかく建物をたくさん配置したときに重くなる」（3次元図を動かすと 5 fps）
+// 【発生源（実測・本物の Cesium 1.124・建物 539棟）】頂点を押す・光らせるための見えない印（1px・不透明度 0.01）を、
+//   頂点ごとに entity にしていた。Cesium は entity の点を**毎コマ全部**作り直す（PointVisualizer.update が
+//   位置・色・大きさを1つずつ読み直す）ので、CesiumJS の窓1つにつき1コマ約 25ms（3D と 2D の2つで約 50ms）を
+//   **止まっているときも**使っていた。何も描かないコマでも時計を進めるたびに走る。
+// 【直し方】印は点の集まり（変えたときだけ更新される）に置く。見た目・押す・光らせる（picked.id._vertexInfo と
+//   picked.id.point.pixelSize 等）は同じ形のまま＝押した結果の id に { _vertexInfo, point } を入れる。
+//   消すのは _cesiumRemoveBldExtra 1か所（entity と印を見分ける）。
+//   旗 window.__CESIUM_VERT_POINTS_PRIMITIVE = false で従来（entity）＝陽性対照。
+function _cesiumVertPointsOn() {
+  return !(typeof window !== 'undefined' && window.__CESIUM_VERT_POINTS_PRIMITIVE === false);
+}
+function _cesiumAddVertMarker(v, position, info) {
+  if (!_cesiumVertPointsOn()) {
+    return v.entities.add({
+      position,
+      point: { pixelSize: 1, color: Cesium.Color.CYAN.withAlpha(0.01), outlineColor: Cesium.Color.CYAN, outlineWidth: 0, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+      _vertexInfo: info,
+    });
+  }
+  if (!v._vertPoints || v._vertPoints.isDestroyed()) v._vertPoints = v.scene.primitives.add(new Cesium.PointPrimitiveCollection());
+  const M = { _vertexInfo: info, _isVertMarker: true, point: null };
+  M.point = v._vertPoints.add({ position, pixelSize: 1, color: Cesium.Color.CYAN.withAlpha(0.01), outlineColor: Cesium.Color.CYAN,
+    outlineWidth: 0, disableDepthTestDistance: Number.POSITIVE_INFINITY, id: M });
+  return M;
+}
+// 建物の追加の部品を消す（entity でも頂点の印でも）
+function _cesiumRemoveBldExtra(v, e) {
+  if (!e) return;
+  if (e._isVertMarker) { if (v._vertPoints && !v._vertPoints.isDestroyed() && e.point) v._vertPoints.remove(e.point); e.point = null; return; }
+  if (v.entities.contains(e)) v.entities.remove(e);
 }
 function _cesiumStopOwnLoop(viewer) {
   if (!viewer || !viewer._ownLoop) return;
@@ -1101,7 +1140,7 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
         for (const [cid, cac] of v._solidCache) {
           if (!_activeIds.has(cid)) {
             if (cac.labelEnt && v.entities.contains(cac.labelEnt)) v.entities.remove(cac.labelEnt);
-            (cac.extraEnts || []).forEach(e => { if (e && v.entities.contains(e)) v.entities.remove(e); });
+            (cac.extraEnts || []).forEach(e => _cesiumRemoveBldExtra(v, e));
             v._solidCache.delete(cid);
           }
         }
@@ -1115,7 +1154,7 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
           v._bldEntities.forEach(e => { if (e && !_cachedEntitySet.has(e) && v.entities.contains(e)) v.entities.remove(e); });
         }
         if (v._bldExtraEntities) {
-          v._bldExtraEntities.forEach(e => { if (e && !_cachedEntitySet.has(e) && v.entities.contains(e)) v.entities.remove(e); });
+          v._bldExtraEntities.forEach(e => { if (e && !_cachedEntitySet.has(e)) _cesiumRemoveBldExtra(v, e); });
         }
         v._bldEntities = [];
         v._bldExtraEntities = [];
@@ -1240,11 +1279,8 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
                 if (addedKeys.has(key)) return;
                 addedKeys.add(key);
                 const g = gridToGeo(vt.x, vt.y);
-                v._bldExtraEntities.push(v.entities.add({
-                  position: Cesium.Cartesian3.fromDegrees(g.lng, g.lat, localBaseElev + vt.z),
-                  point: { pixelSize: 1, color: Cesium.Color.CYAN.withAlpha(0.01), outlineColor: Cesium.Color.CYAN, outlineWidth: 0, disableDepthTestDistance: Number.POSITIVE_INFINITY },
-                  _vertexInfo: { solidIdx, faceId: face2.id, vertIdx: vi, gx: vt.x, gy: vt.y, gz: vt.z },
-                }));
+                v._bldExtraEntities.push(_cesiumAddVertMarker(v, Cesium.Cartesian3.fromDegrees(g.lng, g.lat, localBaseElev + vt.z),
+                  { solidIdx, faceId: face2.id, vertIdx: vi, gx: vt.x, gy: vt.y, gz: vt.z }));
               });
             });
           });
@@ -1296,7 +1332,7 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
           }
           if (_cac) {
             if (_cac.labelEnt && v.entities.contains(_cac.labelEnt)) v.entities.remove(_cac.labelEnt);
-            (_cac.extraEnts || []).forEach(e => { if (e && v.entities.contains(e)) v.entities.remove(e); });
+            (_cac.extraEnts || []).forEach(e => _cesiumRemoveBldExtra(v, e));
           }
           // 配列を一時的にper-solidコレクターに差し替え（_addWallPolyなどの全pushが捕捉される）
           const _mainBldEnts = v._bldEntities;
@@ -1533,17 +1569,8 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
               if (addedVertKeys.has(key)) return;
               addedVertKeys.add(key);
               const g = gridToGeo(vt.x, vt.y);
-              const ptEnt = v.entities.add({
-                position: Cesium.Cartesian3.fromDegrees(g.lng, g.lat, localBaseElev + vt.z),
-                point: {
-                  pixelSize: 1,
-                  color: Cesium.Color.CYAN.withAlpha(0.01),
-                  outlineColor: Cesium.Color.CYAN,
-                  outlineWidth: 0,
-                  disableDepthTestDistance: Number.POSITIVE_INFINITY,
-                },
-                _vertexInfo: { solidIdx, flatIdx: solid.flatIdx, faceId: face.id, vertIdx: vi, gx: vt.x, gy: vt.y, gz: vt.z },
-              });
+              const ptEnt = _cesiumAddVertMarker(v, Cesium.Cartesian3.fromDegrees(g.lng, g.lat, localBaseElev + vt.z),
+                { solidIdx, flatIdx: solid.flatIdx, faceId: face.id, vertIdx: vi, gx: vt.x, gy: vt.y, gz: vt.z });
               v._bldExtraEntities.push(ptEnt);
             });
           });
@@ -5202,6 +5229,7 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
         v._hoveredVertEnt.point.pixelSize = 1;
         v._hoveredVertEnt.point.color = Cesium.Color.CYAN.withAlpha(0.01);
         v._hoveredVertEnt.point.outlineWidth = 0;
+        v.scene.requestRender();
       }
       v._hoveredVertEnt = null;
       const picked = v.scene.pick(movement.endPosition);
