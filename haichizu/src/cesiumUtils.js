@@ -21,38 +21,37 @@ function saveFieldPolygon(pts) {
 //   多角形として同じここを通す＝形で分岐しない。
 // 【意味】図面（TW×TH グリッド）にその多角形の外接矩形がぴったり収まるよう縮尺を決め（2026-11-28 以前は 90%）、
 //   図面の中心が多角形の中心に重なるよう原点（南西の角）を逆算する。
-function fieldFrameFromPolygon(poly) {
-  if (!Array.isArray(poly) || poly.length < 3) return null;
-  const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
-  const centerLat = (Math.min(...lats) + Math.max(...lats)) / 2;
-  const centerLng = (Math.min(...lngs) + Math.max(...lngs)) / 2;
-  const mPerDegLng = 111320 * Math.cos(centerLat * Math.PI / 180);
-  const bboxW = (Math.max(...lngs) - Math.min(...lngs)) * mPerDegLng;
-  const bboxH = (Math.max(...lats) - Math.min(...lats)) * M_PER_DEG_LAT;
+function fieldFrameFromPolygon(poly, rotDeg) {
+  // 外接する四角は図面の向きで測る（constants.js の fieldExtent 1つ＝升の数と同じ測り方）
+  const ex = fieldExtent(poly, rotDeg || 0);
+  if (!ex) return null;
+  const centerLat = ex.centerLat, centerLng = ex.centerLng, mPerDegLng = ex.mPerDegLng;
+  const bboxW = ex.W, bboxH = ex.H;
   // 【外接する四角がぴったり図面になる・2026-11-28】升の数（TW×TH）は constants.js が範囲の縦横比で決めている。
   //   旗 window.__FIELD_AREA_FIT = false で従来（図面の 90% に収める）
   //   以前に決めた範囲（field_fit が無い）は従来のまま＝保存した図がずれない（述語は constants.js の fieldAreaFitEnabled 1つ）
   const _ぴったり = (typeof fieldAreaFitEnabled === 'function') ? fieldAreaFitEnabled() : false;
   const mpp = _ぴったり ? Math.max(bboxW / TW, bboxH / TH, 0.001)
     : Math.max(bboxW / (TW * 0.9), bboxH / (TH * 0.9), 0.001);
-  return {
-    origin: {
-      lat: centerLat - (TH / 2) * mpp / M_PER_DEG_LAT,
-      lng: centerLng - (TW / 2) * mpp / mPerDegLng,
-    },
-    mpp,
-    mPerDegLng,
-  };
+  // 原点＝図面の左下の角（回していなければ南西の角）
+  let origin = { lat: centerLat - (TH / 2) * mpp / M_PER_DEG_LAT, lng: centerLng - (TW / 2) * mpp / mPerDegLng };
+  if (rotDeg) { const t = rotDeg * Math.PI / 180, c = Math.cos(t), s = Math.sin(t), u = -(TW / 2) * mpp, v = -(TH / 2) * mpp;
+    origin = { lat: centerLat + (u * s + v * c) / M_PER_DEG_LAT, lng: centerLng + (u * c - v * s) / mPerDegLng }; }
+  return { origin, mpp, mPerDegLng, center: { lat: centerLat, lng: centerLng }, rot: rotDeg || 0 };
 }
 
 // GEO_ORIGIN & METERS_PER_PX: フィールドポリゴンから毎回再計算（TW/TH変更に対応）
 let GEO_ORIGIN, METERS_PER_PX, M_PER_DEG_LNG;
+// 図面の向き（度・時計回り。constants.js の fieldRotationDeg）と図面の中心。回していなければ 0・null＝従来の式
+let FIELD_ROT_DEG = 0, FIELD_CENTER = null, _FR_C = 1, _FR_S = 0;
 (() => {
-  const fr = fieldFrameFromPolygon(getSavedFieldPolygon());
+  const _rot = getSavedFieldPolygon() ? fieldRotationDeg() : 0;
+  const fr = fieldFrameFromPolygon(getSavedFieldPolygon(), _rot);
   if (fr) {
     GEO_ORIGIN = fr.origin;
     METERS_PER_PX = fr.mpp;
     M_PER_DEG_LNG = fr.mPerDegLng;
+    if (_rot) { FIELD_ROT_DEG = _rot; FIELD_CENTER = fr.center; _FR_C = Math.cos(_rot * Math.PI / 180); _FR_S = Math.sin(_rot * Math.PI / 180); }
     // localStorageも更新
     try { localStorage.setItem('geo_origin', JSON.stringify(GEO_ORIGIN)); } catch (_) {}
   } else {
@@ -81,7 +80,10 @@ function updateGeoOrigin(lat, lng) {
 function commitFieldPolygon(poly, opts) {
   // この版以降に決めた範囲は、図面の大きさ・縮尺を範囲に合わせる（constants.js の fieldAreaFitEnabled が読む印）
   if (!(typeof window !== 'undefined' && window.__FIELD_AREA_FIT === false)) { try { localStorage.setItem('field_fit', '1'); } catch (_) {} }
-  const fr = fieldFrameFromPolygon(poly);
+  // 図面の向き（回した地図で決めた範囲はその向き）。0 なら記録を消す＝北が上（constants.js の fieldRotationDeg が読む）
+  const _rot = (opts && Number.isFinite(opts.rot) && !(typeof window !== 'undefined' && window.__FIELD_ROTATE === false)) ? ((opts.rot % 360) + 360) % 360 : 0;
+  try { if (_rot) localStorage.setItem('field_rot', String(_rot)); else localStorage.removeItem('field_rot'); } catch (_) {}
+  const fr = fieldFrameFromPolygon(poly, _rot);
   if (!fr) return false;
   saveFieldPolygon(poly);
   updateGeoOrigin(fr.origin.lat, fr.origin.lng);
@@ -93,6 +95,7 @@ function commitFieldPolygon(poly, opts) {
 function clearFieldPolygon(opts) {
   try { localStorage.removeItem('field_polygon'); } catch (_) {}
   try { localStorage.removeItem('field_fit'); } catch (_) {}
+  try { localStorage.removeItem('field_rot'); } catch (_) {}
   try { localStorage.removeItem('geo_origin'); } catch (_) {}
   try { localStorage.removeItem(getElevCacheKey()); } catch (_) {}
   if (!(opts && opts.noReload)) location.reload();
@@ -221,6 +224,11 @@ function detectAndInstallProxy() {
 detectAndInstallProxy();
 
 function gridToGeo(x, y) {
+  if (FIELD_CENTER) {
+    // 図面を回しているとき: 図面の中心からの（右 u・上 v）を地面の（東 E・北 N）へ回す
+    const u = (x - TW / 2) * METERS_PER_PX, v = (TH / 2 - y) * METERS_PER_PX;
+    return { lng: FIELD_CENTER.lng + (u * _FR_C - v * _FR_S) / M_PER_DEG_LNG, lat: FIELD_CENTER.lat + (u * _FR_S + v * _FR_C) / M_PER_DEG_LAT };
+  }
   return {
     lng: GEO_ORIGIN.lng + x * METERS_PER_PX / M_PER_DEG_LNG,
     lat: GEO_ORIGIN.lat + (TH - y) * METERS_PER_PX / M_PER_DEG_LAT, // Y反転: 平面図の上=北
@@ -228,6 +236,10 @@ function gridToGeo(x, y) {
 }
 
 function geoToGrid(lat, lng) {
+  if (FIELD_CENTER) {
+    const E = (lng - FIELD_CENTER.lng) * M_PER_DEG_LNG, N = (lat - FIELD_CENTER.lat) * M_PER_DEG_LAT;
+    return { x: TW / 2 + (E * _FR_C + N * _FR_S) / METERS_PER_PX, y: TH / 2 - (-E * _FR_S + N * _FR_C) / METERS_PER_PX };
+  }
   return {
     x: (lng - GEO_ORIGIN.lng) * M_PER_DEG_LNG / METERS_PER_PX,
     y: TH - (lat - GEO_ORIGIN.lat) * M_PER_DEG_LAT / METERS_PER_PX, // Y反転

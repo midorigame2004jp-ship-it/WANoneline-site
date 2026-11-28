@@ -13,15 +13,39 @@ function fieldAreaFitEnabled() {
   if (typeof window !== 'undefined' && window.__FIELD_AREA_FIT === false) return false;
   try { return typeof localStorage !== 'undefined' && localStorage.getItem('field_fit') === '1'; } catch (e) { return false; }
 }
+// 【図面の向き＝範囲を決めたときの地図の向き・2026-11-28 ユーザー指摘】
+//   「（回した範囲に合わせて図面を回すか）言っている意味が分からない。逆に回さなかったら図形を置き去りにするつもりか？」
+//   国土地理院の窓を回して範囲を決めたら、その向き（画面の上＝図面の上）で図面を作る。
+//   localStorage の field_rot＝範囲を決めたときの地図の回転（度・時計回り。地図が時計回りに θ 回っていれば、
+//   図面の右は地面の東から反時計回りに θ）。範囲が無い・記録が無ければ 0（北が上＝従来）。
+//   旗 window.__FIELD_ROTATE = false で 0（従来＝図面は北が上のまま・範囲が入る北向きの四角）＝陽性対照。
+function fieldRotationDeg() {
+  if (typeof window !== 'undefined' && window.__FIELD_ROTATE === false) return 0;
+  try { const v = Number(typeof localStorage !== 'undefined' ? localStorage.getItem('field_rot') : 0); return Number.isFinite(v) ? v : 0; } catch (e) { return 0; }
+}
+// 範囲の広がりを図面の向きで測る（升の数 fieldCellsFromPolygon と縮尺・原点 fieldFrameFromPolygon が同じこれを読む＝外接する四角の測り方は1つ）。
+//   戻り: { W, H（図面の横・縦のメートル）, centerLat, centerLng（外接する四角の中心）, mPerDegLng } ／ 測れなければ null
+function fieldExtent(poly, rotDeg) {
+  if (!Array.isArray(poly) || poly.length < 3) return null;
+  const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
+  if (!lats.every(Number.isFinite) || !lngs.every(Number.isFinite)) return null;
+  const lat0 = (Math.min(...lats) + Math.max(...lats)) / 2, lng0 = (Math.min(...lngs) + Math.max(...lngs)) / 2;
+  const mPerDegLng = 111320 * Math.cos(lat0 * Math.PI / 180);
+  if (!rotDeg) return { W: (Math.max(...lngs) - Math.min(...lngs)) * mPerDegLng, H: (Math.max(...lats) - Math.min(...lats)) * 111320, centerLat: lat0, centerLng: lng0, mPerDegLng };
+  const t = rotDeg * Math.PI / 180, c = Math.cos(t), s = Math.sin(t);
+  // 地面（東 E・北 N）→ 図面の向き（右 u・上 v）: u = E cos + N sin ／ v = −E sin + N cos
+  let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+  for (const p of poly) { const E = (p.lng - lng0) * mPerDegLng, N = (p.lat - lat0) * 111320;
+    const u = E * c + N * s, v = -E * s + N * c; if (u < u0) u0 = u; if (u > u1) u1 = u; if (v < v0) v0 = v; if (v > v1) v1 = v; }
+  const uc = (u0 + u1) / 2, vc = (v0 + v1) / 2, Ec = uc * c - vc * s, Nc = uc * s + vc * c;
+  return { W: u1 - u0, H: v1 - v0, centerLat: lat0 + Nc / 111320, centerLng: lng0 + Ec / mPerDegLng, mPerDegLng };
+}
 function fieldCellsFromPolygon(poly) {
   const 既定 = { MC: 160, MR: 112 };
   if (!fieldAreaFitEnabled()) return 既定;
-  if (!Array.isArray(poly) || poly.length < 3) return 既定;
-  const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
-  if (!lats.every(Number.isFinite) || !lngs.every(Number.isFinite)) return 既定;
-  const 中lat = (Math.min(...lats) + Math.max(...lats)) / 2;
-  const W = (Math.max(...lngs) - Math.min(...lngs)) * 111320 * Math.cos(中lat * Math.PI / 180);
-  const H = (Math.max(...lats) - Math.min(...lats)) * 111320;
+  const ex = fieldExtent(poly, fieldRotationDeg());
+  if (!ex) return 既定;
+  const W = ex.W, H = ex.H;
   if (!(W > 0 && H > 0)) return 既定;
   const 長 = 160, 短の下限 = 8;
   if (W >= H) return { MC: 長, MR: Math.max(短の下限, Math.min(長, Math.round(長 * H / W))) };

@@ -69,9 +69,11 @@ function _oiFaces(pnRad, cAz, cEl) {
 // 4本の軸の向き（画面上の単位ベクトル）。aAz/aEl = 矢印を投影するカメラ
 // 【真北の式が変わった】以前ここは world オフセットで直接求めていたが、
 //   コアへ寄せた。値は実測で同一（checks/cube_parity3.cjs で 160/160×2条件）
+// 真北の矢印は、図面を範囲の向きに回していればその分だけ回す（cesiumUtils.js の FIELD_ROT_DEG・時計回り）
+function _fieldNorthRad() { return (typeof FIELD_ROT_DEG === 'number' ? FIELD_ROT_DEG : 0) * Math.PI / 180; }
 function _oiDirs(pnRad, aAz, aEl) {
   const w = ocFromWorldCam(pnRad, aAz, aEl);
-  return ocAxisDirs(w.pnRad, w.az, w.el);
+  return ocAxisDirs(w.pnRad, w.az, w.el, _fieldNorthRad());
 }
 
 // 矢印の頭（三角形）
@@ -19763,7 +19765,8 @@ window.App = function App() {
             const pXpn = project3D(TW/2 + Math.cos(pnRad), TH/2 + Math.sin(pnRad), 0, camAz, camEl, 1, 0, 0);
             const nrm = (dx, dy) => { const l = Math.sqrt(dx*dx+dy*dy)||1; return [dx/l, dy/l]; };
             // 真北 N
-            const pN  = project3D(TW/2, TH/2 - 1, 0, camAz, camEl, 1, 0, 0);
+            const _nr = _fieldNorthRad();   // 図面を範囲の向きに回していれば真北もその分回る
+            const pN  = project3D(TW/2 + Math.sin(_nr), TH/2 - Math.cos(_nr), 0, camAz, camEl, 1, 0, 0);
             const [nx,ny]  = nrm(pN.x  -p0.x, pN.y  -p0.y);
             const [zx,zy]  = nrm(pZ.x  -p0.x, pZ.y  -p0.y);
             const [pnx,pny]= nrm(pPN.x -p0.x, pPN.y -p0.y);

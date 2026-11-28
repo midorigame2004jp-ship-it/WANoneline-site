@@ -103,7 +103,10 @@ function ocCubeFaces(pnRad, az, el, gc, cs) {
 //   これで真北は world (0,-1) 固定＝PNに依存しない。真北は動かず、
 //   PN側（キューブ）がその下で回る、という物理どおりの姿になる。
 //   検査: checks/cube_parity3.cjs「真北は PN に依存しない」（陽性対照つき）
-function ocAxisDirs(pnRad, az, el) {
+// nOffRad: 真北が図面の上から時計回りにどれだけ回っているか（図面を範囲の向きに回したとき・2026-11-28）。
+//   符号は project3D のグリッドで (sinθ, −cosθ) を投影した向きと一致することを数値で確かめた（0 なら従来）。
+function ocAxisDirs(pnRad, az, el, nOffRad) {
+  const _nOff = Number.isFinite(nOffRad) ? nOffRad : 0;
   const proj = ocMakeProj(pnRad, az, el, 0, 1);
   const p0 = proj(0, 0, 0);
   const nrm = (p) => {
@@ -113,7 +116,7 @@ function ocAxisDirs(pnRad, az, el) {
   };
   return {
     x:  nrm(proj(1, 0, 0)),
-    n:  nrm(proj(Math.sin(pnRad), Math.cos(pnRad), 0)),
+    n:  nrm(proj(Math.sin(pnRad + _nOff), Math.cos(pnRad + _nOff), 0)),
     pn: nrm(proj(0, 1, 0)),
     z:  nrm(proj(0, 0, 1)),
   };

@@ -117,19 +117,21 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   })();
 
   // 図面全体（TW×TH）が地球上のどこに当たるか＝地面を取る範囲。gridToGeo が正
-  const 図面の範囲 = () => {
+  // 図面の4隅（左上・右上・右下・左下）。図面を回していれば（範囲を回した地図で決めた）4隅も回っている
+  const 図面の隅 = () => {
     if (typeof gridToGeo !== 'function' || typeof TW === 'undefined' || typeof TH === 'undefined') return null;
-    const sw = gridToGeo(0, TH);   // y=TH が南
-    const ne = gridToGeo(TW, 0);   // y=0 が北
-    return { west: sw.lng, south: sw.lat, east: ne.lng, north: ne.lat };
+    return [gridToGeo(0, 0), gridToGeo(TW, 0), gridToGeo(TW, TH), gridToGeo(0, TH)];
+  };
+  // 地面・建物を取る範囲＝図面の4隅が入る緯度経度の四角（回していなければ図面そのもの）
+  const 図面の範囲 = () => {
+    const 隅 = 図面の隅();
+    if (!隅) return null;
+    const lats = 隅.map(p => p.lat), lngs = 隅.map(p => p.lng);
+    return { west: Math.min(...lngs), south: Math.min(...lats), east: Math.max(...lngs), north: Math.max(...lats) };
   };
   const 図面の枠 = (() => {
-    const b = 図面の範囲();
-    if (!b) return null;
-    return [
-      画面へ(b.north, b.west), 画面へ(b.north, b.east),
-      画面へ(b.south, b.east), 画面へ(b.south, b.west),
-    ];
+    const 隅 = 図面の隅();
+    return 隅 ? 隅.map(p => 画面へ(p.lat, p.lng)) : null;
   })();
 
   // ── 建物を取り込む・2026-11-23 ──
@@ -458,10 +460,11 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     const mPerDegLng = 111320 * Math.cos(((north + south) / 2) * Math.PI / 180);
     return { north, south, west, east, 幅m: (east - west) * mPerDegLng, 高m: (north - south) * 111320, mPerDegLng };
   };
-  const _確かめて決める = (poly, 文) => {
+  // 回は図面の向き（地図を回して決めた範囲はその向きで図面を作る＝画面の上が図面の上。cesiumUtils.js の commitFieldPolygon）
+  const _確かめて決める = (poly, 文, 回) => {
     setPickMode(false); setPts([]); set四角(null); setHover(null);
     setTimeout(() => {
-      if (window.confirm(文)) commitFieldPolygon(poly);
+      if (window.confirm(文)) commitFieldPolygon(poly, { rot: 回 || 0 });
       else setMsg('範囲の設定をやめました');
     }, 0);
   };
@@ -473,10 +476,12 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       const 長さ = (a, c) => Math.hypot((c.lng - a.lng) * b2.mPerDegLng, (c.lat - a.lat) * 111320);
       const 辺1 = 長さ(角ら[0], 角ら[1]), 辺2 = 長さ(角ら[1], 角ら[2]);
       if (辺1 < 1 || 辺2 < 1) { setMsg('範囲が小さすぎます。もう少し大きく囲んでください'); return; }
+      const _図面も回す = !(typeof window !== 'undefined' && window.__FIELD_ROTATE === false);
       _確かめて決める(角ら, 'この四角（地図を ' + Math.round(回転) + '° 回した向き）を3次元の範囲にしますか？\n'
         + '  辺の長さ ' + Math.round(辺1) + ' m × ' + Math.round(辺2) + ' m\n\n'
-        + '図面（平面図・3次元図）は北が上のまま、この四角が入る大きさになり、地面と建物はこの四角の中だけ取り込みます。\n'
-        + '座標が合わせ直され、画面を読み込み直します。');
+        + (_図面も回す ? '図面（平面図・3次元図）もこの四角の向きに回します（いまの地図の画面の上＝図面の上）。地面と建物はこの四角の中を取り込みます。\n'
+          : '図面（平面図・3次元図）は北が上のまま、この四角が入る大きさになり、地面と建物はこの四角の中だけ取り込みます。\n')
+        + '座標が合わせ直され、画面を読み込み直します。', 回転);
       return;
     }
     const poly0 = [p1, p2];
@@ -502,10 +507,13 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (i === 0 && j === P.length - 1) continue;
       if (交わる(P[i], P[(i + 1) % P.length], P[j], P[(j + 1) % P.length])) { setMsg('線が交わっている形は範囲にできません。Backspace で戻して描き直してください'); setPickMode(true); return; }
     }
+    const _回す = 回転 && !(typeof window !== 'undefined' && window.__FIELD_ROTATE === false);
     _確かめて決める(poly, 'この形（' + poly.length + ' 点）を3次元の範囲にしますか？\n'
-      + '  外接する四角 東西 ' + Math.round(b.幅m) + ' m ／ 南北 ' + Math.round(b.高m) + ' m\n\n'
-      + '図面（平面図・3次元図）の範囲はこの形が入る四角になり、地面と建物はこの形の中だけ取り込みます。\n'
-      + '座標が合わせ直され、画面を読み込み直します。');
+      + (_回す ? '' : '  外接する四角 東西 ' + Math.round(b.幅m) + ' m ／ 南北 ' + Math.round(b.高m) + ' m\n')
+      + '\n'
+      + (_回す ? '図面（平面図・3次元図）はいまの地図の向き（' + Math.round(回転) + '° 回した向き・画面の上＝図面の上）で、この形が入る四角になります。'
+        : '図面（平面図・3次元図）の範囲はこの形が入る四角になり、') + '地面と建物はこの形の中だけ取り込みます。\n'
+      + '座標が合わせ直され、画面を読み込み直します。', 回転);
   };
   // 取り込みを範囲の中だけにする（範囲＝保存されたフィールドの形）
   const _範囲の形 = () => { const p = (typeof getSavedFieldPolygon === 'function') ? getSavedFieldPolygon() : null; return p && p.length >= 3 ? p : null; };
@@ -545,7 +553,10 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     // 取れなかった画素は 0m（海面）で埋める。dem（10mメッシュ）は全国整備なので、
     // そこまで落として取れない所は海。山あいで欠けるのは dem へ落ちる前の話で、
     // それは gsiLoadElevationStack が埋める（2026-11-23）。
-    const data = gsiBuildElevationGrid(b, 格子, 格子, reader, { seaLevel: 0 });
+    // 図面を回しているときは、標高を図面の格子の点（図面の向き）で取る（地面の格子は図面に重ねて描くため）
+    const _図面の点 = (typeof FIELD_CENTER !== 'undefined' && FIELD_CENTER)
+      ? ((r, c, rows, cols) => gridToGeo(TW * (cols === 1 ? 0 : c / (cols - 1)), TH * (rows === 1 ? 0 : r / (rows - 1)))) : null;
+    const data = gsiBuildElevationGrid(b, 格子, 格子, reader, { seaLevel: 0, sampleAt: _図面の点 });
     if (!data) {
       setBusy(null);
       setMsg('この範囲の標高データが取れませんでした');

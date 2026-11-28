@@ -296,12 +296,16 @@ function gsiBuildElevationGrid(bounds, cols, rows, reader, opts) {
   //   seaLevel を渡したときだけ従来どおりその値で埋める。
   const elevations = [];
   let min = Infinity, max = -Infinity, 有効 = 0, 欠け = 0;
+  // opts.sampleAt(r, c, rows, cols) → {lat, lng} を渡すと、その点で取る（図面を回しているとき・2026-11-28）。
+  //   渡さなければ従来どおり bounds の緯度経度を等分した点（北が上）。
+  const 点で = opts && typeof opts.sampleAt === 'function' ? opts.sampleAt : null;
   for (let r = 0; r < rows; r++) {
     const lat = bounds.north + (bounds.south - bounds.north) * (rows === 1 ? 0 : r / (rows - 1));
     const line = new Array(cols);
     for (let c = 0; c < cols; c++) {
       const lng = bounds.west + (bounds.east - bounds.west) * (cols === 1 ? 0 : c / (cols - 1));
-      const v = reader.read(lat, lng);
+      const q = 点で ? 点で(r, c, rows, cols) : null;
+      const v = q ? reader.read(q.lat, q.lng) : reader.read(lat, lng);
       if (v === null || v === undefined || !Number.isFinite(v)) { line[c] = null; 欠け++; }
       else { line[c] = v; 有効++; if (v < min) min = v; if (v > max) max = v; }
     }
