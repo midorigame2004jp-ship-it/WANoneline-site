@@ -1735,8 +1735,11 @@ window.App = function App() {
       // 【データが「タンク」と言っているものは円柱にする・2026-11-23 ユーザー指示】
       //   地図の記号コード 4302＝タンク。点列が多少いびつでも（測量の誤差・タイルの切れ）
       //   円柱で間違いない。形から推し量るより、**データの意味**を信じる。
-      let shape = (typeof shapeFromOutline === "function") ? shapeFromOutline(pts) : null;
-      if (!shape && it.種別 === "タンク" && typeof circleFromOutline === "function") {
+      // 【範囲で切り取った建物は形のまま・2026-11-28】切り口のあるタンクを円柱に作り直すと、切った所がまた丸く戻って
+      //   範囲の外へはみ出す（実測: タンク1件で頂点11個が範囲の外）。切った足元の形をそのまま押し出す。
+      const _切った = !!(it.srcAdd && it.srcAdd.範囲で切った);
+      let shape = (!_切った && typeof shapeFromOutline === "function") ? shapeFromOutline(pts) : null;
+      if (!shape && !_切った && it.種別 === "タンク" && typeof circleFromOutline === "function") {
         shape = circleFromOutline(pts);
       }
       const 点 = (shape && typeof blockShapePoints === "function") ? blockShapePoints(shape) : pts;
@@ -1772,7 +1775,8 @@ window.App = function App() {
       //   形が崩れているか、タイルの境目で切れている。赤くして目で探せるようにする。
       // 【いびつだった印】タンクは必ず円柱になるが、点列が円と見なせなかったものは赤くして
       //   「元の形が崩れている（測量の誤差・タイルの切れ）」と分かるようにする。
-      const _いびつ = (it.種別 === "タンク") && !((typeof shapeFromOutline === "function") && shapeFromOutline(pts));
+      // 範囲で切り取ったタンクは丸くないのが正しいので、いびつの印（赤）を付けない（2026-11-28）
+      const _いびつ = !_切った && (it.種別 === "タンク") && !((typeof shapeFromOutline === "function") && shapeFromOutline(pts));
       // 【色は取り込み元（レイヤの表）が決める・2026-11-24】
       //   ここに `if (種別 === "道路")` を書かない。gsiTiles.js の GSI_IMPORT_LAYERS が it.color を渡す。
       const 色 = _いびつ ? "#EF4444" : (it.color || BLD_COLORS[(c - 1) % BLD_COLORS.length]);
@@ -8057,16 +8061,8 @@ window.App = function App() {
   // 【範囲の形（フィールド）が四角でないときだけ、その形（図面座標）を返す・2026-11-28】
   //   四角（外接する四角そのもの＝図面いっぱい）なら切る必要が無いので null。地形・塗る面・平面図が同じ判定を使う。
   //   旗 window.__FIELD_CLIP = false で切らない（従来）
-  const _fieldPolyClip = () => {
-    if (typeof window !== 'undefined' && window.__FIELD_CLIP === false) return null;
-    const P = (typeof FIELD_POLY_GRID !== 'undefined') ? FIELD_POLY_GRID : null;
-    if (!Array.isArray(P) || P.length < 3) return null;
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, a2 = 0;
-    for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length];
-      x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); a2 += p.x * q.y - q.x * p.y; }
-    const 箱 = (x1 - x0) * (y1 - y0);
-    return (箱 > 0 && Math.abs(a2 / 2) >= 箱 * 0.999) ? null : P;   // 面積が外接する四角と同じ＝四角
-  };
+  // 範囲の形が四角でなければその形（判定は cesiumUtils.js の fieldPolyClipGrid 1か所。取り込んだ建物の切り取りと同じ）
+  const _fieldPolyClip = () => (typeof fieldPolyClipGrid === 'function' ? fieldPolyClipGrid() : null);
   const _ptInPolyXY = (P, x, y) => { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j];
     if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
   const _mToPx今 = _terrainMToPx();
@@ -9929,7 +9925,7 @@ window.App = function App() {
       //   旗 window.__GROUND_CLIP_SHEET = false で従来（四角のときは切らない）
       const _形の切り = _fieldPolyClip();
       const _形で切る = _形の切り
-        || (!(typeof window !== 'undefined' && window.__GROUND_CLIP_SHEET === false) ? [{ x: 0, y: 0 }, { x: TW, y: 0 }, { x: TW, y: TH }, { x: 0, y: TH }] : null);
+        || (!(typeof window !== 'undefined' && window.__GROUND_CLIP_SHEET === false) && typeof drawAreaPolygonGrid === 'function' ? drawAreaPolygonGrid() : null);
       切り方 = _形の切り ? '範囲の形' : (_形で切る ? '図面の四角' : null);
       if (_形で切る) {
         ctx.save();
@@ -15171,9 +15167,9 @@ window.App = function App() {
   // 【報告】「画像のような規模（建物 約500棟）になると、建物だけ配置したときでもじゃっかんヌルっとしていて軽快ではない」
   // 【発生源（実測）】建物の面（約3,100枚）を、カメラが1コマ動くたびに部品（SVG の polygon）として作り直していた。
   //   1コマ約100ms のうち、部品の作り直しと画面の配置計算（属性の書き換え・並べ替え・寸法の取り直し）が大半。
-  // 【直し方】動かしている間（カメラが変わってから 0.2 秒）は、同じ面の列・同じ描き方の決め（_cabSolidsPlan）・
+  // 【直し方】ドラッグで動かしている間は、同じ面の列・同じ描き方の決め（_cabSolidsPlan）・
   //   同じ見た目（_cabFaceLook）で canvas に描き、SVG の面は直前のまま隠しておく（部品を作り直さない）。
-  //   止まったら SVG に戻す（面を押す・光らせるなどの操作は SVG の面が受け持つ）。
+  //   ボタンを離したら SVG に戻す（面を押す・光らせるなどの操作は SVG の面が受け持つ）。
   //   旗 window.__CAB_SOLIDS_CANVAS_WHILE_MOVING = false で従来（動かしている間も SVG を作り直す）
   const solidsCanvasRef = useRef(null);
   const cabSolidsSvgCacheRef = useRef(null);
@@ -15245,20 +15241,22 @@ window.App = function App() {
         使い回し: (前情報.使い回し || 0) + (_使い回す ? 1 : 0) };
     }
   };
+  // 【canvas で描くのは「ドラッグ中で、カメラが実際に動いたとき」だけ・2026-11-28 ユーザー指摘】
+  //   最初の版は「カメラが変わってから 0.2 秒」canvas にしていたので、動かし終わってから 0.2 秒間は建物を押しても選べなかった
+  //   （ユーザー指摘「なんで勝手にやってんだダメだろ」）。ドラッグ中（画面の移動・回転）は押せないので canvas でよく、
+  //   ボタンを離した瞬間（cabDragStore の panning・orbiting が消えたとき）に SVG へ戻す。ホイールの拡大縮小・クリックだけでは切り替えない。
+  //   ★押しただけ（カメラが動いていない）では切り替えない＝建物を押して離す操作の途中で面が消えない。
   const _useCabMoving = ({ camAz, camEl, camZoom, camPanX, camPanY }) => {
-    const [, set刻] = useState(0);
-    const r = useRef({ cam5: null, until: 0, timer: 0 }).current;
+    const drag = React.useSyncExternalStore(cabDragStore.subscribe, cabDragStore.get);
+    const 引く中 = !!(drag && (drag.panning || drag.orbiting));
+    const r = useRef({ cam5: null, 動いた: false }).current;
     const cam5 = camAz + ',' + camEl + ',' + camZoom + ',' + camPanX + ',' + camPanY;
-    const on = _cabSolidsCanvasOn();
-    if (on && r.cam5 !== null && r.cam5 !== cam5) {
-      r.until = performance.now() + 200;
-      clearTimeout(r.timer);
-      r.timer = setTimeout(() => set刻(x => x + 1), 230);
-    }
+    if (!引く中) r.動いた = false;
+    else if (r.cam5 !== null && r.cam5 !== cam5) r.動いた = true;
     r.cam5 = cam5;
-    useEffect(() => () => clearTimeout(r.timer), []);
+    const on = _cabSolidsCanvasOn();
     // 観測（製品は読まない）: 検査が「動かしている間の絵」と「止まったときの絵」を同じカメラで比べるために立てる
-    const moving = on && ((typeof window !== 'undefined' && window.__CAB_FORCE_MOVING === true) || performance.now() < r.until);
+    const moving = on && ((typeof window !== 'undefined' && window.__CAB_FORCE_MOVING === true) || (引く中 && r.動いた));
     useLayoutEffect(() => { _drawSolidsCanvas(moving); });
     if (typeof window !== 'undefined') window.__cabMoving = moving;
     return moving;
@@ -19859,7 +19857,7 @@ window.App = function App() {
           <canvas ref={terrainCanvasRef} data-terrain-canvas="1"
             style={{ position: 'absolute', inset: 0, width: '100%', height: '100%',
               pointerEvents: 'none', opacity: 0.7 }} />
-          {/* 建物の面（カメラを動かしている間だけ。止まると SVG の面に戻る）・2026-11-28 */}
+          {/* 建物の面（ドラッグで動かしている間だけ。ボタンを離すと SVG の面に戻る）・2026-11-28 */}
           <canvas ref={solidsCanvasRef} data-cab-solids-canvas="1"
             style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }} />
           <svg viewBox={`0 0 ${CAB_W} ${CAB_H}`} preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}>
@@ -20303,7 +20301,7 @@ window.App = function App() {
                 ...((csgSolids && csgSolids.length) ? csgSolids : []),
                 ...(sketchSolids || []), ...(previewSolids || [])];
               if (!_drawSolids || _drawSolids.length === 0) return null;
-              // 【動かしている間は直前の面のまま隠す・2026-11-28】部品を作り直さない（canvas が描く）。止まったら作り直す
+              // 【ドラッグで動かしている間は直前の面のまま隠す・2026-11-28】部品を作り直さない（canvas が描く）。離したら作り直す
               if (_cabMoving && cabSolidsSvgCacheRef.current) {
                 return (<g data-cab-solids="1" style={{ display: 'none' }}>{cabSolidsSvgCacheRef.current}</g>);
               }

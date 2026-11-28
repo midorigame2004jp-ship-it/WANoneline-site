@@ -238,4 +238,22 @@ const FIELD_POLY_GRID = (() => {
   if (!poly) return null;
   return poly.map(p => geoToGrid(p.lat, p.lng));
 })();
+// ── 描写範囲の形（グリッド座標）・2026-11-28 ──
+// 範囲の形が四角でなければその形、四角（または範囲なし）なら null。四角の判定は「面積が外接する四角と同じ」。
+//   3次元図・平面図の地面の塗りを切る形と、取り込んだ建物を切り取る形が同じこれを使う（判定を2か所に書かない）。
+//   旗 window.__FIELD_CLIP = false で null（形で切らない）
+function fieldPolyClipGrid() {
+  if (typeof window !== 'undefined' && window.__FIELD_CLIP === false) return null;
+  const P = FIELD_POLY_GRID;
+  if (!Array.isArray(P) || P.length < 3) return null;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, a2 = 0;
+  for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length];
+    x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); a2 += p.x * q.y - q.x * p.y; }
+  const 箱 = (x1 - x0) * (y1 - y0);
+  return (箱 > 0 && Math.abs(a2 / 2) >= 箱 * 0.999) ? null : P;
+}
+// 描写範囲＝範囲の形（四角でなければ）／図面の四角（0,0〜TW,TH）
+function drawAreaPolygonGrid() {
+  return fieldPolyClipGrid() || [{ x: 0, y: 0 }, { x: TW, y: 0 }, { x: TW, y: TH }, { x: 0, y: TH }];
+}
 

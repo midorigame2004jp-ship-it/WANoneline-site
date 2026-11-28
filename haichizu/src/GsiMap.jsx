@@ -142,7 +142,32 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
         let la = 0, lo = 0; for (const q of 点) { la += q.lat; lo += q.lng; }
         return _中(_形, { lat: la / 点.length, lng: lo / 点.length });
       };
-      const _中の = r.items.filter(it => { const ok = _採る(it); if (!ok) 範囲の外++; return ok; });
+      // 【範囲の線をまたぐ建物は描写範囲で切り取る・2026-11-28 ユーザー裁定「描写範囲に従い建物を切り取って表現してくれ」】
+      //   従来は「重心が範囲の中なら形のまま取り込む」ので、範囲の外へはみ出して描かれていた。
+      //   建物の足元の形を描写範囲（範囲の形／四角なら図面の四角＝ cesiumUtils.js の drawAreaPolygonGrid）と重なる部分だけにする。
+      //   重なりが2つに分かれたら2つの建物にする。重なりが無ければ取り込まない。
+      //   旗 window.__GSI_CLIP_BUILDINGS_TO_AREA = false で従来（重心で決めて形は切らない）
+      const _切る = !(typeof window !== 'undefined' && window.__GSI_CLIP_BUILDINGS_TO_AREA === false)
+        && typeof drawAreaPolygonGrid === 'function' && typeof clipPolygonByPolygon === 'function';
+      const _描写範囲 = _切る ? drawAreaPolygonGrid() : null;
+      let 切り取った = 0;
+      const _建物か = (it) => !it.塗る && Array.isArray(it.ring) && it.ring.length >= 3;
+      const _中の = [];
+      for (const it of r.items) {
+        if (_切る && _建物か(it)) {
+          const G = _グ(it.ring);
+          // ★頂点が全部中でも、凹んだ範囲（L字など）では辺がくぼみを横切ることがあるので、必ず重なりを計算する
+          const 片ら = clipPolygonByPolygon(G, _描写範囲);
+          if (!片ら.length) { 範囲の外++; continue; }
+          const _面積 = (P) => { let a = 0; for (let k = 0; k < P.length; k++) { const p = P[k], q = P[(k + 1) % P.length]; a += p.x * q.y - q.x * p.y; } return Math.abs(a / 2); };
+          if (片ら.length === 1 && Math.abs(_面積(片ら[0]) - _面積(G)) <= 1e-6 * Math.max(1, _面積(G))) { _中の.push(Object.assign({}, it, { _G: G })); continue; }
+          切り取った++;
+          片ら.forEach((片, k) => _中の.push(Object.assign({}, it, { _G: 片, key: it.key + (片ら.length > 1 ? '#' + (k + 1) : '#切'),
+            srcAdd: Object.assign({}, it.srcAdd || {}, { 範囲で切った: true }) })));
+          continue;
+        }
+        if (_採る(it)) _中の.push(it); else 範囲の外++;
+      }
       const items = _中の.map(it => {
         const 他 = Object.assign({}, it); delete 他.ring; delete 他.中心線;
         // 【塗る面は中心線＋幅で運ぶ・2026-11-24】輪（ring）を持たないので points も作らない。
@@ -152,7 +177,8 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
         // 島（穴）も同じ変換でグリッドへ（2026-11-28）
         if (it.塗る && Array.isArray(it.輪)) return Object.assign(他, { 輪: _グ(it.輪) },
           Array.isArray(it.穴) && it.穴.length ? { 穴: it.穴.map(_グ) } : {});
-        return Object.assign(他, { points: _グ(it.ring || []) });
+        delete 他._G;
+        return Object.assign(他, { points: it._G || _グ(it.ring || []) });
       });
       const res = (typeof onBuildings === 'function') ? onBuildings(items) : null;
       const 内訳 = {};
@@ -168,6 +194,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (res && res.重複) 行.push('すでにある ' + res.重複 + ' 件は足していません');
       if (res && res.重なり) 行.push('手で作った建屋と重なる ' + res.重なり + ' 件は足していません');
       if (範囲の外) 行.push('範囲の形の外の ' + 範囲の外 + ' 件は取り込んでいません');
+      if (切り取った) 行.push('範囲の線をまたぐ建物 ' + 切り取った + ' 件は範囲の中の部分だけに切り取りました');
       if (r.穴) 行.push('中庭などの穴 ' + r.穴 + ' 件は落としました');
       // 【道路の縁の線は取らない・2026-11-27】道路は中心線だけを帯にする（gsiTiles.js の GSI_IMPORT_LAYERS の ft範囲）
       // 【道路の面・2026-11-27】道路の縁の線で囲まれた形をそのまま面にした数（交差点も縁の線どおり）

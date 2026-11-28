@@ -365,3 +365,90 @@ function eventClientXY(e) {
   const t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || e;
   return { clientX: t.clientX, clientY: t.clientY };
 }
+
+// ══ 2つの多角形の重なり（A ∩ B）・2026-11-28 ══
+// 【用途】取り込んだ建物の足元を描写範囲（範囲の形）で切り取る（ユーザー裁定「描写範囲に従い建物を切り取って表現してくれ」）。
+// 【やり方】A と B の辺を全部集めて交点で割り、囲まれた面をたどる。A∩B のひとまとまりは、どの辺にも横切られない
+//   ＝ちょうど1つの面になる（A の辺は A の縁、B の辺は B の縁なので、重なりの内側を通らない）。
+//   面の中の1点が A の中かつ B の中なら採る。凹んだ形どうしでも、切った結果が2つに分かれても扱える。
+//   立体計算の道具（WASM）は使わない（公開サイトで読めないことがあるため）。
+// 【入力】A, B: [{x, y}, …]（閉じ点なし・向きは問わない）。【出力】[[{x, y}, …], …]（重なりが無ければ []）
+function clipPolygonByPolygon(A, B) {
+  const 整 = (P) => { const o = []; for (const p of P || []) { const q = o[o.length - 1]; if (!q || Math.abs(q.x - p.x) > 1e-9 || Math.abs(q.y - p.y) > 1e-9) o.push({ x: p.x, y: p.y }); }
+    if (o.length > 1 && Math.abs(o[0].x - o[o.length - 1].x) < 1e-9 && Math.abs(o[0].y - o[o.length - 1].y) < 1e-9) o.pop(); return o; };
+  A = 整(A); B = 整(B);
+  if (A.length < 3 || B.length < 3) return [];
+  const 中 = (P, q) => { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j];
+    if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
+  let span = 0; for (const p of A.concat(B)) span = Math.max(span, Math.abs(p.x), Math.abs(p.y));
+  const eps = Math.max(1e-9, span * 1e-9);
+  const 段 = [];
+  const 入れる = (P) => { for (let i = 0; i < P.length; i++) 段.push({ a: P[i], b: P[(i + 1) % P.length], t: [0, 1] }); };
+  入れる(A); 入れる(B);
+  // 交点（重なって平行な辺は、相手の端点を割り点にする）
+  for (let i = 0; i < 段.length; i++) for (let j = i + 1; j < 段.length; j++) {
+    const s = 段[i], u = 段[j];
+    const rx = s.b.x - s.a.x, ry = s.b.y - s.a.y, qx = u.b.x - u.a.x, qy = u.b.y - u.a.y;
+    const den = rx * qy - ry * qx, wx = u.a.x - s.a.x, wy = u.a.y - s.a.y;
+    const L1 = rx * rx + ry * ry, L2 = qx * qx + qy * qy;
+    if (Math.abs(den) <= eps * Math.sqrt(L1 * L2)) {
+      // 平行: 同じ直線上なら端点を相手の上に割り点として足す
+      if (Math.abs(wx * ry - wy * rx) > eps * Math.sqrt(L1) * 10) continue;
+      for (const p of [u.a, u.b]) { const t = ((p.x - s.a.x) * rx + (p.y - s.a.y) * ry) / L1; if (t > 0 && t < 1) s.t.push(t); }
+      for (const p of [s.a, s.b]) { const t = ((p.x - u.a.x) * qx + (p.y - u.a.y) * qy) / L2; if (t > 0 && t < 1) u.t.push(t); }
+      continue;
+    }
+    const t = (wx * qy - wy * qx) / den, v = (wx * ry - wy * rx) / den;
+    const tol = 1e-12;
+    if (t < -tol || t > 1 + tol || v < -tol || v > 1 + tol) continue;
+    s.t.push(Math.max(0, Math.min(1, t))); u.t.push(Math.max(0, Math.min(1, v)));
+  }
+  // 頂点を作る（近い点は1つにまとめる）
+  const 頂 = [], 鍵 = new Map(), g = eps * 1e3 || 1e-6;
+  const 番 = (x, y) => { const k = Math.round(x / g) + ',' + Math.round(y / g); let n = 鍵.get(k); if (n == null) { n = 頂.length; 頂.push({ x, y }); 鍵.set(k, n); } return n; };
+  const 隣 = [], 辺 = new Set();
+  for (const s of 段) {
+    const ts = [...new Set(s.t.map(t => +t.toFixed(12)))].sort((p, q) => p - q);
+    let 前 = 番(s.a.x + (s.b.x - s.a.x) * ts[0], s.a.y + (s.b.y - s.a.y) * ts[0]);
+    for (let k = 1; k < ts.length; k++) {
+      const v = 番(s.a.x + (s.b.x - s.a.x) * ts[k], s.a.y + (s.b.y - s.a.y) * ts[k]);
+      if (v === 前) continue;
+      const kk = 前 < v ? 前 + ',' + v : v + ',' + 前;
+      if (!辺.has(kk)) { 辺.add(kk); (隣[前] = 隣[前] || []).push(v); (隣[v] = 隣[v] || []).push(前); }
+      前 = v;
+    }
+  }
+  for (let v = 0; v < 頂.length; v++) if (隣[v]) { const p = 頂[v]; 隣[v].sort((a, b) => Math.atan2(頂[a].y - p.y, 頂[a].x - p.x) - Math.atan2(頂[b].y - p.y, 頂[b].x - p.x)); }
+  // 面をたどる（囲まれた面は面積が正）
+  const 通 = new Set(), 出 = [];
+  for (let u0 = 0; u0 < 頂.length; u0++) {
+    if (!隣[u0]) continue;
+    for (const v0 of 隣[u0]) {
+      if (通.has(u0 + '>' + v0)) continue;
+      const 輪 = []; let u = u0, v = v0, 歩 = 0;
+      do { 通.add(u + '>' + v); 輪.push(u); const N = 隣[v], i = N.indexOf(u), w = N[(i - 1 + N.length) % N.length]; u = v; v = w; }
+      while (!(u === u0 && v === v0) && ++歩 < 100000);
+      let a2 = 0; for (let k = 0; k < 輪.length; k++) { const p = 頂[輪[k]], q = 頂[輪[(k + 1) % 輪.length]]; a2 += p.x * q.y - q.x * p.y; }
+      if (!(a2 > 0)) continue;
+      const P = 輪.map(n => 頂[n]);
+      // 面の中の1点: 凸の角から角の二等分線の方向へ少し入った点（面の中に入っているか確かめる）
+      let 点 = null;
+      for (let k = 0; k < P.length && !点; k++) {
+        const a = P[(k - 1 + P.length) % P.length], b = P[k], c = P[(k + 1) % P.length];
+        if ((b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x) <= 0) continue;   // 凸の角だけ（a2>0 と同じ向き）
+        const 長 = Math.min(Math.hypot(a.x - b.x, a.y - b.y), Math.hypot(c.x - b.x, c.y - b.y));
+        for (const f of [0.01, 0.1, 0.3]) {
+          const q = { x: b.x + ((a.x - b.x) + (c.x - b.x)) * f * 0.5, y: b.y + ((a.y - b.y) + (c.y - b.y)) * f * 0.5 };
+          if (長 > 0 && 中(P, q)) { 点 = q; break; }
+        }
+      }
+      if (!点) continue;
+      if (!中(A, 点) || !中(B, 点)) continue;
+      // 一直線上の点を落とす
+      const 簡 = P.filter((q, k) => { const a = P[(k - 1 + P.length) % P.length], b = P[(k + 1) % P.length];
+        return Math.abs((q.x - a.x) * (b.y - a.y) - (q.y - a.y) * (b.x - a.x)) > eps * Math.max(1, Math.hypot(b.x - a.x, b.y - a.y)); });
+      if (簡.length >= 3) 出.push(簡);
+    }
+  }
+  return 出;
+}
