@@ -6187,6 +6187,15 @@ window.App = function App() {
   const [cesium3dGearOpen, setCesium3dGearOpen] = useState(false);
   const [cesium3dLoaded, setCesium3dLoaded] = useState(false);
   const [cesium2dLoaded, setCesium2dLoaded] = useState(false);
+  // 「表示する」を押したときに Cesium の本体を読み込む（src/cesiumUtils.js の cesiumLoad・2026-11-28 ユーザー要望
+  //   「表示するボタンを押すまではcesiumに反映しないようにしてくれ」）。読み込み中・失敗の表示は窓ごと
+  const [cesiumLoadState, setCesiumLoadState] = useState({});   // { '3d': '読み込み中' | 'エラー文', '2d': … }
+  const _cesiumShow = (which, setLoaded) => {
+    if (typeof cesiumLoad !== 'function') { setLoaded(true); return; }
+    setCesiumLoadState(st => ({ ...st, [which]: '読み込み中…' }));
+    cesiumLoad().then(() => { setCesiumLoadState(st => ({ ...st, [which]: null })); setLoaded(true); })
+      .catch((e) => setCesiumLoadState(st => ({ ...st, [which]: '読み込めませんでした: ' + ((e && e.message) || e) })));
+  };
   const [cabGearOpen, setCabGearOpen] = useState(false);
   const [panelDragQuality, setPanelDragQuality] = useState(50);  // ドラッグ中OC品質 0-100%
   const [panelRestoreDelay, setPanelRestoreDelay] = useState(50); // 静止後に戻るまでの時間 ms
@@ -22636,10 +22645,15 @@ window.App = function App() {
         <div style={{ position: 'relative', width: '100%', height: '100%' }}>
         {!cesium3dLoaded ? (
           <div style={{ display:'flex', alignItems:'center', justifyContent:'center', width:'100%', height:'100%', background:'#1E293B' }}>
-            <button onClick={() => setCesium3dLoaded(true)}
+            <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:10 }}>
+            <button data-cesium-show="3d" disabled={cesiumLoadState['3d'] === '読み込み中…'} onClick={() => _cesiumShow('3d', setCesium3dLoaded)}
               style={{ padding:'10px 28px', fontSize:14, fontWeight:700, background:'#3B82F6', color:'#fff', border:'none', borderRadius:8, cursor:'pointer' }}>
-              表示する
+              {cesiumLoadState['3d'] === '読み込み中…' ? '読み込み中…' : '表示する'}
             </button>
+            {cesiumLoadState['3d'] && cesiumLoadState['3d'] !== '読み込み中…' && (
+              <div data-cesium-load-error="3d" style={{ color:'#FCA5A5', fontSize:12, maxWidth:360, textAlign:'center' }}>{cesiumLoadState['3d']}</div>
+            )}
+            </div>
           </div>
         ) : (<>
         <CesiumMap
@@ -22886,10 +22900,15 @@ window.App = function App() {
       <FloatWin id="cesium2d" title="CesiumJS 2D" winState={winState} setWinState={setWinState} bringFront={bringFront} keepMounted>
         {!cesium2dLoaded ? (
           <div style={{ display:'flex', alignItems:'center', justifyContent:'center', width:'100%', height:'100%', background:'#1E293B' }}>
-            <button onClick={() => setCesium2dLoaded(true)}
+            <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:10 }}>
+            <button data-cesium-show="2d" disabled={cesiumLoadState['2d'] === '読み込み中…'} onClick={() => _cesiumShow('2d', setCesium2dLoaded)}
               style={{ padding:'10px 28px', fontSize:14, fontWeight:700, background:'#3B82F6', color:'#fff', border:'none', borderRadius:8, cursor:'pointer' }}>
-              表示する
+              {cesiumLoadState['2d'] === '読み込み中…' ? '読み込み中…' : '表示する'}
             </button>
+            {cesiumLoadState['2d'] && cesiumLoadState['2d'] !== '読み込み中…' && (
+              <div data-cesium-load-error="2d" style={{ color:'#FCA5A5', fontSize:12, maxWidth:360, textAlign:'center' }}>{cesiumLoadState['2d']}</div>
+            )}
+            </div>
           </div>
         ) : (
         <CesiumMap

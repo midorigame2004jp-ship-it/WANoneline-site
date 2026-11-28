@@ -242,7 +242,7 @@ function _cesiumStartOwnLoop(viewer, el, mode) {
   const tick = () => {
     if (!viewer || viewer.isDestroyed()) return;
     viewer._ownLoopRaf = requestAnimationFrame(tick);
-    if (viewer._ownLoopPaused) return;
+    if (viewer._ownLoopPaused || viewer._unavailable3d) return;
     if (休み > 0) { 休み--; return; }
     try {
       // 観測（速度表示 __perfHud() の「Cesium」の行・2026-11-28）: 1コマに使った時間と、本当に描いた回数
@@ -323,6 +323,12 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
   onMovePlacedPanel = null, onRotatePlacedPanel = null }) {
   const containerRef = useRef(null);
   const viewerRef = useRef(null);
+  // 【3D が使えないときは2Dにせず知らせる・2026-11-28 ユーザー指摘「GitHubだとcesium３ｄは使えないの？ウインドウ押して
+  //   開いても２ｄにしかならんけど。かってに２ｄにするくらいならエラーで出ない方がいい」】
+  //   立体の地図（Google の 3D タイル）は Cesium ion の鍵で読み込む。公開版には鍵を置かない（ユーザー方針）ので必ず失敗し、
+  //   これまでは黙って衛星写真の地球（見た目が2D）に切り替えていた。切り替えずに理由を窓に出す。
+  //   旗 window.__CESIUM3D_FALLBACK_SATELLITE = true で従来（衛星写真に切り替える）＝陽性対照。
+  const [unavail3d, setUnavail3d] = useState(null);
   // ===== 階（建物内部 Phase A）用のUI状態 =====
   const [floorAddZ, setFloorAddZ] = useState(0);      // 追加する階の床標高(m)
   const [floorAddH, setFloorAddH] = useState(3);      // 追加する階の階高(m)
@@ -836,6 +842,15 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
   // Cesiumビューア初期化（1回だけ）
   useEffect(() => {
     if (!containerRef.current || typeof Cesium === 'undefined') return;
+    const _衛星へ = typeof window !== 'undefined' && window.__CESIUM3D_FALLBACK_SATELLITE === true;
+    if (mode === '3d' && !CESIUM_TOKEN && !_衛星へ) {
+      // 鍵が無い＝立体の地図は必ず読めない。地図そのものを作らない（何も描かず、重さも使わない）
+      setUnavail3d('CesiumJS 3D を表示できません。\n'
+        + '立体の地図（Google の 3D タイル）は Cesium ion の鍵で読み込みますが、この公開版には鍵を置いていません（鍵は GitHub に置かないため）。\n'
+        + '鍵を入れた手元のサーバーでは使えます。衛星写真の地図は「CesiumJS 2D」で見られます。');
+      console.warn('[CESIUM_INIT 3d] Cesium ion の鍵が無いので 3D の地図を作りません');
+      return;
+    }
     let destroyed = false;
     Cesium.Ion.defaultAccessToken = CESIUM_TOKEN;
 
@@ -1013,6 +1028,14 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
           );
           viewer.scene.requestRender();
         };
+        // 立体の地図が使えないとき: 衛星写真に切り替えず、理由を窓に出して描くのをやめる（旗で従来に戻せる）
+        const _3d使えない = (理由) => {
+          if (_衛星へ) { _fallbackToSatellite(); return; }
+          if (viewer.isDestroyed()) return;
+          viewer._unavailable3d = true;
+          setUnavail3d('CesiumJS 3D を表示できません。\n' + 理由);
+          console.warn('[3DTiles] 3D の地図を出せません: ' + 理由);
+        };
 
         try {
           console.log(`[CESIUM_INIT 3d] 3DTiles 読み込み開始...`);
@@ -1086,13 +1109,13 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
               ?? -1;
             console.log(`[3DTiles] 15秒後チェック: タイル読み込み数=${loaded}`);
             if (loaded === 0) {
-              _fallbackToSatellite();
+              _3d使えない('立体の地図（Google の 3D タイル）が 15 秒たっても1枚も届きませんでした。通信か Cesium ion の鍵を確かめてください。');
             }
           }, 15000);
 
         } catch (e) {
           console.warn('3D Tiles failed:', e.message);
-          _fallbackToSatellite();
+          _3d使えない('立体の地図（Google の 3D タイル）を読み込めませんでした（' + ((e && e.message) || e) + '）。');
         }
       }
       viewer._tileset3d = tileset3d;
@@ -8220,6 +8243,12 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
         onDrop={handleCesiumDrop}
         style={{ width: '100%', height: '100%', cursor: (fieldDrawMode || bldAddMode || faceSketchPhase) ? 'crosshair' : undefined }}
       />
+      {unavail3d && (
+        <div data-cesium3d-unavailable="1" style={{ position: 'absolute', inset: 0, zIndex: 30, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: '#1E293B', color: '#FCA5A5', fontSize: 13, lineHeight: 1.6, padding: 20, textAlign: 'center', whiteSpace: 'pre-wrap' }}>
+          {unavail3d}
+        </div>
+      )}
       {/* ワイヤー描画Canvas: postRenderで同期描画（ちらつきなし） */}
       <canvas ref={wireCanvasRef} style={{ position:'absolute', inset:0, width:'100%', height:'100%', pointerEvents:'none', zIndex:7 }} />
       {/* アイコンホバーオーバーレイ: カメラ/×ボタン（ドラッグ中はcanvasに描画するため非表示） */}

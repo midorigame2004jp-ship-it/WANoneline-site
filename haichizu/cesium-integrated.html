@@ -10,8 +10,8 @@
 
 <!-- CesiumJS -->
 <script>window.CESIUM_BASE_URL = 'https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/';</script>
-<script src="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Cesium.js"></script>
-<link href="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<!-- Cesium.js と widgets.css は「表示する」を押したときに読み込む（src/cesiumUtils.js の cesiumLoad・2026-11-28）。
+     場所は上の CESIUM_BASE_URL 1か所 -->
 
 <!-- React 18 (UMD) -->
 <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>

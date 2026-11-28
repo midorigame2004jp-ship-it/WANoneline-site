@@ -205,6 +205,8 @@ function detectAndInstallProxy() {
   const 知らせる = (ok) => { try { if (typeof gsiSetProxyAvailable === 'function') gsiSetProxyAvailable(ok); } catch (_) {} };
   fetch('/stats').then(r => {
     if (r.ok) {
+      // Cesium は「表示する」を押したときに読み込む（cesiumLoad）。読み込み後に入れ直せるよう、使えることを覚えておく
+      if (typeof window !== 'undefined') window.__tileProxyAvailable = true;
       installTileProxy();
       知らせる(true);
     } else {
@@ -257,3 +259,37 @@ function drawAreaPolygonGrid() {
   return fieldPolyClipGrid() || [{ x: 0, y: 0 }, { x: TW, y: 0 }, { x: TW, y: TH }, { x: 0, y: TH }];
 }
 
+// ══ Cesium は「表示する」を押したときに読み込む・2026-11-28 ══
+// 【ユーザー要望】「もともと重くならないようにCesiumは『表示する』ボタンを押して黙らせていたつもりだが。
+//   表示するボタンを押すまではcesiumに反映しないようにしてくれ」
+// 【それまで】窓の中身（CesiumMap）は「表示する」まで作らないが、Cesium の本体（Cesium.js・約4MB）は
+//   ページを開いた時点で <head> から読み込んでいた（毎コマの重さは無いが、起動時の読み込み・解釈とメモリを使う）。
+// 【直し方】入口の HTML から Cesium.js と widgets.css を外し、「表示する」を押したときにここで1回だけ読み込む。
+//   場所は HTML の window.CESIUM_BASE_URL 1か所（入口ごとに書かない）。読み込めなければ理由を返す（窓に出す）。
+//   旗 window.__CESIUM_LAZY = false で従来（ページを開いた時点で読み込む）＝陽性対照（App の起動時に呼ぶ）。
+let _cesiumLoading = null;
+function cesiumLoad() {
+  if (typeof Cesium !== 'undefined') return Promise.resolve(Cesium);
+  if (_cesiumLoading) return _cesiumLoading;
+  const base = (typeof window !== 'undefined' && window.CESIUM_BASE_URL) || 'https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/';
+  _cesiumLoading = new Promise((res, rej) => {
+    if (!document.querySelector('link[data-cesium-css]')) {
+      const l = document.createElement('link'); l.rel = 'stylesheet'; l.href = base + 'Widgets/widgets.css'; l.setAttribute('data-cesium-css', '1');
+      document.head.appendChild(l);
+    }
+    const sc = document.createElement('script'); sc.src = base + 'Cesium.js'; sc.async = true; sc.setAttribute('data-cesium-js', '1');
+    sc.onload = () => {
+      if (typeof Cesium === 'undefined') { _cesiumLoading = null; sc.remove(); rej(new Error('Cesium の本体を読み込めませんでした（中身が空）')); return; }
+      try { if (window.__tileProxyAvailable) installTileProxy(); } catch (_) {}
+      console.info('[Cesium] 「表示する」で読み込みました（' + (Cesium.VERSION || '?') + '）');
+      res(Cesium);
+    };
+    sc.onerror = () => { _cesiumLoading = null; sc.remove(); rej(new Error('Cesium の本体を取りに行けませんでした（' + base + 'Cesium.js）')); };
+    document.head.appendChild(sc);
+  });
+  return _cesiumLoading;
+}
+if (typeof window !== 'undefined') {
+  window.cesiumLoad = cesiumLoad;
+  if (window.__CESIUM_LAZY === false) cesiumLoad().catch(() => {});
+}

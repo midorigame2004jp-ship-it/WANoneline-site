@@ -29,6 +29,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   const rotRef = React.useRef(null);
   // Alt を押している間は直角に吸い付かない（印も出さない）。描き直しのために持つ
   const [alt, setAlt] = React.useState(false);
+  const [shift, setShift] = React.useState(false);   // Shift を押している間は画面の垂直・水平に寄せる（点をつなぐとき）
   const [pickMode, setPickMode] = React.useState(false);
   // 【範囲の指定・2026-11-28 ユーザー要望】ドラッグ＝四角で囲む（離したら確認）／クリック＝点をつないでいき、
   //   始点をクリックすると閉じた形（建物を点で結んで作るときと同じ）。地面と建物の取り込みもその範囲の中だけ。
@@ -36,7 +37,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   const [hover, setHover] = React.useState(null);     // 範囲指定中のカーソル位置
   const [四角, set四角] = React.useState(null);       // ドラッグ中の四角 { a, b }（緯度経度）
   const pickRef = React.useRef(null);                  // 押した点 { sx, sy, p, 動いた }
-  const 範囲の案内 = 'ドラッグで四角を囲む／クリックで点をつなぎ、始点をクリックか右クリックで閉じる（直角・始点に吸い付く・Alt で吸い付かない／Backspace で1点戻す・Esc でやめる）';
+  const 範囲の案内 = 'ドラッグで四角を囲む／クリックで点をつなぎ、始点をクリックか右クリックで閉じる（直角・始点に吸い付く・Shift で垂直水平・Alt で吸い付かない／Backspace で1点戻す・Esc でやめる）';
   const [busy, setBusy] = React.useState(null);       // 取得中の進捗の文字
   const [msg, setMsg] = React.useState('');
   // 取り込み対象が上限より多いときの確認（すべて読み込む／上限まで／やめる）。{ items, 情報, 超え: [{名, 数}], 上限 }
@@ -290,14 +291,20 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     } catch (e) { setMsg('取り込みに失敗: ' + (e && e.message)); }
   };
   // ── 操作 ──
-  // 【点をつなぐ作図は Cesium の「建物を点で結ぶ」と同じ・2026-11-28 ユーザー指摘「90度のマークはこれじゃねぇよ。
-  //   cesiumで建物つくるときに…既存のコードを確認しろ」】src/CesiumMap.jsx の建屋追加（始点の吸い付き SNAP_PX=20・
-  //   カーソルの線・始点へ戻る線・L字の印・右クリックで確定）とそろえる。見た目の値は下の 作図の見た目 1か所。
-  //   旗 __GSI_PICK_LIKE_CESIUM=false で従来（始点 10px・緑の小さい印・全体の線が緑）＝陽性対照。
-  // 作図の見た目（Cesium の Cesium.Color.CYAN / Cesium.Color.LIME と同じ色・印は辺の長さの 15%＝CesiumMap.jsx の drawPerpMark）
-  const 作図の見た目 = { 水色: '#00ffff', 黄緑: '#00ff00', 印の割合: 0.15 };
-  const _Cesiumと同じ = !(typeof window !== 'undefined' && window.__GSI_PICK_LIKE_CESIUM === false);
-  const 閉じる距離px = _Cesiumと同じ ? 20 : 10;   // 始点からこの距離より近ければ始点に吸い付き、押すと閉じる（Cesium の SNAP_PX）
+  // 【点をつなぐ作図の直角の機能は Cesium の「建物を点で結ぶ」と同じ・2026-11-28 ユーザー指摘】
+  //   「90度のマークはこれじゃねぇよ。cesiumで建物つくるときに…既存のコードを確認しろ」→「直角はできた。
+  //   デザインはcesiumと同じにする必要はなくそのままにしろ。あくまで直角機能だけまねろ」
+  //   ＝機能（直角の印＝角に入る辺の長さの 15%・始点へ戻る角の印・始点へ 20px で吸い付き押すと閉じる・Alt なら閉じずに置く・
+  //   右クリックで閉じる）は src/CesiumMap.jsx の建屋追加と同じ。見た目（オレンジの線・緑の印・白い始点）はこの窓のまま。
+  //   旗 __GSI_PICK_LIKE_CESIUM=false で従来（始点 10px・印 10px・右クリックで閉じない）＝陽性対照。
+  // 【Shift で垂直・水平・2026-11-28 ユーザー要望「1点目から2点目の最中垂直水平ができるようにShiftを押しながらだと
+  //   垂直水平モードになるようにしろ」】直角は2本目からしか効かないので、Shift を押している間はカーソルの線を
+  //   **画面の**横か縦（近い方）に寄せる（地図を回していれば回した向きの縦横）。2本目以降でも Shift が優先。
+  //   旗 __GSI_SHIFT_AXIS=false で効かない＝陽性対照。
+  const _直角機能 = !(typeof window !== 'undefined' && window.__GSI_PICK_LIKE_CESIUM === false);
+  const _軸モード = !(typeof window !== 'undefined' && window.__GSI_SHIFT_AXIS === false);
+  const 閉じる距離px = _直角機能 ? 20 : 10;   // 始点からこの距離より近ければ始点に吸い付き、押すと閉じる（Cesium の SNAP_PX）
+  const 印の割合 = 0.15;                       // L字の印の大きさ＝角に入る辺の長さの 15%（Cesium の drawPerpMark）
   const onDown = (e) => {
     const r = boxRef.current.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
@@ -335,6 +342,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     if (pickMode) {
       setHover(画面から(sx, sy));
       if (alt !== !!e.altKey) setAlt(!!e.altKey);
+      if (shift !== !!e.shiftKey) setShift(!!e.shiftKey);
       const k = pickRef.current;
       if (k) {
         if (!k.動いた && Math.hypot(sx - k.sx, sy - k.sy) > 5) k.動いた = true;
@@ -366,6 +374,31 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     const r = perpSnap2D(S, { x: sx, y: sy });
     return (r.snap90 || r.snapClose90) ? { ...r, S } : null;
   };
+  // 次の点をどこに置くか（見せる線と、押したときに置く位置は必ずこの1つで決める）。
+  //   種: 'start'（始点に寄る＝押すと閉じる）／'axis'（Shift の垂直・水平）／'90'（直角に吸い付く）／'free'
+  const _置く先 = (sx, sy, 止める, 軸) => {
+    const q = { x: sx, y: sy };
+    if (!pts.length) return { 種: 'free', target: q };
+    const S = pts.map(p => 画面へ(p.lat, p.lng)), last = S[S.length - 1];
+    if (S.length >= 3 && (!_直角機能 || !止める)) {
+      const d0 = Math.hypot(sx - S[0].x, sy - S[0].y);
+      if (_直角機能 ? d0 < 閉じる距離px : d0 <= 閉じる距離px) return { 種: 'start', target: S[0] };
+    }
+    if (軸 && _軸モード) {
+      const dx = sx - last.x, dy = sy - last.y;
+      const T = Math.abs(dx) >= Math.abs(dy) ? { x: sx, y: last.y } : { x: last.x, y: sy };
+      // 寄せた線が直前の辺・始点へ戻る辺とちょうど直角なら印を出す（画面に沿った長方形を描くとき）
+      const 直 = (ax, ay, bx, by) => { const al = Math.hypot(ax, ay), bl = Math.hypot(bx, by); return al > 1e-9 && bl > 1e-9 && Math.abs((ax * bx + ay * by) / (al * bl)) < 0.0175; };
+      const A = S.length >= 2 ? S[S.length - 2] : null;
+      return { 種: 'axis', target: T, snap90: !!(A && 直(last.x - A.x, last.y - A.y, T.x - last.x, T.y - last.y)),
+        snapClose90: !!(S.length >= 3 && 直(T.x - last.x, T.y - last.y, S[0].x - T.x, S[0].y - T.y)) };
+    }
+    if (!(typeof window !== 'undefined' && window.__GSI_PERP_SNAP === false)) {
+      const 吸 = _直角(sx, sy, 止める);
+      if (吸) return { 種: '90', target: 吸.target, snap90: 吸.snap90, snapClose90: 吸.snapClose90 };
+    }
+    return { 種: 'free', target: q };
+  };
   const onUp = (e) => {
     dragRef.current = null;
     if (rotRef.current) { rotRef.current = null; return; }
@@ -377,16 +410,12 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (pts.length === 0) { set四角(null); 四角を確定(k.p, 画面から(sx, sy), { x: k.sx, y: k.sy }, { x: sx, y: sy }); }
       return;
     }
-    // クリック: 始点の近くなら閉じる（Alt を押していれば閉じずに点を置く＝Cesium と同じ）。そうでなければ点を足す
+    // クリック: 始点の近くなら閉じる（Alt を押していれば閉じずに点を置く＝Cesium と同じ）。
+    //   そうでなければ点を足す（Shift なら垂直・水平、でなければ直角に吸い付いた位置。Alt なら押した所のまま）
     const _止 = (typeof snapSuppressedFor === 'function') ? snapSuppressedFor(e) : !!e.altKey;
-    if (pts.length >= 3 && (!_Cesiumと同じ || !_止)) {
-      const s0 = 画面へ(pts[0].lat, pts[0].lng);
-      const d0 = Math.hypot(sx - s0.x, sy - s0.y);
-      if (_Cesiumと同じ ? d0 < 閉じる距離px : d0 <= 閉じる距離px) { 多角形を確定(pts); return; }
-    }
-    // 直角に吸い付いた位置に置く（Alt を押していれば押した所のまま）
-    const 吸 = (typeof window !== 'undefined' && window.__GSI_PERP_SNAP === false) ? null : _直角(k.sx, k.sy, _止);
-    const 置く = 吸 ? 画面から(吸.target.x, 吸.target.y) : k.p;
+    const 先 = _置く先(k.sx, k.sy, _止, !!e.shiftKey);
+    if (先.種 === 'start') { 多角形を確定(pts); return; }
+    const 置く = 先.種 === 'free' ? k.p : 画面から(先.target.x, 先.target.y);
     setPts(prev => [...prev, 置く]);
   };
   // Backspace で1点戻す・Esc でやめる（範囲の指定中だけ）
@@ -395,12 +424,13 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     const onKey = (e) => {
       // Alt: 押している間は直角に吸い付かない（Windows で Alt がメニューへ取られないよう既定の動きを止める）
       if (e.key === 'Alt') { setAlt(e.type === 'keydown'); e.preventDefault(); return; }
+      if (e.key === 'Shift') { setShift(e.type === 'keydown'); return; }
       if (e.type !== 'keydown') return;
       const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
       if (e.key === 'Escape') { setPts([]); set四角(null); setPickMode(false); setMsg('範囲の指定をやめました'); e.preventDefault(); }
       else if (e.key === 'Backspace') { setPts(prev => prev.slice(0, -1)); e.preventDefault(); }
     };
-    const onBlur = () => setAlt(false);
+    const onBlur = () => { setAlt(false); setShift(false); };
     window.addEventListener('keydown', onKey);
     window.addEventListener('keyup', onKey);
     window.addEventListener('blur', onBlur);
@@ -587,7 +617,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
           // 右クリックで閉じる（3点以上・Cesium の建屋追加と同じ）。点をつないでいる間はブラウザのメニューを出さない
           if (!pickMode) return;
           e.preventDefault();
-          if (_Cesiumと同じ && pts.length >= 3) 多角形を確定(pts);
+          if (_直角機能 && pts.length >= 3) 多角形を確定(pts);
         }}>
         {/* タイルは北が上の並びのまま、入れ物ごと回す（真ん中を中心に） */}
         <div data-gsi-tiles="1" style={{ position: 'absolute', inset: 0, pointerEvents: 'none',
@@ -617,58 +647,31 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
               width={Math.abs(a.x - b.x)} height={Math.abs(a.y - b.y)}
               fill="rgba(249,115,22,0.15)" stroke="#f97316" strokeWidth={2} />;
           })()}
-          {pts.length > 0 && _Cesiumと同じ && (() => {
-            // Cesium の建屋追加と同じ描き方（src/CesiumMap.jsx: 置いた点・置いた線＝始点まで閉じた水色の線／
-            //   カーソルの線＝吸い付いたら黄緑の太線／始点へ戻る線＝直角なら黄緑／始点に吸い付いたら始点を黄緑で囲む／
-            //   L字の印＝角に入る辺の長さの 15%）
-            const 見 = 作図の見た目;
+          {pts.length > 0 && (() => {
+            // 見た目はこの窓のまま（オレンジの線・緑の印・白い始点）。置く位置は _置く先 1つで決める（押したときと同じ）
             const S = pts.map(p => 画面へ(p.lat, p.lng));
             const last = S[S.length - 1];
             const h0 = hover ? 画面へ(hover.lat, hover.lng) : null;
-            const 吸い付き禁止 = alt || (typeof window !== 'undefined' && window.__GSI_PERP_SNAP === false);
-            const 始点に寄る = !!(h0 && pts.length >= 3 && !alt && Math.hypot(h0.x - S[0].x, h0.y - S[0].y) < 閉じる距離px);
-            const 吸 = (h0 && !始点に寄る && !吸い付き禁止) ? _直角(h0.x, h0.y, false) : null;
-            const h = 始点に寄る ? S[0] : (吸 ? 吸.target : h0);
-            const 寄る = 始点に寄る || !!吸;
-            const L字 = (角, 元, 先) => { const el = Math.hypot(角.x - 元.x, 角.y - 元.y); return el > 1e-9 ? perpMark2D(角, 元, 先, el * 見.印の割合) : null; };
+            const 先 = h0 ? _置く先(h0.x, h0.y, alt, shift) : null;
+            const h = 先 ? 先.target : null;
+            const 閉じる = !!(先 && 先.種 === 'start');
+            const 寄せた = !!(先 && (先.種 === '90' || 先.種 === 'axis'));
+            const 線 = S.concat(h ? [h] : []);
+            const L字 = (角, 元, 先2) => { const el = Math.hypot(角.x - 元.x, 角.y - 元.y);
+              return el > 1e-9 ? perpMark2D(角, 元, 先2, _直角機能 ? el * 印の割合 : 10) : null; };
             const 印ら = [];
-            if (吸 && 吸.snap90 && S.length >= 2) 印ら.push(L字(last, S[S.length - 2], h));
-            if (吸 && 吸.snapClose90 && S.length >= 2) 印ら.push(L字(h, last, S[0]));
-            const 線 = (q) => q.map(p => p.x + ',' + p.y).join(' ');
-            return (<g data-gsi="pick-poly" data-gsi-snap={寄る ? (始点に寄る ? 'start' : '90') : ''}>
-              {S.length >= 2 && <polyline data-gsi="pick-placed" points={線(S.concat([S[0]]))} fill="none"
-                stroke={見.水色} strokeOpacity={0.8} strokeWidth={2} />}
-              {h && <line data-gsi="pick-cursor" x1={last.x} y1={last.y} x2={h.x} y2={h.y}
-                stroke={寄る ? 見.黄緑 : 見.水色} strokeOpacity={寄る ? 1 : 0.6} strokeWidth={寄る ? 3 : 1.5} />}
-              {h && !始点に寄る && pts.length >= 2 && <line data-gsi="pick-close" x1={h.x} y1={h.y} x2={S[0].x} y2={S[0].y}
-                stroke={吸 && 吸.snapClose90 ? 見.黄緑 : 見.水色} strokeOpacity={吸 && 吸.snapClose90 ? 0.6 : 0.3} strokeWidth={吸 && 吸.snapClose90 ? 2.5 : 1} />}
-              {始点に寄る && <circle data-gsi="pick-start-snap" cx={S[0].x} cy={S[0].y} r={7} fill={見.黄緑} fillOpacity={0.5} stroke={見.黄緑} strokeWidth={2} />}
-              {印ら.filter(Boolean).map((m, i) => <polyline key={'p' + i} data-gsi="perp-mark" points={線(m)}
-                fill="none" stroke={見.黄緑} strokeWidth={2} />)}
-              {S.map((q, i) => <circle key={i} cx={q.x} cy={q.y} r={i === 0 ? 5 : 3.5}
-                fill={i === 0 ? 見.水色 : '#ffffff'} stroke="#000000" strokeWidth={1} />)}
-            </g>);
-          })()}
-          {pts.length > 0 && !_Cesiumと同じ && (() => {
-            const S = pts.map(p => 画面へ(p.lat, p.lng));
-            const h0 = hover ? 画面へ(hover.lat, hover.lng) : null;
-            const 閉じる = !!(h0 && pts.length >= 3 && Math.hypot(h0.x - S[0].x, h0.y - S[0].y) <= 閉じる距離px);
-            // 直角に吸い付く（閉じるときは始点が優先・Alt を押していれば吸い付かない）
-            const 吸 = (h0 && !閉じる && !(typeof window !== 'undefined' && window.__GSI_PERP_SNAP === false)) ? _直角(h0.x, h0.y, alt) : null;
-            const h = 吸 ? 吸.target : h0;
-            const 線 = S.concat(h ? [閉じる ? S[0] : h] : []);
-            const 印ら = [];
-            if (吸 && h && 吸.snap90 && S.length >= 2) 印ら.push(perpMark2D(S[S.length - 1], S[S.length - 2], h, 10));
-            if (吸 && h && 吸.snapClose90 && S.length >= 2) 印ら.push(perpMark2D(h, S[S.length - 1], S[0], 10));
-            return (<g data-gsi="pick-poly">
+            if (寄せた && h && 先.snap90 && S.length >= 2) 印ら.push(L字(last, S[S.length - 2], h));
+            if (寄せた && h && 先.snapClose90 && S.length >= 2) 印ら.push(L字(h, last, S[0]));
+            return (<g data-gsi="pick-poly" data-gsi-snap={先 ? 先.種 : ''}>
               {pts.length >= 3 && <polygon points={S.map(q => q.x + ',' + q.y).join(' ')} fill="rgba(249,115,22,0.12)" stroke="none" />}
-              <polyline points={線.map(q => q.x + ',' + q.y).join(' ')} fill="none" stroke={吸 ? '#22c55e' : '#f97316'} strokeWidth={2} />
+              <polyline data-gsi="pick-line" points={線.map(q => q.x + ',' + q.y).join(' ')} fill="none" stroke={寄せた ? '#22c55e' : '#f97316'} strokeWidth={2} />
               {/* 始点へ戻る辺（直角なら緑） */}
               {h && !閉じる && pts.length >= 2 && <line data-gsi="pick-close" x1={h.x} y1={h.y} x2={S[0].x} y2={S[0].y}
-                stroke={吸 && 吸.snapClose90 ? '#22c55e' : '#f97316'} strokeWidth={1} strokeDasharray="4 3" opacity={0.8} />}
+                stroke={寄せた && 先.snapClose90 ? '#22c55e' : '#f97316'} strokeWidth={1} strokeDasharray="4 3" opacity={0.8} />}
               {印ら.filter(Boolean).map((m, i) => <polyline key={'p' + i} data-gsi="perp-mark" points={m.map(q => q.x + ',' + q.y).join(' ')}
                 fill="none" stroke="#22c55e" strokeWidth={2} />)}
               {S.map((q, i) => <circle key={i} cx={q.x} cy={q.y} r={i === 0 ? (閉じる ? 8 : 6) : 4}
+                data-gsi={i === 0 && 閉じる ? 'pick-start-snap' : undefined}
                 fill={i === 0 ? (閉じる ? '#22c55e' : '#fff') : '#f97316'} stroke={i === 0 ? '#f97316' : '#fff'} strokeWidth={i === 0 ? 2.5 : 1.5} />)}
             </g>);
           })()}
