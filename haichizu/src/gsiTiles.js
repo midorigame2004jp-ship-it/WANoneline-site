@@ -27,8 +27,16 @@ const GSI_FETCH_GRID = 401;
 // 取り込む格子は「元データの細かさ」に見合う量にする（2026-11-23）。
 // 5mメッシュを 401 点（1.4m間隔）で取り込んでも、増えるのは補間の時間だけで情報は増えない。
 // 実測: 401 点だと取り込みに約9秒（タイルの読み取り＋補間 160801 点）かかった。
-function gsiFetchGridFor(選) {
-  return (Number(選) === 1) ? GSI_FETCH_GRID : 201; // 1=1mメッシュのときだけ細かく
+// 【範囲の大きさで取り込む点の数を決める・2026-11-28 ユーザー報告「範囲を大きくすると拡大しても地面の高さがほぼ無いようになる」】
+//   従来は範囲によらず 201 点（1m のときだけ 401 点）。範囲 1.6km なら 8m おき＝5mメッシュより粗く、護岸のような段差が均されていた。
+//   標高データのいちばん細かい間隔（1m／5m／10m）で範囲を割った数にする（少なくとも従来の数・多くても GSI_FETCH_GRID_MAX）。
+//   長m … 範囲の長い辺（メートル）。旗 globalThis.__GSI_FETCH_BY_METERS = false で従来
+const GSI_FETCH_GRID_MAX = 1201;
+function gsiDemResolutionM(選) { const n = Number(選); return n === 1 ? 1 : (n === 3 ? 10 : 5); }
+function gsiFetchGridFor(選, 長m) {
+  const 基 = (Number(選) === 1) ? GSI_FETCH_GRID : 201; // 1=1mメッシュのときだけ細かく
+  if (!(長m > 0) || (typeof globalThis !== 'undefined' && globalThis.__GSI_FETCH_BY_METERS === false)) return 基;
+  return Math.max(基, Math.min(GSI_FETCH_GRID_MAX, Math.ceil(長m / gsiDemResolutionM(選)) + 1));
 }
 
 // 標高タイルの種類。精度の高い順。整備されていない地域があるので、取れなければ下へ落とす。

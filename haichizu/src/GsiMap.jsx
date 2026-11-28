@@ -20,11 +20,15 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     const poly = (typeof getSavedFieldPolygon === 'function') ? getSavedFieldPolygon() : null;
     if (poly && poly.length >= 3) {
       const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
-      return { lat: (Math.min(...lats) + Math.max(...lats)) / 2, lng: (Math.min(...lngs) + Math.max(...lngs)) / 2, z: 16 };
+      return { lat: (Math.min(...lats) + Math.max(...lats)) / 2, lng: (Math.min(...lngs) + Math.max(...lngs)) / 2, z: 16, rot: 0 };
     }
     const o = (typeof GEO_ORIGIN !== 'undefined' && GEO_ORIGIN) ? GEO_ORIGIN : { lat: 33.275, lng: 131.667 };
-    return { lat: o.lat, lng: o.lng, z: 15 };
+    return { lat: o.lat, lng: o.lng, z: 15, rot: 0 };
   });
+  // 地図を回している間の控え（右ボタン／Ctrl＋左ボタンのドラッグ）{ a0: 押した点の角度, rot0 }
+  const rotRef = React.useRef(null);
+  // Alt を押している間は直角に吸い付かない（印も出さない）。描き直しのために持つ
+  const [alt, setAlt] = React.useState(false);
   const [pickMode, setPickMode] = React.useState(false);
   // 【範囲の指定・2026-11-28 ユーザー要望】ドラッグ＝四角で囲む（離したら確認）／クリック＝点をつないでいき、
   //   始点をクリックすると閉じた形（建物を点で結んで作るときと同じ）。地面と建物の取り込みもその範囲の中だけ。
@@ -32,7 +36,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   const [hover, setHover] = React.useState(null);     // 範囲指定中のカーソル位置
   const [四角, set四角] = React.useState(null);       // ドラッグ中の四角 { a, b }（緯度経度）
   const pickRef = React.useRef(null);                  // 押した点 { sx, sy, p, 動いた }
-  const 範囲の案内 = 'ドラッグで四角を囲む／クリックで点をつなぎ、始点をクリックで閉じる（Backspace で1点戻す・Esc でやめる）';
+  const 範囲の案内 = 'ドラッグで四角を囲む／クリックで点をつなぎ、始点をクリックで閉じる（直角に吸い付く・Alt で吸い付かない／Backspace で1点戻す・Esc でやめる）';
   const [busy, setBusy] = React.useState(null);       // 取得中の進捗の文字
   const [msg, setMsg] = React.useState('');
   // 取り込み対象が上限より多いときの確認（すべて読み込む／上限まで／やめる）。{ items, 情報, 超え: [{名, 数}], 上限 }
@@ -58,21 +62,34 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   const cx = gsiLngToTileX(view.lng, z);
   const cy = gsiLatToTileY(view.lat, z);
 
+  // 【地図の回転・2026-11-28 ユーザー要望「国土地理院のマップは回転できないのか。北が上となっており形状によって範囲設定が難しい」】
+  //   rot は地図を画面の上で時計回りに回す角度（度）。窓の真ん中を中心に回す。
+  //   タイルは「北が上」の並びのまま、入れ物ごと CSS で回す。線・点（SVG）は下の 画面へ が回した位置を返す。
+  //   変換はこの2つ（画面から・画面へ）だけ。押す・動かす・ホイール・範囲の確定は全部これを通る。
+  const 回転 = Math.round(((view.rot || 0) % 360 + 360) % 360 * 10) / 10;
+  const _角 = 回転 * Math.PI / 180, _cA = Math.cos(_角), _sA = Math.sin(_角);
+  // 北が上の地図の中の座標 → 回した画面の座標（CSS の rotate と同じ向き）
+  const _回す = (x, y) => { const dx = x - 半W, dy = y - 半H; return { x: 半W + dx * _cA - dy * _sA, y: 半H + dx * _sA + dy * _cA }; };
+  // 画面の上の動き（ベクトル）→ 北が上の地図の中の動き
+  const _戻すV = (dx, dy) => ({ x: dx * _cA + dy * _sA, y: -dx * _sA + dy * _cA });
   // 画面 ⇄ 緯度経度（この窓の中だけの変換。図面のグリッドとは別物）
-  const 画面から = (sx, sy) => ({
-    lat: gsiTileYToLat(cy + (sy - 半H) / GSI_TILE_SIZE, z),
-    lng: gsiTileXToLng(cx + (sx - 半W) / GSI_TILE_SIZE, z),
-  });
-  const 画面へ = (lat, lng) => ({
-    x: (gsiLngToTileX(lng, z) - cx) * GSI_TILE_SIZE + 半W,
-    y: (gsiLatToTileY(lat, z) - cy) * GSI_TILE_SIZE + 半H,
-  });
+  const 画面から = (sx, sy) => {
+    const m = _戻すV(sx - 半W, sy - 半H);
+    return { lat: gsiTileYToLat(cy + m.y / GSI_TILE_SIZE, z), lng: gsiTileXToLng(cx + m.x / GSI_TILE_SIZE, z) };
+  };
+  const 画面へ = (lat, lng) => _回す(
+    (gsiLngToTileX(lng, z) - cx) * GSI_TILE_SIZE + 半W,
+    (gsiLatToTileY(lat, z) - cy) * GSI_TILE_SIZE + 半H);
 
-  // 並べるタイル
+  // 観測（製品は読まない）: 検査が画面と緯度経度の変換・回転・つないだ点を読む
+  React.useEffect(() => { if (typeof window !== 'undefined') window.__gsiMapForCheck = { 画面から, 画面へ, 回転, pts, w: size.w, h: size.h }; });
+  // 並べるタイル（回しても窓の隅まで埋まるよう、真ん中から対角線の半分まで並べる）
   const タイルら = [];
   {
-    const x0 = Math.floor(cx - 半W / GSI_TILE_SIZE), x1 = Math.floor(cx + 半W / GSI_TILE_SIZE);
-    const y0 = Math.floor(cy - 半H / GSI_TILE_SIZE), y1 = Math.floor(cy + 半H / GSI_TILE_SIZE);
+    const 半R = 回転 ? Math.hypot(半W, 半H) : null;
+    const rx = 回転 ? 半R : 半W, ry = 回転 ? 半R : 半H;
+    const x0 = Math.floor(cx - rx / GSI_TILE_SIZE), x1 = Math.floor(cx + rx / GSI_TILE_SIZE);
+    const y0 = Math.floor(cy - ry / GSI_TILE_SIZE), y1 = Math.floor(cy + ry / GSI_TILE_SIZE);
     const 枚 = Math.pow(2, z);
     for (let ty = y0; ty <= y1; ty++) {
       if (ty < 0 || ty >= 枚) continue;
@@ -273,9 +290,15 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   // ── 操作 ──
   const 閉じる距離px = 10;   // 始点からこの距離以内をクリックしたら閉じる
   const onDown = (e) => {
-    if (e.button !== 0) return;
     const r = boxRef.current.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    // 右ボタン／Ctrl＋左ボタンのドラッグで地図を回す（国土地理院の地図（ベクトル）と同じ操作）
+    if ((e.button === 2 || (e.button === 0 && e.ctrlKey)) && !(typeof window !== 'undefined' && window.__GSI_ROTATE === false)) {
+      rotRef.current = { a0: Math.atan2(sy - 半H, sx - 半W), rot0: view.rot || 0 };
+      e.preventDefault();
+      return;
+    }
+    if (e.button !== 0) return;
     if (pickMode) {
       // 押した時点では決めない（離したときに「ドラッグか・クリックか」で分ける）
       pickRef.current = { sx, sy, p: 画面から(sx, sy), 動いた: false, lat: view.lat, lng: view.lng };
@@ -288,8 +311,19 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   const onMove = (e) => {
     const r = boxRef.current.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    const 回 = rotRef.current;
+    if (回) {
+      // 押した点の角度からどれだけ回ったか。Shift を押していれば 15° 刻み
+      let d = (Math.atan2(sy - 半H, sx - 半W) - 回.a0) * 180 / Math.PI;
+      let nr = 回.rot0 + d;
+      if (e.shiftKey) nr = Math.round(nr / 15) * 15;
+      nr = ((nr % 360) + 360) % 360;
+      setView(v => ({ ...v, rot: Math.round(nr * 10) / 10 }));
+      return;
+    }
     if (pickMode) {
       setHover(画面から(sx, sy));
+      if (alt !== !!e.altKey) setAlt(!!e.altKey);
       const k = pickRef.current;
       if (k) {
         if (!k.動いた && Math.hypot(sx - k.sx, sy - k.sy) > 5) k.動いた = true;
@@ -297,8 +331,9 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
           if (pts.length === 0) set四角({ a: k.p, b: 画面から(sx, sy) });   // 最初の点の前のドラッグ＝四角で囲む
           else {
             // 点をつないでいる途中のドラッグは地図を動かす（つなぎかけの点は残す）
-            const fx = gsiLngToTileX(k.lng, z) - (sx - k.sx) / GSI_TILE_SIZE;
-            const fy = gsiLatToTileY(k.lat, z) - (sy - k.sy) / GSI_TILE_SIZE;
+            const m = _戻すV(sx - k.sx, sy - k.sy);
+            const fx = gsiLngToTileX(k.lng, z) - m.x / GSI_TILE_SIZE;
+            const fy = gsiLatToTileY(k.lat, z) - m.y / GSI_TILE_SIZE;
             setView(v => ({ ...v, lng: gsiTileXToLng(fx, z), lat: gsiTileYToLat(fy, z) }));
           }
         }
@@ -307,18 +342,28 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     }
     const d = dragRef.current;
     if (!d) return;
-    const fx = gsiLngToTileX(d.lng, z) - (sx - d.sx) / GSI_TILE_SIZE;
-    const fy = gsiLatToTileY(d.lat, z) - (sy - d.sy) / GSI_TILE_SIZE;
+    const m = _戻すV(sx - d.sx, sy - d.sy);
+    const fx = gsiLngToTileX(d.lng, z) - m.x / GSI_TILE_SIZE;
+    const fy = gsiLatToTileY(d.lat, z) - m.y / GSI_TILE_SIZE;
     setView(v => ({ ...v, lng: gsiTileXToLng(fx, z), lat: gsiTileYToLat(fy, z) }));
+  };
+  // 点をつなぐときの直角の吸い付き（規則は geometry.js の perpSnap2D 1つ＝Cesium で建物を点で結ぶときと同じ）。
+  //   画面の上で計算する（地図の投影は角度を保つので、画面の角度＝地面の角度）。吸い付かせないときは null
+  const _直角 = (sx, sy, 止める) => {
+    if (止める || typeof perpSnap2D !== 'function' || pts.length < 2) return null;
+    const S = pts.map(p => 画面へ(p.lat, p.lng));
+    const r = perpSnap2D(S, { x: sx, y: sy });
+    return (r.snap90 || r.snapClose90) ? { ...r, S } : null;
   };
   const onUp = (e) => {
     dragRef.current = null;
+    if (rotRef.current) { rotRef.current = null; return; }
     const k = pickRef.current; pickRef.current = null;
     if (!pickMode || !k || !e || e.type === 'mouseleave') { if (e && e.type === 'mouseleave') set四角(null); return; }
     const r = boxRef.current.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
     if (k.動いた) {
-      if (pts.length === 0) { set四角(null); 四角を確定(k.p, 画面から(sx, sy)); }
+      if (pts.length === 0) { set四角(null); 四角を確定(k.p, 画面から(sx, sy), { x: k.sx, y: k.sy }, { x: sx, y: sy }); }
       return;
     }
     // クリック: 始点の近くなら閉じる。そうでなければ点を足す
@@ -326,18 +371,28 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       const s0 = 画面へ(pts[0].lat, pts[0].lng);
       if (Math.hypot(sx - s0.x, sy - s0.y) <= 閉じる距離px) { 多角形を確定(pts); return; }
     }
-    setPts(prev => [...prev, k.p]);
+    // 直角に吸い付いた位置に置く（Alt を押していれば押した所のまま）
+    const _止 = (typeof snapSuppressedFor === 'function') ? snapSuppressedFor(e) : !!e.altKey;
+    const 吸 = (typeof window !== 'undefined' && window.__GSI_PERP_SNAP === false) ? null : _直角(k.sx, k.sy, _止);
+    const 置く = 吸 ? 画面から(吸.target.x, 吸.target.y) : k.p;
+    setPts(prev => [...prev, 置く]);
   };
   // Backspace で1点戻す・Esc でやめる（範囲の指定中だけ）
   React.useEffect(() => {
     if (!pickMode) return undefined;
     const onKey = (e) => {
+      // Alt: 押している間は直角に吸い付かない（Windows で Alt がメニューへ取られないよう既定の動きを止める）
+      if (e.key === 'Alt') { setAlt(e.type === 'keydown'); e.preventDefault(); return; }
+      if (e.type !== 'keydown') return;
       const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
       if (e.key === 'Escape') { setPts([]); set四角(null); setPickMode(false); setMsg('範囲の指定をやめました'); e.preventDefault(); }
       else if (e.key === 'Backspace') { setPts(prev => prev.slice(0, -1)); e.preventDefault(); }
     };
+    const onBlur = () => setAlt(false);
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKey);
+    window.addEventListener('blur', onBlur);
+    return () => { window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', onKey); window.removeEventListener('blur', onBlur); };
   }, [pickMode]);
   const onWheel = (e) => {
     e.preventDefault();
@@ -346,9 +401,10 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     const 下 = 画面から(sx, sy);                 // カーソルの下の点を保つ
     const nz = Math.max(5, Math.min(18, z + (e.deltaY < 0 ? 1 : -1)));
     if (nz === z) return;
-    const ncx = gsiLngToTileX(下.lng, nz) - (sx - 半W) / GSI_TILE_SIZE;
-    const ncy = gsiLatToTileY(下.lat, nz) - (sy - 半H) / GSI_TILE_SIZE;
-    setView({ z: nz, lng: gsiTileXToLng(ncx, nz), lat: gsiTileYToLat(ncy, nz) });
+    const m = _戻すV(sx - 半W, sy - 半H);        // 回しているときは北が上の向きに直してから
+    const ncx = gsiLngToTileX(下.lng, nz) - m.x / GSI_TILE_SIZE;
+    const ncy = gsiLatToTileY(下.lat, nz) - m.y / GSI_TILE_SIZE;
+    setView(v => ({ ...v, z: nz, lng: gsiTileXToLng(ncx, nz), lat: gsiTileYToLat(ncy, nz) }));
   };
 
   // ── 3次元範囲を設定（ドラッグの四角／クリックでつないだ形 → フィールド）──
@@ -367,7 +423,20 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       else setMsg('範囲の設定をやめました');
     }, 0);
   };
-  const 四角を確定 = (p1, p2) => {
+  const 四角を確定 = (p1, p2, s1, s2) => {
+    // 地図を回しているときは、画面の上の四角＝地面の上で回した四角（4つの角を緯度経度に直す）
+    if (回転 && s1 && s2 && !(typeof window !== 'undefined' && window.__GSI_ROTATE === false)) {
+      const 角ら = [[s1.x, s1.y], [s2.x, s1.y], [s2.x, s2.y], [s1.x, s2.y]].map(([x, y]) => 画面から(x, y));
+      const b2 = _外接(角ら);
+      const 長さ = (a, c) => Math.hypot((c.lng - a.lng) * b2.mPerDegLng, (c.lat - a.lat) * 111320);
+      const 辺1 = 長さ(角ら[0], 角ら[1]), 辺2 = 長さ(角ら[1], 角ら[2]);
+      if (辺1 < 1 || 辺2 < 1) { setMsg('範囲が小さすぎます。もう少し大きく囲んでください'); return; }
+      _確かめて決める(角ら, 'この四角（地図を ' + Math.round(回転) + '° 回した向き）を3次元の範囲にしますか？\n'
+        + '  辺の長さ ' + Math.round(辺1) + ' m × ' + Math.round(辺2) + ' m\n\n'
+        + '図面（平面図・3次元図）は北が上のまま、この四角が入る大きさになり、地面と建物はこの四角の中だけ取り込みます。\n'
+        + '座標が合わせ直され、画面を読み込み直します。');
+      return;
+    }
     const poly0 = [p1, p2];
     const b = _外接(poly0);
     if (b.幅m < 1 || b.高m < 1) { setMsg('範囲が小さすぎます。もう少し大きく囲んでください'); return; }
@@ -415,7 +484,9 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     //   表示できず**、細かくするには「地面を作る」を押し直すしか無かった（荒くする方向だけ自由）。
     //   取り込みは1回なので常に上限で取り、**表示の細かさは歯車で後からいくらでも変えられる**ようにする。
     //   gridN（歯車の値）はここでは使わない＝表示側（App の terrainToMesh）が使う。
-    const 格子 = gsiFetchGridFor(demSource);
+    // 範囲の長い辺（メートル）。点の数は標高データの細かさで割って決める（gsiFetchGridFor）
+    const _長m = Math.max((b.east - b.west) * 111320 * Math.cos(((b.north + b.south) / 2) * Math.PI / 180), (b.north - b.south) * 111320);
+    const 格子 = gsiFetchGridFor(demSource, _長m);
     // 精度の高い順に重ねて読む（dem5a が無い画素は dem から）。
     // 「1種類で1枚でも取れたら打ち切る」にすると、取れなかったタイルの範囲が
     // 丸ごと欠けて平らになる（2026-11-23 ユーザー実機報告）。
@@ -496,13 +567,18 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       </div>
 
       {/* 地図 */}
-      <div ref={boxRef} data-gsi-map="1"
+      <div ref={boxRef} data-gsi-map="1" data-gsi-rot={回転}
         style={{ position: 'relative', flex: 1, overflow: 'hidden', cursor: pickMode ? 'crosshair' : 'grab', background: '#1e293b' }}
-        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp} onWheel={onWheel}>
-        {タイルら.map(t => (
-          <img key={t.key} src={t.url} alt="" draggable={false}
-            style={{ position: 'absolute', left: t.left, top: t.top, width: GSI_TILE_SIZE, height: GSI_TILE_SIZE, userSelect: 'none', pointerEvents: 'none' }} />
-        ))}
+        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp} onWheel={onWheel}
+        onContextMenu={(e) => e.preventDefault()}>
+        {/* タイルは北が上の並びのまま、入れ物ごと回す（真ん中を中心に） */}
+        <div data-gsi-tiles="1" style={{ position: 'absolute', inset: 0, pointerEvents: 'none',
+          transform: 回転 ? 'rotate(' + 回転 + 'deg)' : undefined, transformOrigin: 半W + 'px ' + 半H + 'px' }}>
+          {タイルら.map(t => (
+            <img key={t.key} src={t.url} alt="" draggable={false}
+              style={{ position: 'absolute', left: t.left, top: t.top, width: GSI_TILE_SIZE, height: GSI_TILE_SIZE, userSelect: 'none', pointerEvents: 'none' }} />
+          ))}
+        </div>
 
         <svg style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>
           {図面の枠 && (
@@ -521,17 +597,43 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
           })()}
           {pts.length > 0 && (() => {
             const S = pts.map(p => 画面へ(p.lat, p.lng));
-            const h = hover ? 画面へ(hover.lat, hover.lng) : null;
-            const 閉じる = !!(h && pts.length >= 3 && Math.hypot(h.x - S[0].x, h.y - S[0].y) <= 閉じる距離px);
+            const h0 = hover ? 画面へ(hover.lat, hover.lng) : null;
+            const 閉じる = !!(h0 && pts.length >= 3 && Math.hypot(h0.x - S[0].x, h0.y - S[0].y) <= 閉じる距離px);
+            // 直角に吸い付く（閉じるときは始点が優先・Alt を押していれば吸い付かない）
+            const 吸 = (h0 && !閉じる && !(typeof window !== 'undefined' && window.__GSI_PERP_SNAP === false)) ? _直角(h0.x, h0.y, alt) : null;
+            const h = 吸 ? 吸.target : h0;
             const 線 = S.concat(h ? [閉じる ? S[0] : h] : []);
+            const 印ら = [];
+            if (吸 && h && 吸.snap90 && S.length >= 2) 印ら.push(perpMark2D(S[S.length - 1], S[S.length - 2], h, 10));
+            if (吸 && h && 吸.snapClose90 && S.length >= 2) 印ら.push(perpMark2D(h, S[S.length - 1], S[0], 10));
             return (<g data-gsi="pick-poly">
               {pts.length >= 3 && <polygon points={S.map(q => q.x + ',' + q.y).join(' ')} fill="rgba(249,115,22,0.12)" stroke="none" />}
-              <polyline points={線.map(q => q.x + ',' + q.y).join(' ')} fill="none" stroke="#f97316" strokeWidth={2} />
+              <polyline points={線.map(q => q.x + ',' + q.y).join(' ')} fill="none" stroke={吸 ? '#22c55e' : '#f97316'} strokeWidth={2} />
+              {/* 始点へ戻る辺（直角なら緑） */}
+              {h && !閉じる && pts.length >= 2 && <line data-gsi="pick-close" x1={h.x} y1={h.y} x2={S[0].x} y2={S[0].y}
+                stroke={吸 && 吸.snapClose90 ? '#22c55e' : '#f97316'} strokeWidth={1} strokeDasharray="4 3" opacity={0.8} />}
+              {印ら.filter(Boolean).map((m, i) => <polyline key={'p' + i} data-gsi="perp-mark" points={m.map(q => q.x + ',' + q.y).join(' ')}
+                fill="none" stroke="#22c55e" strokeWidth={2} />)}
               {S.map((q, i) => <circle key={i} cx={q.x} cy={q.y} r={i === 0 ? (閉じる ? 8 : 6) : 4}
                 fill={i === 0 ? (閉じる ? '#22c55e' : '#fff') : '#f97316'} stroke={i === 0 ? '#f97316' : '#fff'} strokeWidth={i === 0 ? 2.5 : 1.5} />)}
             </g>);
           })()}
         </svg>
+
+        {/* 方位: 針は北を指す。押すと北を上に戻す（右ボタン／Ctrl＋左ボタンのドラッグで回す・Shift で 15° 刻み） */}
+        {!(typeof window !== 'undefined' && window.__GSI_ROTATE === false) && (
+          <div data-gsi-compass="1" title={'地図の向き ' + Math.round(回転) + '°（押すと北が上に戻る／右ボタンか Ctrl＋左ボタンのドラッグで回す・Shift で 15° 刻み）'}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => { e.stopPropagation(); setView(v => ({ ...v, rot: 0 })); }}
+            style={{ position: 'absolute', right: 6, top: 6, width: 34, height: 34, borderRadius: 17, cursor: 'pointer',
+              background: 'rgba(15,23,42,0.8)', border: '1px solid rgba(148,163,184,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <svg width="26" height="26" viewBox="-13 -13 26 26" style={{ transform: 'rotate(' + 回転 + 'deg)' }}>
+              <polygon points="0,-11 4,0 -4,0" fill="#ef4444" />
+              <polygon points="0,11 4,0 -4,0" fill="#e2e8f0" />
+            </svg>
+            {回転 !== 0 && <span style={{ position: 'absolute', top: 36, right: 0, fontSize: 10, background: 'rgba(15,23,42,0.8)', padding: '0 4px', borderRadius: 3, whiteSpace: 'nowrap' }}>{Math.round(回転)}°</span>}
+          </div>
+        )}
 
         {/* 出典（地理院タイルの利用条件） */}
         <div style={{ position: 'absolute', right: 4, bottom: 3, fontSize: 10, background: 'rgba(15,23,42,0.75)', padding: '1px 5px', borderRadius: 3 }}>
@@ -554,7 +656,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       )}
       {/* 知らせ */}
       <div style={{ fontSize: 11, padding: '3px 6px', background: '#1e293b', minHeight: 18, lineHeight: '14px' }}>
-        {busy ? busy : (msg || (pickMode ? 範囲の案内 : '水色の点線＝いまの図面の範囲／黄色＝フィールド'))}
+        {busy ? busy : (msg || (pickMode ? 範囲の案内 : '水色の点線＝いまの図面の範囲／黄色＝フィールド／右ボタン（または Ctrl＋左ボタン）のドラッグで地図を回す'))}
       </div>
     </div>
   );

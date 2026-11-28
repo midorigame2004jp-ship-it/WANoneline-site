@@ -677,7 +677,7 @@ const PP_BOX_COLOR = '#A78BFA'; // 建物3Dでの盤の色。床置き機器(#38
 //   複製されている。1つ直しても他に同じ不具合が残る（Codex/監査指摘）。
 // deltaMode: 0=px / 1=行 / 2=ページ。行・ページ単位のブラウザでは px へ直す
 const WHEEL_LINE_PX = 16, WHEEL_PAGE_PX = 400;
-function wheelIntent(e) {
+function wheelIntent(e, perNotch) {
   const unit = e.deltaMode === 1 ? WHEEL_LINE_PX : (e.deltaMode === 2 ? WHEEL_PAGE_PX : 1);
   const dx = (e.deltaX || 0) * unit, dy = (e.deltaY || 0) * unit;
   // 横の方が大きい＝左右チルト（または2本指の横スワイプ）→ 倍率は変えず左右へ流す
@@ -689,7 +689,8 @@ function wheelIntent(e) {
   //   どの図も同じ式（倍率の決め方はここ1か所）。旗 window.__WHEEL_ZOOM_BY_DELTA = false で従来（1回 1.07 倍）
   const _従来 = (typeof window !== 'undefined' && window.__WHEEL_ZOOM_BY_DELTA === false);
   const _量 = Math.min(Math.abs(dy), 300);
-  const factorUp = _従来 ? 1.07 : Math.exp(_量 * Math.log(1.25) / 100);
+  //   perNotch … 1目盛（100px）の倍率。図ごとに渡せる（既定 1.25。3次元図は従来の 1目盛 12% に合わせて 1.12）
+  const factorUp = _従来 ? 1.07 : Math.exp(_量 * Math.log(perNotch > 1 ? perNotch : 1.25) / 100);
   return { dir: dy > 0 ? -1 : 1, panX: 0, factor: dy > 0 ? 1 / factorUp : factorUp };     // 下へ回す=縮小 / 上へ回す=拡大
 }
 
@@ -909,8 +910,16 @@ if (typeof window !== 'undefined') window.__MENU_WORDS = MENU_WORDS;
 const SETTING_DEFS = [
   { id: 'terrainBands', label: '地形の色の段数', 既定: 12, min: 2, max: 48, step: 1,
     note: '多いほどなめらか。描く物が段の数だけ増える（すぐ効く）' },
+  // 【地形の網目は「メートル」で決める・2026-11-28 ユーザー報告「範囲を大きくすると拡大しても地面の高さがほぼ無いようになる」】
+  //   従来は範囲を「地形の細かさ」の数（既定 81）で割っていたので、範囲が広いほど1マスが大きく（1.6km なら 20m）、
+  //   護岸のような段差が坂に均されていた（高さそのものは実寸のまま）。既定は標高データの細かさ（5mメッシュなら 5m）で割る。
+  //   決め方は App の _terrainDiv 1か所（面・崖・等高線・道路の塗り・建物を乗せる高さが全部これを読む）
+  { id: 'terrainCellM', label: '地形の1マスの大きさ', 既定: 0, min: -1, max: 20, step: 1,
+    選: [{ v: 0, label: '自動（標高データの細かさ）' }, { v: 2, label: '2m' }, { v: 5, label: '5m' }, { v: 10, label: '10m' }, { v: 20, label: '20m' },
+      { v: -1, label: '範囲を「地形の細かさ」の数で割る（従来）' }],
+    note: '小さいほど段差がくっきりし、重くなる。範囲が広くても同じ細かさ（1辺は多くても400マス）' },
   { id: 'terrainGrid', label: '地形の細かさ', 既定: 81, min: 11, max: 401, step: 10,
-    note: '大きいほど細かく、重くなる。面の数は(値−1)²（すぐ効く。地面を作り直さなくてよい）' },
+    note: '「地形の1マスの大きさ」が従来のときに使う。大きいほど細かく、重くなる。面の数は(値−1)²（すぐ効く）' },
   { id: 'terrainExag', label: '標高の強調', 既定: () => _terrainExagDefault(), min: 1, max: 10, step: 1,
     note: '1＝実寸。高低差の小さい敷地で起伏を見たいとき上げる（すぐ効く）' },
   // 【0m をどこに置くか・2026-11-23 ユーザー指摘「基準を海抜か標高か決めておかないといけないのでは」】
@@ -1025,6 +1034,7 @@ window.App = function App() {
   //   同じ canvas で両立しない。一度 getContext("2d") した canvas は webgl が null になる）。
   //   いまの canvas は道路の塗り（2D）に残し、地面だけ WebGL の canvas へ移す。
   const terrainGLCanvasRef = useRef(null);
+  const groundDrapeRef = useRef(null);      // 起伏に乗せた塗る面（道路・水面）の控え。地面・塗る面・細かさが変わったときだけ作り直す
   const terrainGLRef = useRef(null);        // { gl, prog, ... } or null（使えない）
   const terrainGLVerRef = useRef(null);     // 頂点を送り直す判断に使う版
   // 表示の設定（メニューバー右端の歯車）。標高の強調はここに統合した
@@ -1032,15 +1042,17 @@ window.App = function App() {
   const [uiSettings, setUiSettings] = useState(設定を読む);
   const [settingDraft, setSettingDraft] = useState(null); // スライダーを動かしている間だけの値
   const setUiSetting = useCallback((id, v) => setUiSettings(p => ({ ...p, [id]: v })), []);
+  // 観測（製品は読まない）: 検査が歯車の値を変える口
+  if (typeof window !== 'undefined') window.__setUiSettingForCheck = setUiSetting;
   // 【地面の見た目のプリセット・2026-11-26 ユーザー指示】
   //   「リアル描写」と「目で見てわかりやすい図形描写」を切り替える。
    //   **新しい描き方は作らない**。既にある設定（陰影の強さ・段数・細かさ・等高線）を束ねるだけ。
    //   選んだ後で歯車から個別に変えられる（固定ではない）。
   const 地面の見た目 = {
     // 図: 陰影を弱め、段をはっきりさせ、等高線で高さを読む。細かさを落とすので**軽い**
-    図: { terrainShade: 1, terrainBands: 7, terrainGrid: 41, terrainContour: 2 },
+    図: { terrainShade: 1, terrainBands: 7, terrainGrid: 41, terrainCellM: 20, terrainContour: 2 },
     // 実: 細部まで陰影で描く（従来の既定）
-    実: { terrainShade: 4, terrainBands: 12, terrainGrid: 81, terrainContour: 0 },
+    実: { terrainShade: 4, terrainBands: 12, terrainGrid: 81, terrainCellM: 0, terrainContour: 0 },
   };
   const _applyTerrainLook = useCallback((名) => {
     const v = 地面の見た目[名]; if (!v) return;
@@ -1050,6 +1062,24 @@ window.App = function App() {
   useEffect(() => { 設定を保存(uiSettings); }, [uiSettings]);
   // 旗 __TERRAIN_Z_METERS=false（陽性対照）のときは従来の強調3に戻す
   const terrainExag = _terrainZUnitOn() ? uiSettingValue(uiSettings, 'terrainExag') : 3;
+  // ══ 地形の網目の数（1辺あたりの点の数）を決める・唯一の入口・2026-11-28 ══
+  //   「地形の1マスの大きさ」（メートル）で範囲の長い辺を割る。自動は標高データの細かさ（取り込んだ種類から）。
+  //   従来（-1）・旗 window.__TERRAIN_CELL_BY_METERS = false のときは「地形の細かさ」の数。
+  //   取り込んだ点の数より細かくはできない（terrainToMesh が間引くだけ）。多くても 401（1辺 400マス）。
+  const _terrainResM = (t) => { const k = String((t && t._gsi && t._gsi.kind) || '');
+    return /(^|[^0-9])1m/.test(k) ? 1 : (/5m/.test(k) ? 5 : (/10m/.test(k) ? 10 : 5)); };
+  const _terrainDiv = () => {
+    const 従来 = uiSettingValue(uiSettings, 'terrainGrid');
+    const 選 = uiSettingValue(uiSettings, 'terrainCellM');
+    if (!terrain || 選 < 0 || (typeof window !== 'undefined' && window.__TERRAIN_CELL_BY_METERS === false)) return 従来;
+    const cell = 選 > 0 ? 選 : _terrainResM(terrain);
+    const mpp = (typeof METERS_PER_PX === 'number' && METERS_PER_PX > 0) ? METERS_PER_PX : 0.1;
+    let n = Math.round(Math.max(TW, TH) * mpp / cell) + 1;
+    // 自動のときは従来より粗くしない（狭い範囲は従来どおり「地形の細かさ」の数で割る＝見た目が変わらない）
+    if (選 === 0) n = Math.max(n, 従来);
+    const 点 = Math.max(terrain.cols || 0, terrain.rows || 0) || 401;
+    return Math.max(11, Math.min(401, 点, n));
+  };
   const [onSegT, setOnSegT] = useState(() => { const m = {}; initNodes.filter(n => n.kind === "on_seg").forEach(n => m[n.id] = n.t); return m; });
   const [segWp, setSegWp] = useState({});
   const [wpZ, setWpZ] = useState({});       // セグメント折れ点のZ値
@@ -1623,7 +1653,7 @@ window.App = function App() {
     if (typeof window !== 'undefined' && window.__GSI_BLD_ON_GROUND === false) return { 乗せた: false, z: 0 };
     const _t = 地形 || terrainDraw;
     if (!_t || typeof terrainZAt !== 'function' || !Array.isArray(pts) || !pts.length) return { 乗せた: false, z: 0 };
-    const _div = uiSettingValue(uiSettings, 'terrainGrid');
+    const _div = _terrainDiv();
     let 最小 = Infinity;
     for (const q of pts) {
       // mToPx = 1 → メートルで返る。**強調は掛けない**（ユーザー裁定 2026-11-26
@@ -6411,6 +6441,7 @@ window.App = function App() {
   const [perfHud, setPerfHud] = useState(false);
   useEffect(() => {
     window.__perfHud = (on = true) => setPerfHud(!!on);
+    window.__PerfHud = window.__perfHud;   // 大文字で打っても出るように（2026-11-28 ユーザーが __PerfHud と打って出なかった）
     // 検査から内訳を読む口（作り直し回数・盤の描画時間）
     window.__perfStats = () => ({ renders: _perfRef.current.renders, drawMs: _perfRef.current.drawMs,
       camMoves: _perfRef.current.camMoves, camFlushes: _perfRef.current.camFlushes,
@@ -6508,7 +6539,7 @@ window.App = function App() {
     //   「建物が地面に埋まる」を数値で切り分けるのに要る（絵だけでは原因が決まらない）。
     window.__terrainZAt = (x, y) => {
       if (!terrainDraw || typeof terrainZAt !== 'function') return null;
-      const _d = uiSettingValue(uiSettings, 'terrainGrid');
+      const _d = _terrainDiv();
       return { m: terrainZAt(terrainDraw, TW, TH, x, y, 1, 1, _d),
                px: terrainZAt(terrainDraw, TW, TH, x, y, terrainExag, _terrainMToPx(), _d) };
     };
@@ -8085,7 +8116,7 @@ window.App = function App() {
     const t2 = terrainDraw;
     // 【分割数＝歯車の「細かさ」】以前は terrainToMesh の中で 80 に間引かれていて、
     //   細かさを上げても表示が変わらなかった（2026-11-23 ユーザー報告）
-    const _div = uiSettingValue(uiSettings, 'terrainGrid');
+    const _div = _terrainDiv();
     const _m = terrainToMesh(t2, TW, TH, terrainExag, _terrainMToPx(), _div);
     // 【地面も範囲の形の中だけ・2026-11-28】範囲が四角でないときは、中心が形の外にある面を描かない
     const _形 = _fieldPolyClip();
@@ -8113,7 +8144,7 @@ window.App = function App() {
       };
     }
     return _m;
-  }, [terrain, terrainExag, _mToPx今, uiSettings.terrainDatum, uiSettings.terrainGrid, uiSettings.terrainLift]);
+  }, [terrain, terrainExag, _mToPx今, uiSettings.terrainDatum, uiSettings.terrainGrid, uiSettings.terrainCellM, uiSettings.terrainLift]);
 
 
   // ウィンドウ状態
@@ -8468,6 +8499,7 @@ window.App = function App() {
     if (!q) return false;
     if (q.az != null || q.el != null) setCamAnglesSafe(q.az ?? camAzRef.current, q.el ?? camElRef.current);
     if (q.panX != null && q.panY != null) setCamPanSafe(q.panX, q.panY);
+    if (q.zoom != null) setCamZoomSafe(q.zoom);
     _perfRef.current.camFlushes++;
     return true;
   }, []);
@@ -8480,6 +8512,7 @@ window.App = function App() {
       p.panX = next.panX; p.panY = next.panY;
       camPanXRef.current = next.panX; camPanYRef.current = next.panY;
     }
+    if (Number.isFinite(next.zoom) && next.zoom > 0) { p.zoom = next.zoom; camZoomRef.current = next.zoom; }
     _camPendRef.current = p;
     if (!_camRafRef.current) _camRafRef.current = requestAnimationFrame(() => { _camRafRef.current = 0; flushCam(); });
   }, [flushCam]);
@@ -9119,6 +9152,19 @@ window.App = function App() {
       const _wi = wheelIntent(e);
       if (_wi.dir === 0) {
         if (_wi.panX) setCamPanSafe(camPanXRef.current - _wi.panX, camPanYRef.current);
+        return;
+      }
+      // 【回した量で決める・2026-11-28 ユーザー報告「重くなると同時にスクロールもたくさんしないと拡大縮小できなくなった」】
+      //   従来は通知1回につき 12% の決め打ち。処理が追いつかないとブラウザは何回分かの回転を1回の通知にまとめて送る
+      //   （deltaY が大きくなる）ので、まとめられた分の拡大が捨てられていた。回した量で決める（1目盛 100px＝12%・従来と同じ手ごたえ）。
+      //   書き込みも1コマに1回にまとめる（queueCam）。旗 window.__CAB_WHEEL_BY_DELTA = false で従来
+      if (!(typeof window !== 'undefined' && window.__CAB_WHEEL_BY_DELTA === false)) {
+        const _wf = wheelIntent(e, 1.12).factor;
+        const newZoom = Math.max(0.1, Math.min(500, oldZoom * (_wf || 1)));
+        const ratio = newZoom / oldZoom;
+        queueCam({ zoom: newZoom,
+          panX: mx - CAB_W / 2 - (mx - CAB_W / 2 - camPanXRef.current) * ratio,
+          panY: my - CAB_H / 2 - (my - CAB_H / 2 - camPanYRef.current) * ratio });
         return;
       }
       const delta = _wi.dir > 0 ? 0.12 * oldZoom : -0.12 * oldZoom;
@@ -9945,7 +9991,7 @@ window.App = function App() {
     //   旗 window.__GROUND_AREA_PAINT = false で塗らない＝陽性対照。
     let 塗数 = 0, 穴数 = 0, 切り方 = null;
     if (_塗りあり) {
-      const _div = uiSettingValue(uiSettings, 'terrainGrid');
+      const _div = _terrainDiv();
       const _mpp = _bldZMpp();
       // 【範囲の形で切る・2026-11-28】範囲（フィールド）が四角でないときは、形の外にはみ出した分を描かない。
       //   形の辺を地面の格子で刻んで起伏に乗せ、画面の上で切り抜く（塗る面はすべて地面の上なので画面で切ってよい）。
@@ -9956,78 +10002,81 @@ window.App = function App() {
       const _形で切る = _形の切り
         || (!(typeof window !== 'undefined' && window.__GROUND_CLIP_SHEET === false) && typeof drawAreaPolygonGrid === 'function' ? drawAreaPolygonGrid() : null);
       切り方 = _形の切り ? '範囲の形' : (_形で切る ? '図面の四角' : null);
-      if (_形で切る) {
-        ctx.save();
-        const 刻 = (typeof terrainResample === 'function') ? terrainResample(_形で切る.concat([_形で切る[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : _形で切る;
-        ctx.beginPath();
-        刻.forEach((q, i) => {
-          const zz = (typeof terrainZAt === 'function') ? terrainZAt(terrainDraw, TW, TH, q.x, q.y, terrainExag, _terrainMToPx(), _div) : 0;
-          const pr = _地面の投影(q.x, q.y, zz);
+      // 【起伏に乗せた形は地面・塗る面が変わったときだけ作る・2026-11-28】
+      //   辺を地面の格子で刻んで各点の高さを引く計算（terrainResample・terrainZAt）はカメラに依らないのに、毎コマやり直していた。
+      //   地形の網目をメートルで決めて細かくした（_terrainDiv）ら刻む点が増え、1コマ約1ms→約5ms になったので、
+      //   刻んだ点（x, y, 高さ）を控え、毎コマは画面への写し（_地面の投影）と塗りだけにする。
+      //   旗 window.__GROUND_DRAPE_CACHE = false で従来（毎コマ作り直す）
+      const _旗 = (k) => (typeof window !== 'undefined' && window[k] === false);
+      const _鍵 = [_div, terrainExag, _terrainMToPx(), _mpp, _形で切る ? JSON.stringify(_形で切る) : '',
+        _旗('__ROAD_BAND_THEN_RESAMPLE'), _旗('__GROUND_AREA_HOLES')].join('|');
+      let 乗 = groundDrapeRef.current;
+      if (_旗('__GROUND_DRAPE_CACHE') || !乗 || 乗.t !== terrainDraw || 乗.g !== groundAreas || 乗.鍵 !== _鍵) {
+        const _刻む閉 = (R) => (typeof terrainResample === 'function') ? terrainResample(R.concat([R[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : R;
+        const _高さ = (R) => R.map(q => ({ x: q.x, y: q.y, z: (typeof terrainZAt === 'function') ? terrainZAt(terrainDraw, TW, TH, q.x, q.y, terrainExag, _terrainMToPx(), _div) : 0 }));
+        const 面ら = [];
+        for (const a of groundAreas) {
+          if (!a) continue;
+          // 【形（輪）で持つ面＝交差点の角・2026-11-27】輪の辺を地面の格子の間隔で刻んで起伏に乗せる
+          const _輪あり = Array.isArray(a.輪) && a.輪.length >= 3;
+          if (!_輪あり && (!Array.isArray(a.中心線) || a.中心線.length < 2)) continue;
+          // 【左右の幅を点ごとに・2026-11-27】幅は道路の縁の線から実測した左右の半幅（無ければ 幅m の一定幅）。
+          //   先に帯（輪）を作ってから、**輪の辺**を地面の格子の間隔で刻む（中心線を刻んでから帯にすると、
+          //   刻んで増えた点に左右の幅が無い）。旗 __ROAD_BAND_THEN_RESAMPLE=false で従来（中心線を刻んでから帯）。
+          const _px = (_mpp || 0.1);
+          const _左 = Array.isArray(a.幅左m) ? a.幅左m.map(v => v / _px) : null;
+          const _右 = Array.isArray(a.幅右m) ? a.幅右m.map(v => v / _px) : null;
+          const _後で刻む = !_旗('__ROAD_BAND_THEN_RESAMPLE');
+          let 輪;
+          if (_輪あり) 輪 = _刻む閉(a.輪);
+          else if (_後で刻む) { const _帯 = gsiBandRing(a.中心線, (a.幅m || 2) / _px, _左, _右); 輪 = _帯 ? _刻む閉(_帯) : _帯; }
+          else {
+            const 刻 = (typeof terrainResample === 'function') ? terrainResample(a.中心線, terrainDraw, TW, TH, _div) : a.中心線;
+            輪 = gsiBandRing(刻, (a.幅m || 2) / _px);
+          }
+          if (!輪 || 輪.length < 3) continue;
+          // 【島（穴）は塗らない・2026-11-28】穴の輪も同じ道（地面の格子で刻んで起伏に乗せる）で足し、evenodd で抜く。
+          //   旗 window.__GROUND_AREA_HOLES = false で従来（穴を無視して塗る）
+          const _穴を抜く = _輪あり && Array.isArray(a.穴) && a.穴.length && !_旗('__GROUND_AREA_HOLES');
+          const 輪ら = [_高さ(輪)];
+          let 穴 = 0;
+          if (_穴を抜く) for (const Q of a.穴) { if (!Array.isArray(Q) || Q.length < 3) continue; 穴++; 輪ら.push(_高さ(_刻む閉(Q))); }
+          面ら.push({ 輪ら, 穴, 色: a.color || '#9CA3AF', 偶奇: !!_穴を抜く });
+        }
+        乗 = { t: terrainDraw, g: groundAreas, 鍵: _鍵, 切り: _形で切る ? _高さ(_刻む閉(_形で切る)) : null, 面ら, 作った: ((乗 && 乗.作った) || 0) + 1 };
+        groundDrapeRef.current = 乗;
+      }
+      const _なぞる = (R) => {
+        for (let i = 0; i < R.length; i++) {
+          const q = R[i], pr = _地面の投影(q.x, q.y, q.z);
           if (i === 0) ctx.moveTo(pr.x, pr.y); else ctx.lineTo(pr.x, pr.y);
-        });
+        }
         ctx.closePath();
+      };
+      if (乗.切り) {
+        ctx.save();
+        ctx.beginPath();
+        _なぞる(乗.切り);
         ctx.clip();
       }
-      for (const a of groundAreas) {
-        if (!a) continue;
-        // 【形（輪）で持つ面＝交差点の角・2026-11-27】輪の辺を地面の格子の間隔で刻んで起伏に乗せる
-        const _輪あり = Array.isArray(a.輪) && a.輪.length >= 3;
-        if (!_輪あり && (!Array.isArray(a.中心線) || a.中心線.length < 2)) continue;
-        // 【左右の幅を点ごとに・2026-11-27】幅は道路の縁の線から実測した左右の半幅（無ければ 幅m の一定幅）。
-        //   先に帯（輪）を作ってから、**輪の辺**を地面の格子の間隔で刻む（中心線を刻んでから帯にすると、
-        //   刻んで増えた点に左右の幅が無い）。旗 __ROAD_BAND_THEN_RESAMPLE=false で従来（中心線を刻んでから帯）。
-        const _px = (_mpp || 0.1);
-        const _左 = Array.isArray(a.幅左m) ? a.幅左m.map(v => v / _px) : null;
-        const _右 = Array.isArray(a.幅右m) ? a.幅右m.map(v => v / _px) : null;
-        const _後で刻む = !(typeof window !== 'undefined' && window.__ROAD_BAND_THEN_RESAMPLE === false);
-        let 輪;
-        if (_輪あり) {
-          輪 = (typeof terrainResample === 'function')
-            ? terrainResample(a.輪.concat([a.輪[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : a.輪;
-        } else if (_後で刻む) {
-          const _帯 = gsiBandRing(a.中心線, (a.幅m || 2) / _px, _左, _右);
-          輪 = (_帯 && typeof terrainResample === 'function')
-            ? terrainResample(_帯.concat([_帯[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : _帯;
-        } else {
-          const 刻 = (typeof terrainResample === 'function')
-            ? terrainResample(a.中心線, terrainDraw, TW, TH, _div) : a.中心線;
-          輪 = gsiBandRing(刻, (a.幅m || 2) / _px);
-        }
-        if (!輪 || 輪.length < 3) continue;
+      for (const f of 乗.面ら) {
         ctx.beginPath();
-        const _なぞる = (R) => {
-          for (let i = 0; i < R.length; i++) {
-            const q = R[i];
-            const z = (typeof terrainZAt === 'function')
-              ? terrainZAt(terrainDraw, TW, TH, q.x, q.y, terrainExag, _terrainMToPx(), _div) : 0;
-            const pr = _地面の投影(q.x, q.y, z);
-            if (i === 0) ctx.moveTo(pr.x, pr.y); else ctx.lineTo(pr.x, pr.y);
-          }
-          ctx.closePath();
-        };
-        _なぞる(輪);
-        // 【島（穴）は塗らない・2026-11-28】穴の輪も同じ道（地面の格子で刻んで起伏に乗せる）で足し、evenodd で抜く。
-        //   旗 window.__GROUND_AREA_HOLES = false で従来（穴を無視して塗る）
-        const _穴を抜く = _輪あり && Array.isArray(a.穴) && a.穴.length && !(typeof window !== 'undefined' && window.__GROUND_AREA_HOLES === false);
-        if (_穴を抜く) for (const Q of a.穴) {
-          if (!Array.isArray(Q) || Q.length < 3) continue;
-          穴数++;
-          _なぞる((typeof terrainResample === 'function') ? terrainResample(Q.concat([Q[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : Q);
-        }
-        ctx.fillStyle = a.color || '#9CA3AF';
-        ctx.fill(_穴を抜く ? 'evenodd' : 'nonzero');
+        for (const R of f.輪ら) _なぞる(R);
+        穴数 += f.穴;
+        ctx.fillStyle = f.色;
+        ctx.fill(f.偶奇 ? 'evenodd' : 'nonzero');
         // 【継ぎ目を隠す・2026-11-27 ユーザー指摘「貼り合わせているのがバレてないか」】隣り合う面は同じ線を共有するが、
         //   縁の滑らかさ（アンチエイリアス）で継ぎ目が薄い線に見える。同じ色の細い線（画面で約1px）で縁をなぞって埋める。
         //   旗 window.__GROUND_AREA_SEAM_STROKE = false で従来（なぞらない）
-        if (!(typeof window !== 'undefined' && window.__GROUND_AREA_SEAM_STROKE === false)) {
-          ctx.strokeStyle = a.color || '#9CA3AF';
+        if (!_旗('__GROUND_AREA_SEAM_STROKE')) {
+          ctx.strokeStyle = f.色;
           ctx.lineWidth = 1 / ((b && b.sc) || 1);
           ctx.lineJoin = 'round';
           ctx.stroke();
         }
         塗数++;
       }
-      if (_形で切る) ctx.restore();
+      if (乗.切り) ctx.restore();
     }
     ctx.restore();
     if (typeof window !== 'undefined') {
@@ -10036,6 +10085,7 @@ window.App = function App() {
         面: 面数, GL: _gl描いた, GL失敗: (terrainGLRef.current && terrainGLRef.current.失敗) || null,
         頂点を送った: !!(terrainGLRef.current && terrainGLRef.current.送った),
         塗り: 塗数, 穴: 穴数, 切り: 切り方, 段: 束.size, ms: Math.round(performance.now() - t0),
+        起伏に乗せ直した: groundDrapeRef.current ? groundDrapeRef.current.作った : 0,
         回: ((window.__terrainCanvasInfo || {}).回 || 0) + 1,
       };
     }
@@ -15202,6 +15252,7 @@ window.App = function App() {
   //   旗 window.__CAB_SOLIDS_CANVAS_WHILE_MOVING = false で従来（動かしている間も SVG を作り直す）
   const solidsCanvasRef = useRef(null);
   const cabSolidsSvgCacheRef = useRef(null);
+  const cabSolidsSvgCamRef = useRef(null);   // その面を描いたときのカメラ [az, el, zoom, panX, panY]
   const _cabSolidsCanvasOn = () => !(typeof window !== 'undefined' && window.__CAB_SOLIDS_CANVAS_WHILE_MOVING === false);
   // 描く物の列（面ごとの形・色）は「向き（az・el）と立体」が同じ間は使い回す。
   //   移動（パン）と拡大縮小は平行投影なので形も前後関係も変わらず、画面上で平行移動・拡大するだけ
@@ -15222,7 +15273,11 @@ window.App = function App() {
   const solidsGLDataRef = useRef(null);    // 形を置いたときの面の列と版
   const _sglOn = () => !(typeof window !== 'undefined' && window.__CAB_SOLIDS_WEBGL === false)
     && typeof solidsGLCreate === 'function' && typeof makeProjMatrix === 'function';
-  const _sglInfo = (o) => { if (typeof window !== 'undefined') { const 前 = window.__cabSolidsGLInfo || {}; window.__cabSolidsGLInfo = { ...前, ...o, 回: (前.回 || 0) + 1 }; } };
+  const _sglInfo = (o) => { if (typeof window !== 'undefined') { const 前 = window.__cabSolidsGLInfo || {};
+    window.__cabSolidsGLInfo = { ...前, ...o, 回: (前.回 || 0) + 1 };
+    // 描き手が変わったときだけコンソールに1行（GPU で描けているかを利用者が確かめられるように）
+    const 今 = o.失敗 ? ('従来の描き方（' + o.失敗 + '）') : ('GPU（' + ((solidsGLRef.current && solidsGLRef.current.描き手) || 'WebGL') + '）');
+    if (o.失敗 !== undefined && window.__cabSolidsDrawerLast !== 今) { window.__cabSolidsDrawerLast = 今; console.info('[3次元図] 動かしている間の建物の描き方: ' + 今); } } };
   const _drawSolidsGL = () => {
     const cv = solidsGLCanvasRef.current, cab = cabRef.current;
     if (!cv || !cab) return false;
@@ -15410,19 +15465,42 @@ window.App = function App() {
   //   （ユーザー指摘「なんで勝手にやってんだダメだろ」）。ドラッグ中（画面の移動・回転）は押せないので canvas でよく、
   //   ボタンを離した瞬間（cabDragStore の panning・orbiting が消えたとき）に SVG へ戻す。ホイールの拡大縮小・クリックだけでは切り替えない。
   //   ★押しただけ（カメラが動いていない）では切り替えない＝建物を押して離す操作の途中で面が消えない。
+  // 【ホイールの拡大縮小も GPU で描く・2026-11-28 ユーザー要望「ホイールも…つかんで移動もGPUにするべきではないのか」】
+  //   向き（az・el）を変えずに拡大・移動したとき（ホイール）は、止まってから _CAB_SETTLE_MS の間「動かしている」扱いにする。
+  //   ★押せない時間は作らない（前の版の「0.2 秒押せない」はダメと言われた）: その間も SVG の面は消さずに、
+  //     見えないまま「描いたときのカメラ → いまのカメラ」の変換（拡大と平行移動）を掛けて同じ位置に置いておく
+  //     （平行投影なので向きが同じなら変換は正確）。押せばその面がそのまま受ける。止まったら SVG を作り直して見せる。
+  //   旗 window.__CAB_GPU_WHEEL = false で従来（ホイールのたびに SVG を作り直す）
+  const _CAB_SETTLE_MS = 250;
   const _useCabMoving = ({ camAz, camEl, camZoom, camPanX, camPanY }) => {
     const drag = React.useSyncExternalStore(cabDragStore.subscribe, cabDragStore.get);
     const 引く中 = !!(drag && (drag.panning || drag.orbiting));
-    const r = useRef({ cam5: null, 動いた: false }).current;
+    const r = useRef({ cam5: null, 動いた: false, 輪: 0, az: null, el: null }).current;
+    const [, 起こす] = React.useState(0);
     const cam5 = camAz + ',' + camEl + ',' + camZoom + ',' + camPanX + ',' + camPanY;
-    if (!引く中) r.動いた = false;
-    else if (r.cam5 !== null && r.cam5 !== cam5) r.動いた = true;
-    r.cam5 = cam5;
+    const now = performance.now();
+    const _輪on = !(typeof window !== 'undefined' && window.__CAB_GPU_WHEEL === false);
+    if (!引く中) {
+      r.動いた = false;
+      // ドラッグ以外でカメラが変わった: 向きが同じ（拡大・移動だけ）なら GPU、向きが変わったら従来どおり SVG
+      if (r.cam5 !== null && r.cam5 !== cam5) r.輪 = (_輪on && r.az === camAz && r.el === camEl) ? now : 0;
+    } else {
+      r.輪 = 0;
+      if (r.cam5 !== null && r.cam5 !== cam5) r.動いた = true;
+    }
+    r.cam5 = cam5; r.az = camAz; r.el = camEl;
+    const 輪中 = !!r.輪 && (now - r.輪 < _CAB_SETTLE_MS);
+    // 止まったら作り直すための目覚まし（描き直しの予約だけ。値は変えない）
+    useEffect(() => {
+      if (!輪中) return undefined;
+      const t = setTimeout(() => 起こす(x => x + 1), Math.max(10, _CAB_SETTLE_MS - (performance.now() - r.輪) + 5));
+      return () => clearTimeout(t);
+    }, [cam5, 輪中]);
     const on = _cabSolidsCanvasOn();
     // 観測（製品は読まない）: 検査が「動かしている間の絵」と「止まったときの絵」を同じカメラで比べるために立てる
-    const moving = on && ((typeof window !== 'undefined' && window.__CAB_FORCE_MOVING === true) || (引く中 && r.動いた));
+    const moving = on && ((typeof window !== 'undefined' && window.__CAB_FORCE_MOVING === true) || (引く中 && r.動いた) || 輪中);
     useLayoutEffect(() => { _drawSolidsCanvas(moving); });
-    if (typeof window !== 'undefined') window.__cabMoving = moving;
+    if (typeof window !== 'undefined') { window.__cabMoving = moving; window.__cabMovingWheel = 輪中; }
     return moving;
   };
 
@@ -19865,7 +19943,7 @@ window.App = function App() {
                   const 海抜 = uiSettingValue(uiSettings, 'terrainDatum') === 1;
                   const t3 = 海抜 ? { ...terrain, baseElev: 0 } : terrain;
                   const 側 = terrainSkirtQuads(t3, TW, TH, terrainExag, _terrainMToPx(),
-                    uiSettingValue(uiSettings, 'terrainGrid'));
+                    _terrainDiv());
                   let d = '';
                   for (const q of 側) {
                     const a = proj(q.x0, q.y0, q.z0), b = proj(q.x1, q.y1, q.z1);
@@ -19883,7 +19961,7 @@ window.App = function App() {
                     const 海抜 = uiSettingValue(uiSettings, 'terrainDatum') === 1;
                     const t3 = 海抜 ? { ...terrain, baseElev: 0 } : terrain;
                     const segs = terrainContourSegs(t3, TW, TH, 間隔, terrainExag, _terrainMToPx(),
-                      uiSettingValue(uiSettings, 'terrainGrid'));
+                      _terrainDiv());
                     let d = '';
                     for (const [a, b] of segs) {
                       const p1 = proj(a.x, a.y, a.z), p2 = proj(b.x, b.y, b.z);
@@ -20038,7 +20116,7 @@ window.App = function App() {
                 : [[0, 0], [TW, 0], [TW, TH], [0, TH]].map(([x, y]) => proj(x, y, 0));
               const 海抜 = uiSettingValue(uiSettings, 'terrainDatum') === 1;
               const t3 = 海抜 ? { ...terrain, baseElev: 0 } : terrain;
-              const _div2 = uiSettingValue(uiSettings, 'terrainGrid');
+              const _div2 = _terrainDiv();
               if (uiSettingValue(uiSettings, 'terrainSkirt') === 1) {
                 const 側 = terrainSkirtQuads(t3, TW, TH, terrainExag, _terrainMToPx(), _div2);
                 let d = '';
@@ -20471,6 +20549,15 @@ window.App = function App() {
               if (!_drawSolids || _drawSolids.length === 0) return null;
               // 【ドラッグで動かしている間は直前の面のまま隠す・2026-11-28】部品を作り直さない（canvas が描く）。離したら作り直す
               if (_cabMoving && cabSolidsSvgCacheRef.current) {
+                // 向きが描いたときと同じ（拡大・移動だけ）なら、見えないまま同じ位置に置いて押せるようにする
+                //   CAB 座標: x = rx*zoom + panX + CAB_W/2 なので、描いたとき(z0,p0) → いま(z,p) は
+                //   translate(p + CAB/2) scale(z/z0) translate(-(p0 + CAB/2))
+                const _c0 = cabSolidsSvgCamRef.current, _c5 = _camNow();
+                if (_c0 && _c0[0] === _c5[0] && _c0[1] === _c5[1] && _c0[2] > 0 && !(typeof window !== 'undefined' && window.__CAB_GPU_WHEEL === false)) {
+                  const _k = _c5[2] / _c0[2];
+                  const _tf = 'translate(' + (_c5[3] + CAB_W / 2) + ' ' + (_c5[4] + CAB_H / 2) + ') scale(' + _k + ') translate(' + (-(_c0[3] + CAB_W / 2)) + ' ' + (-(_c0[4] + CAB_H / 2)) + ')';
+                  return (<g data-cab-solids="1" data-cab-solids-ghost="1" transform={_tf} style={{ opacity: 0 }}>{cabSolidsSvgCacheRef.current}</g>);
+                }
                 return (<g data-cab-solids="1" style={{ display: 'none' }}>{cabSolidsSvgCacheRef.current}</g>);
               }
               // 【面の列は _cabFaceList 1か所で作る・2026-11-23 段0】
@@ -20696,6 +20783,7 @@ window.App = function App() {
                 };
               }
               cabSolidsSvgCacheRef.current = _要素;
+              cabSolidsSvgCamRef.current = _camNow();   // この面を描いたときのカメラ（見えない面に掛ける変換の基準）
               return (<g data-cab-solids="1">{_要素}</g>);
             })()}
             {/* 【2026-09-22】選んでいる建屋の寸法（2Dビューと同じ _bldDimLabels で作る）。

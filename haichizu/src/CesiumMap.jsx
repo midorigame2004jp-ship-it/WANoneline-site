@@ -2300,73 +2300,23 @@ function CesiumMap({ winW, winH, mode, allMapPos, nodes, segs, segWp, wpZ, mapZ,
       }
       return null;
     };
-    // メートル空間変換ヘルパー（cos(lat)補正）
-    const toMetric = (p, cosLat) => ({ x: p.lng * cosLat, y: p.lat });
-    // 直角判定: 2辺のcos角度を返す（0に近い=直角）
-    const angleCos = (eX, eY, dX, dY) => {
-      const el = Math.sqrt(eX * eX + eY * eY), dl = Math.sqrt(dX * dX + dY * dY);
-      if (el < 1e-12 || dl < 1e-12) return 1;
-      return (eX * dX + eY * dY) / (el * dl);
-    };
-    const SNAP_COS = 0.087; // cos(85°)≈0.087 → ±5度以内で直角スナップ
-    // 統合スナップ: 直前辺90° + 閉辺90° を同時に考慮
+    // 【直角の吸い付きの規則は geometry.js の perpSnap2D 1つ・2026-11-28】
+    //   国土地理院の窓で点をつないで範囲を決めるときも同じ規則を使う（同じ規則を2か所に書かない）。
+    //   ここでは緯度経度を、直前の点を原点にしたメートルの平面（経度に cos(緯度) を掛ける）に直して渡すだけ。
+    //   置き換え前と同じ答えになることは checks/perp_snap_same.cjs で突き合わせる。
     const computeSnap = (pt, prev) => {
       const result = { target: pt, snap90: false, snapClose90: false };
       // 【一時解除】判定は snapGate.js が唯一の実装。ここは1行見るだけ（2026-09-03）
       // 以前は呼び出し側の1箇所だけ isAlt を見ていたが、ホバー中の候補線は素通りしていた
       if (typeof snapSuppressed === 'function' && snapSuppressed()) return result;
       if (prev.length < 2) return result;
-      const pB = prev[prev.length - 1], pA = prev[prev.length - 2], pS = prev[0];
+      const pB = prev[prev.length - 1];
       const cosLat = Math.cos(pB.lat * Math.PI / 180);
-      // 直前辺 A→B（メートル空間）
-      const eX = (pB.lng - pA.lng) * cosLat, eY = pB.lat - pA.lat;
-      const elen = Math.sqrt(eX * eX + eY * eY);
-      if (elen < 1e-12) return result;
-      const perpX = -eY / elen, perpY = eX / elen; // A→B の垂直方向
-      // カーソル B→pt（メートル空間）
-      const dX = (pt.lng - pB.lng) * cosLat, dY = pt.lat - pB.lat;
-      // 直前辺に対する90°判定
-      const dotPrev = angleCos(eX, eY, dX, dY);
-      const near90 = Math.abs(dotPrev) < SNAP_COS;
-      // 閉辺90°の理想位置: B→N ⊥ A→B かつ N→S ⊥ B→N を同時に満たす点
-      // N = B + t * perp, 条件: (S-N)·perp = 0 → t = (S-B)·perp
-      if (prev.length >= 3) {
-        const sX = (pS.lng - pB.lng) * cosLat, sY = pS.lat - pB.lat;
-        const tIdeal = sX * perpX + sY * perpY;
-        const idealX = perpX * tIdeal, idealY = perpY * tIdeal;
-        const idealLng = pB.lng + idealX / cosLat, idealLat = pB.lat + idealY;
-        // カーソルが理想位置に近いか（距離で判定）
-        const distX = (pt.lng - idealLng) * cosLat, distY = pt.lat - idealLat;
-        const cursorDist = Math.sqrt(distX * distX + distY * distY);
-        const edgeDist = Math.sqrt(dX * dX + dY * dY);
-        if (edgeDist > 1e-12 && cursorDist / edgeDist < 0.15) {
-          // 理想位置にスナップ（直前辺90° + 閉辺90° を両方満たす）
-          result.target = { ...pt, lat: idealLat, lng: idealLng };
-          result.snap90 = true;
-          result.snapClose90 = true;
-          return result;
-        }
-      }
-      // 直前辺90°のみスナップ
-      if (near90) {
-        const proj = dX * perpX + dY * perpY;
-        const snapLat = pB.lat + perpY * proj, snapLng = pB.lng + perpX * proj / cosLat;
-        result.target = { ...pt, lat: snapLat, lng: snapLng };
-        result.snap90 = true;
-        // スナップ後の閉辺90°チェック（視覚フィードバック用）
-        if (prev.length >= 3) {
-          const nX = (snapLng - pB.lng) * cosLat, nY = snapLat - pB.lat;
-          const cX = (pS.lng - snapLng) * cosLat, cY = pS.lat - snapLat;
-          if (Math.abs(angleCos(nX, nY, cX, cY)) < SNAP_COS) result.snapClose90 = true;
-        }
-        return result;
-      }
-      // スナップなし: 閉辺90°チェックだけ（視覚フィードバック用）
-      if (prev.length >= 3) {
-        const cX = (pS.lng - pt.lng) * cosLat, cY = pS.lat - pt.lat;
-        if (Math.abs(angleCos(dX, dY, cX, cY)) < SNAP_COS) result.snapClose90 = true;
-      }
-      return result;
+      const toM = (p) => ({ x: (p.lng - pB.lng) * cosLat, y: p.lat - pB.lat });
+      const q = toM(pt);
+      const r = perpSnap2D(prev.map(toM), q);
+      if (r.target === q) return { ...result, snap90: r.snap90, snapClose90: r.snapClose90 };
+      return { target: { ...pt, lat: pB.lat + r.target.y, lng: pB.lng + r.target.x / cosLat }, snap90: r.snap90, snapClose90: r.snapClose90 };
     };
     // L字マーク描画ヘルパー
     const drawPerpMark = (corner, edgeFrom, edgeTo, cosLat) => {

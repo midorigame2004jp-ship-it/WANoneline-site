@@ -452,3 +452,55 @@ function clipPolygonByPolygon(A, B) {
   }
   return 出;
 }
+
+// ══ 点を結んで形を作るときの直角の吸い付き（平らな2次元・どの図でも同じ規則）・2026-11-28 ══
+// 【規則】Cesium の「建物を点で結んで作る」（src/CesiumMap.jsx の computeSnap）と同じ:
+//   ・直前の辺と、直前の点→カーソル の角が 90°±5° なら、直前の点を通る垂線の上へ吸い付く（snap90）
+//   ・点が3つ以上あり、カーソルが「直前の辺に直角」かつ「始点へ戻る辺にも直角」になる位置
+//     （＝長方形の4つ目の角）に近ければ、そこへ吸い付く（snap90 と snapClose90 の両方）
+//   ・吸い付かなくても、始点へ戻る辺がカーソルの所で直角なら snapClose90（印だけ）
+// 【入力】prev: これまでの点 [{x,y}]、q: カーソル {x,y}。座標は角度が地面と同じになる平面（画面の地図・メートル）。
+// 【戻り】{ target: 吸い付いた点（吸い付かなければ q）, snap90, snapClose90 }
+// 吸い付きを止める（Alt）かどうかは呼ぶ側が決める（snapGate.js の snapSuppressedFor）。
+const PERP_SNAP_COS = 0.087;          // cos(85°)。±5° 以内を直角とみなす（Cesium と同じ値）
+const PERP_SNAP_CLOSE_RATIO = 0.15;   // 長方形の4つ目の角へは「辺の長さの 15% 以内」で吸い付く（Cesium と同じ値）
+function perpSnap2D(prev, q) {
+  const result = { target: q, snap90: false, snapClose90: false };
+  if (!prev || prev.length < 2 || !q) return result;
+  const B = prev[prev.length - 1], A = prev[prev.length - 2], S = prev[0];
+  const cos2 = (ax, ay, bx, by) => { const al = Math.hypot(ax, ay), bl = Math.hypot(bx, by); return (al < 1e-12 || bl < 1e-12) ? 1 : (ax * bx + ay * by) / (al * bl); };
+  const eX = B.x - A.x, eY = B.y - A.y, el = Math.hypot(eX, eY);
+  if (el < 1e-12) return result;
+  const px = -eY / el, py = eX / el;          // 直前の辺に垂直な向き
+  const dX = q.x - B.x, dY = q.y - B.y;
+  const near90 = Math.abs(cos2(eX, eY, dX, dY)) < PERP_SNAP_COS;
+  if (prev.length >= 3) {
+    // 長方形の4つ目の角: N = B + t·垂直、(S − N)·垂直 = 0 → t = (S − B)·垂直
+    const t = (S.x - B.x) * px + (S.y - B.y) * py;
+    const N = { x: B.x + px * t, y: B.y + py * t };
+    const 辺 = Math.hypot(dX, dY);
+    if (辺 > 1e-12 && Math.hypot(q.x - N.x, q.y - N.y) / 辺 < PERP_SNAP_CLOSE_RATIO) {
+      return { target: N, snap90: true, snapClose90: true };
+    }
+  }
+  if (near90) {
+    const k = dX * px + dY * py;
+    const T = { x: B.x + px * k, y: B.y + py * k };
+    const r = { target: T, snap90: true, snapClose90: false };
+    if (prev.length >= 3 && Math.abs(cos2(T.x - B.x, T.y - B.y, S.x - T.x, S.y - T.y)) < PERP_SNAP_COS) r.snapClose90 = true;
+    return r;
+  }
+  if (prev.length >= 3 && Math.abs(cos2(dX, dY, S.x - q.x, S.y - q.y)) < PERP_SNAP_COS) result.snapClose90 = true;
+  return result;
+}
+// 直角の印（L字）の3点。corner の角で、from→corner の辺と corner→to の辺の内側に描く。size は辺の長さの 40% まで
+function perpMark2D(corner, from, to, size) {
+  const ux = corner.x - from.x, uy = corner.y - from.y, ul = Math.hypot(ux, uy);
+  const vx = to.x - corner.x, vy = to.y - corner.y, vl = Math.hypot(vx, vy);
+  if (ul < 1e-9 || vl < 1e-9) return null;
+  const s = Math.min(size, ul * 0.4, vl * 0.4);
+  const a = { x: corner.x - ux / ul * s, y: corner.y - uy / ul * s };
+  const b = { x: a.x + vx / vl * s, y: a.y + vy / vl * s };
+  const c = { x: corner.x + vx / vl * s, y: corner.y + vy / vl * s };
+  return [a, b, c];
+}
