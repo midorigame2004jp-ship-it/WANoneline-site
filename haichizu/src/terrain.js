@@ -185,6 +185,42 @@ function terrainResample(pts, terrain, worldW, worldH, maxDiv = 80) {
   }
   return 出;
 }
+// 【起伏に乗せた輪（道路の塗りなど）を、形を保ったまま間引く・2026-11-28】
+//   辺を地面の格子の間隔で刻んで高さを引くと、網目を細かくした分だけ点が増える（毎コマ描く点が増えて重い）。
+//   平らな所では刻んだ点の高さが一直線に並ぶので要らない。辺ごとに「端どうしを結んだ直線から高さが tol を超えて外れる点」
+//   だけを残す（高さだけの Douglas-Peucker。横の形は辺の上なので変わらない）。刻み方は terrainResample と同じ。
+//   pts: 閉じた輪（最後に始点を繰り返さない）、zAt(x, y) → 高さ、tol: 高さの許容（zAt と同じ単位）
+//   戻り: [{x, y, z}]（閉じた輪・始点を繰り返さない）
+function terrainDrapeRing(pts, terrain, worldW, worldH, maxDiv, zAt, tol) {
+  if (!pts || pts.length < 3) return [];
+  const n = pts.length;
+  let 刻 = Infinity;
+  if (terrain && terrain.cols && terrain.rows) {
+    const STEP = terrainStep(terrain, maxDiv);
+    刻 = Math.max(1e-6, Math.min(worldW / (terrain.cols - 1) * STEP, worldH / (terrain.rows - 1) * STEP));
+  }
+  const 出 = [];
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    const L = Math.hypot(b.x - a.x, b.y - a.y);
+    const m = Number.isFinite(刻) ? Math.min(400, Math.max(1, Math.ceil(L / 刻))) : 1;
+    const S = [];
+    for (let k = 0; k <= m; k++) { const x = a.x + (b.x - a.x) * k / m, y = a.y + (b.y - a.y) * k / m; S.push({ x, y, z: zAt(x, y) }); }
+    const 残す = new Uint8Array(m + 1); 残す[0] = 1; 残す[m] = 1;
+    const 割る = (i0, i1) => {
+      if (i1 - i0 < 2) return;
+      let 最 = -1, 最大 = tol;
+      for (let k = i0 + 1; k < i1; k++) {
+        const t = (k - i0) / (i1 - i0), zl = S[i0].z + (S[i1].z - S[i0].z) * t, d = Math.abs(S[k].z - zl);
+        if (d > 最大) { 最大 = d; 最 = k; }
+      }
+      if (最 >= 0) { 残す[最] = 1; 割る(i0, 最); 割る(最, i1); }
+    };
+    割る(0, m);
+    for (let k = 0; k < m; k++) if (残す[k]) 出.push(S[k]);   // 終わりの点は次の辺の始めとして入る
+  }
+  return 出;
+}
 function terrainPalette(id) {
   const n = Number(id);
   return TERRAIN_PALETTES.find(p => p.id === n) || TERRAIN_PALETTES[0];

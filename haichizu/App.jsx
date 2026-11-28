@@ -1814,7 +1814,9 @@ window.App = function App() {
       // 【いびつだった印】タンクは必ず円柱になるが、点列が円と見なせなかったものは赤くして
       //   「元の形が崩れている（測量の誤差・タイルの切れ）」と分かるようにする。
       // 範囲で切り取ったタンクは丸くないのが正しいので、いびつの印（赤）を付けない（2026-11-28）
-      const _いびつ = !_切った && (it.種別 === "タンク") && !((typeof shapeFromOutline === "function") && shapeFromOutline(pts));
+      // 【円と言える点列は普通の色・2026-11-28 ユーザー指示「赤い円柱を普通の円柱になるように」】判定は solidModel の tankOutlineIsRound 1つ
+      const _いびつ = !_切った && (it.種別 === "タンク") && !((typeof tankOutlineIsRound === "function") ? tankOutlineIsRound(pts)
+        : ((typeof shapeFromOutline === "function") && shapeFromOutline(pts)));
       // 【色は取り込み元（レイヤの表）が決める・2026-11-24】
       //   ここに `if (種別 === "道路")` を書かない。gsiTiles.js の GSI_IMPORT_LAYERS が it.color を渡す。
       const 色 = _いびつ ? "#EF4444" : (it.color || BLD_COLORS[(c - 1) % BLD_COLORS.length]);
@@ -8125,6 +8127,8 @@ window.App = function App() {
       _m.quads = _m.quads.filter(q => _ptInPolyXY(_形, (q.x0 + q.x2) / 2, (q.y0 + q.y2) / 2));
       _m.形の外で落とした = 前 - _m.quads.length;
     }
+    // 高さの範囲（WebGL の奥行きの範囲に毎コマ使う。毎コマ全部の面をなめないよう、ここで1回だけ）
+    if (_m && Array.isArray(_m.quads)) { let lo = Infinity, hi = -Infinity; for (const q of _m.quads) { const z = q.z0; if (z < lo) lo = z; if (z > hi) hi = z; } if (Number.isFinite(lo)) _m.z範囲 = [lo, hi]; }
     // 観測専用（製品は読まない）。「実寸か」をコンソールで検算できるようにする・2026-11-23
     //   window.__terrainInfo で 1m が何px か・高低差が画面で何px か・図面の実寸が分かる
     if (typeof window !== "undefined") {
@@ -9902,8 +9906,10 @@ window.App = function App() {
           // depth の範囲は地形の外接箱の8隅から（固定値だと拡大時に切れる）
           let zN = Infinity, zF = -Infinity;
           const _Pd = makeProjector(_c5g[0], _c5g[1], _c5g[2], _c5g[3], _c5g[4]);
+          // 地形の高さの範囲は地面の面を作ったときに1回だけ出す（毎コマ全部の面をなめない・2026-11-28）
           let _zlo = Infinity, _zhi = -Infinity;
-          for (const q of terrainMesh.quads) { const z = q.z0;
+          if (terrainMesh.z範囲 && !(typeof window !== 'undefined' && window.__TERRAIN_ZRANGE_CACHE === false)) { _zlo = terrainMesh.z範囲[0]; _zhi = terrainMesh.z範囲[1]; }
+          else for (const q of terrainMesh.quads) { const z = q.z0;
             if (z < _zlo) _zlo = z; if (z > _zhi) _zhi = z; }
           if (!Number.isFinite(_zlo)) { _zlo = 0; _zhi = 0; }
           for (const X of [0, TW]) for (const Y of [0, TH]) for (const Z of [_zlo, _zhi]) {
@@ -10009,11 +10015,16 @@ window.App = function App() {
       //   旗 window.__GROUND_DRAPE_CACHE = false で従来（毎コマ作り直す）
       const _旗 = (k) => (typeof window !== 'undefined' && window[k] === false);
       const _鍵 = [_div, terrainExag, _terrainMToPx(), _mpp, _形で切る ? JSON.stringify(_形で切る) : '',
-        _旗('__ROAD_BAND_THEN_RESAMPLE'), _旗('__GROUND_AREA_HOLES')].join('|');
+        _旗('__ROAD_BAND_THEN_RESAMPLE'), _旗('__GROUND_AREA_HOLES'), _旗('__GROUND_DRAPE_SIMPLIFY')].join('|');
       let 乗 = groundDrapeRef.current;
       if (_旗('__GROUND_DRAPE_CACHE') || !乗 || 乗.t !== terrainDraw || 乗.g !== groundAreas || 乗.鍵 !== _鍵) {
         const _刻む閉 = (R) => (typeof terrainResample === 'function') ? terrainResample(R.concat([R[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : R;
         const _高さ = (R) => R.map(q => ({ x: q.x, y: q.y, z: (typeof terrainZAt === 'function') ? terrainZAt(terrainDraw, TW, TH, q.x, q.y, terrainExag, _terrainMToPx(), _div) : 0 }));
+        // 平らな所の刻んだ点は間引く（高さが 0.1m 以上外れる点だけ残す・terrainDrapeRing）。旗 window.__GROUND_DRAPE_SIMPLIFY = false で全部の点
+        const _zAt = (x, y) => (typeof terrainZAt === 'function') ? terrainZAt(terrainDraw, TW, TH, x, y, terrainExag, _terrainMToPx(), _div) : 0;
+        const _間引く = !_旗('__GROUND_DRAPE_SIMPLIFY') && typeof terrainDrapeRing === 'function';
+        const _許容 = 0.1 * (terrainExag || 1) * (_terrainMToPx() || 1);
+        const _乗せる閉 = (R) => _間引く ? terrainDrapeRing(R, terrainDraw, TW, TH, _div, _zAt, _許容) : _高さ(_刻む閉(R));
         const 面ら = [];
         for (const a of groundAreas) {
           if (!a) continue;
@@ -10028,22 +10039,26 @@ window.App = function App() {
           const _右 = Array.isArray(a.幅右m) ? a.幅右m.map(v => v / _px) : null;
           const _後で刻む = !_旗('__ROAD_BAND_THEN_RESAMPLE');
           let 輪;
-          if (_輪あり) 輪 = _刻む閉(a.輪);
-          else if (_後で刻む) { const _帯 = gsiBandRing(a.中心線, (a.幅m || 2) / _px, _左, _右); 輪 = _帯 ? _刻む閉(_帯) : _帯; }
+          // 輪3 … 起伏に乗せた輪（x, y, 高さ）
+          let 輪3 = null;
+          if (_輪あり) 輪3 = _乗せる閉(a.輪);
+          else if (_後で刻む) { const _帯 = gsiBandRing(a.中心線, (a.幅m || 2) / _px, _左, _右); 輪3 = (_帯 && _帯.length >= 3) ? _乗せる閉(_帯) : null; }
           else {
             const 刻 = (typeof terrainResample === 'function') ? terrainResample(a.中心線, terrainDraw, TW, TH, _div) : a.中心線;
             輪 = gsiBandRing(刻, (a.幅m || 2) / _px);
+            輪3 = (輪 && 輪.length >= 3) ? _高さ(輪) : null;
           }
-          if (!輪 || 輪.length < 3) continue;
+          if (!輪3 || 輪3.length < 3) continue;
           // 【島（穴）は塗らない・2026-11-28】穴の輪も同じ道（地面の格子で刻んで起伏に乗せる）で足し、evenodd で抜く。
           //   旗 window.__GROUND_AREA_HOLES = false で従来（穴を無視して塗る）
           const _穴を抜く = _輪あり && Array.isArray(a.穴) && a.穴.length && !_旗('__GROUND_AREA_HOLES');
-          const 輪ら = [_高さ(輪)];
+          const 輪ら = [輪3];
           let 穴 = 0;
-          if (_穴を抜く) for (const Q of a.穴) { if (!Array.isArray(Q) || Q.length < 3) continue; 穴++; 輪ら.push(_高さ(_刻む閉(Q))); }
+          if (_穴を抜く) for (const Q of a.穴) { if (!Array.isArray(Q) || Q.length < 3) continue; 穴++; 輪ら.push(_乗せる閉(Q)); }
           面ら.push({ 輪ら, 穴, 色: a.color || '#9CA3AF', 偶奇: !!_穴を抜く });
         }
-        乗 = { t: terrainDraw, g: groundAreas, 鍵: _鍵, 切り: _形で切る ? _高さ(_刻む閉(_形で切る)) : null, 面ら, 作った: ((乗 && 乗.作った) || 0) + 1 };
+        乗 = { t: terrainDraw, g: groundAreas, 鍵: _鍵, 切り: _形で切る ? _乗せる閉(_形で切る) : null, 面ら, 作った: ((乗 && 乗.作った) || 0) + 1,
+          点: 面ら.reduce((a2, f) => a2 + f.輪ら.reduce((b2, R) => b2 + R.length, 0), 0) };
         groundDrapeRef.current = 乗;
       }
       const _なぞる = (R) => {
@@ -10086,6 +10101,7 @@ window.App = function App() {
         頂点を送った: !!(terrainGLRef.current && terrainGLRef.current.送った),
         塗り: 塗数, 穴: 穴数, 切り: 切り方, 段: 束.size, ms: Math.round(performance.now() - t0),
         起伏に乗せ直した: groundDrapeRef.current ? groundDrapeRef.current.作った : 0,
+        塗りの点: groundDrapeRef.current ? groundDrapeRef.current.点 : 0,
         回: ((window.__terrainCanvasInfo || {}).回 || 0) + 1,
       };
     }

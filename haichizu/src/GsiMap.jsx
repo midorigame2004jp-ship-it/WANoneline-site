@@ -25,7 +25,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     const o = (typeof GEO_ORIGIN !== 'undefined' && GEO_ORIGIN) ? GEO_ORIGIN : { lat: 33.275, lng: 131.667 };
     return { lat: o.lat, lng: o.lng, z: 15, rot: 0 };
   });
-  // 地図を回している間の控え（右ボタン／Ctrl＋左ボタンのドラッグ）{ a0: 押した点の角度, rot0 }
+  // 地図を回している間の控え（中ボタン／Ctrl＋左ボタンのドラッグ）{ a0: 押した点の角度, rot0 }
   const rotRef = React.useRef(null);
   // Alt を押している間は直角に吸い付かない（印も出さない）。描き直しのために持つ
   const [alt, setAlt] = React.useState(false);
@@ -292,8 +292,10 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   const onDown = (e) => {
     const r = boxRef.current.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
-    // 右ボタン／Ctrl＋左ボタンのドラッグで地図を回す（国土地理院の地図（ベクトル）と同じ操作）
-    if ((e.button === 2 || (e.button === 0 && e.ctrlKey)) && !(typeof window !== 'undefined' && window.__GSI_ROTATE === false)) {
+    // 中ボタン（または Ctrl＋左ボタン）のドラッグで地図を回す（2026-11-28 ユーザー指示「中央ボタンで回るように。平面図と同じ操作に」）。
+    //   どの入力で回すかは App.jsx の _図の回転入力か 1つ（平面図・3次元図と同じ述語。ここで書き分けない）
+    const _回す入力 = (typeof _図の回転入力か === 'function') ? _図の回転入力か(e) : (e.button === 1 || (e.button === 0 && e.ctrlKey));
+    if (_回す入力 && !(typeof window !== 'undefined' && window.__GSI_ROTATE === false)) {
       rotRef.current = { a0: Math.atan2(sy - 半H, sx - 半W), rot0: view.rot || 0 };
       e.preventDefault();
       return;
@@ -570,7 +572,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       <div ref={boxRef} data-gsi-map="1" data-gsi-rot={回転}
         style={{ position: 'relative', flex: 1, overflow: 'hidden', cursor: pickMode ? 'crosshair' : 'grab', background: '#1e293b' }}
         onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp} onWheel={onWheel}
-        onContextMenu={(e) => e.preventDefault()}>
+        onAuxClick={(e) => { if (e.button === 1) e.preventDefault(); }}>
         {/* タイルは北が上の並びのまま、入れ物ごと回す（真ん中を中心に） */}
         <div data-gsi-tiles="1" style={{ position: 'absolute', inset: 0, pointerEvents: 'none',
           transform: 回転 ? 'rotate(' + 回転 + 'deg)' : undefined, transformOrigin: 半W + 'px ' + 半H + 'px' }}>
@@ -620,9 +622,9 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
           })()}
         </svg>
 
-        {/* 方位: 針は北を指す。押すと北を上に戻す（右ボタン／Ctrl＋左ボタンのドラッグで回す・Shift で 15° 刻み） */}
+        {/* 方位: 針は北を指す。押すと北を上に戻す（中ボタン／Ctrl＋左ボタンのドラッグで回す・Shift で 15° 刻み） */}
         {!(typeof window !== 'undefined' && window.__GSI_ROTATE === false) && (
-          <div data-gsi-compass="1" title={'地図の向き ' + Math.round(回転) + '°（押すと北が上に戻る／右ボタンか Ctrl＋左ボタンのドラッグで回す・Shift で 15° 刻み）'}
+          <div data-gsi-compass="1" title={'地図の向き ' + Math.round(回転) + '°（押すと北が上に戻る／中ボタンか Ctrl＋左ボタンのドラッグで回す・Shift で 15° 刻み）'}
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => { e.stopPropagation(); setView(v => ({ ...v, rot: 0 })); }}
             style={{ position: 'absolute', right: 6, top: 6, width: 34, height: 34, borderRadius: 17, cursor: 'pointer',
@@ -656,7 +658,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       )}
       {/* 知らせ */}
       <div style={{ fontSize: 11, padding: '3px 6px', background: '#1e293b', minHeight: 18, lineHeight: '14px' }}>
-        {busy ? busy : (msg || (pickMode ? 範囲の案内 : '水色の点線＝いまの図面の範囲／黄色＝フィールド／右ボタン（または Ctrl＋左ボタン）のドラッグで地図を回す'))}
+        {busy ? busy : (msg || (pickMode ? 範囲の案内 : '水色の点線＝いまの図面の範囲／黄色＝フィールド／中ボタン（または Ctrl＋左ボタン）のドラッグで地図を回す'))}
       </div>
     </div>
   );

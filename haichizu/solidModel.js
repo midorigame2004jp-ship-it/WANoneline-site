@@ -3374,6 +3374,29 @@ function circleFromOutline(points) {
   if (!(r > 0) || !Number.isFinite(r)) return null;
   return makeCircleShape(cx, cy, r);
 }
+// 【円だと分かっている物（タンク）の点列が、円として描いて差し支えない形か・2026-11-28 ユーザー指示「赤い円柱を普通の円柱に」】
+//   shapeFromOutline は「何の印も無い建物の点列が円か」を見分けるので厳しい（9点以上・ばらつき 9% まで）。
+//   国土地理院のタンクは小さいもの（半径 3〜8m）が 7〜13点の粗い多角形で入っており、点の間隔が不ぞろいなので
+//   ばらつきが 9〜12% になって落ち、赤（いびつの印）になっていた。面積は正多角形の理論値と 3% 以内で一致する＝形は円。
+//   データが「円」と言っている物は、点が6つ以上・ばらつき 15% 以下・面積が正多角形の理論値の ±10% 以内なら円として扱う
+//   （正方形〔辺の中点を入れた8点でもばらつき 17%〕・長方形・L字は落ちる）。旗 globalThis.__TANK_ROUND_LOOSE = false で従来（shapeFromOutline）
+function tankOutlineIsRound(points) {
+  if (typeof globalThis !== 'undefined' && globalThis.__TANK_ROUND_LOOSE === false) return !!shapeFromOutline(points);
+  if (!Array.isArray(points) || points.length < 6) return false;
+  let cx = 0, cy = 0;
+  for (const q of points) { cx += q.x; cy += q.y; }
+  cx /= points.length; cy /= points.length;
+  const ds = points.map(q => Math.hypot(q.x - cx, q.y - cy));
+  const r = ds.reduce((a, b) => a + b, 0) / ds.length;
+  if (!(r > 0) || !Number.isFinite(r)) return false;
+  const sd = Math.sqrt(ds.reduce((a, b) => a + (b - r) * (b - r), 0) / ds.length);
+  if (sd / r > 0.15) return false;
+  let 面 = 0;
+  for (let k = 0; k < points.length; k++) { const a = points[k], b = points[(k + 1) % points.length]; 面 += a.x * b.y - b.x * a.y; }
+  面 = Math.abs(面) / 2;
+  const 理論面 = (points.length / 2) * Math.sin(2 * Math.PI / points.length) * r * r;
+  return 理論面 > 0 && Math.abs(面 - 理論面) / 理論面 <= 0.1;
+}
 function shapeFromOutline(points) {
   // 【頂点9以上・2026-11-23】正八角形（折れ角45°）は「円」でなく多角形として残す。
   //   地図の円は粗くても9点以上で入っている（実測: 大分のタンクは 9〜35点）。
