@@ -1012,7 +1012,77 @@ function 設定を保存(settings) {
   } catch (_) {}
 }
 
+// ── 作り直しのきっかけ（2026-11-28 ユーザー指示「ほかに原因がある。ログから探れるなら追加しろ」）──
+//   App はとても大きく、1回作り直すと 60ms 前後かかる（建物を表示した図）。何が作り直しを起こしているかを、
+//   「App のどの状態を・どの関数が書き換えたか」で数える。数えるのは速度表示（__perfHud）を出している間だけ。
+//   ・App の useState だけを包む（App の本体の先頭で useState をこれに差し替える）。ほかの部品は触らない
+//   ・包んだ書き換え関数は React の書き換え関数ごとに1つだけ作る（同じものを返す＝依存配列・メモは変わらない）
+//   ・名前は書き換えた所のコードの行から読む（setXxx( の Xxx）。読めなければ呼んだ関数の名前だけ出す
+//   旗 window.__RENDER_WHO=false（読み込みの前）で包まない＝従来
+const _whoOff = (typeof window !== 'undefined' && window.__RENDER_WHO === false);
+const _whoWrapped = new WeakMap();
+const _who = { on: false, 回: new Map(), 通算: new Map(), _行: null };
+if (typeof window !== 'undefined') window.__renderWho = _who;
+function _whoLines() {
+  if (_who._行) return _who._行;
+  let 文 = '';
+  try { for (const sc of document.scripts) { const t = sc.textContent || ''; if (t.length > 100000 && t.indexOf('window.App = function App') >= 0) { 文 = t; break; } } } catch (e) {}
+  _who._行 = 文 ? 文.split('\n') : [];
+  return _who._行;
+}
+// 書き換えた所の名前（呼んだその場の呼び出し履歴から読む）
+function _whoLabel() {
+  let 名 = '?';
+  try {
+    const 列 = String(new Error().stack || '').split('\n').map(l => l.trim()).filter(l => l.startsWith('at '));
+    // 0 = _whoNote・1 = 包んだ書き換え関数・2 = 書き換えを呼んだ所。
+    //   呼んだ所が名前の無い関数（useCallback に直接渡した矢印など）なら、名前のある呼び元まで上へたどる
+    const 解 = (l) => { const a = l.match(/^at (?:async )?(\S+) \((.*)\)$/); const 名0 = a ? a[1] : '', 所 = a ? a[2] : l.slice(3);
+      const b = 所.match(/^(.*):(\d+):(\d+)$/); return { 名: 名0, 所: b ? b[1] : 所, 行: b ? Number(b[2]) : 0, 桁: b ? Number(b[3]) : 0 }; };
+    const 呼 = 解(列[2] || '');
+    let 関数 = '';
+    for (let i = 2; i < 列.length && !関数; i++) { const f = 解(列[i]);
+      if (f.名 && !/^(?:<anonymous>|eval|Object\.<anonymous>)$/.test(f.名) && !/react/i.test(f.所)) 関数 = f.名.replace(/^Object\./, ''); }
+    const m = 呼.行 ? [null, null, 呼.所, 呼.行, 呼.桁] : null;
+    let 状態 = '';
+    if (m) {
+      const 行 = _whoLines()[Number(m[3]) - 1] || '';
+      const 桁 = Number(m[4]) - 1;
+      // 呼んだ桁の近くにある setXxx( を探す（同じ行に複数あれば呼んだ桁に一番近いもの）
+      let 近 = null; const re = /\b(set[A-Z][\w$]*)\s*\(/g; let r;
+      while ((r = re.exec(行))) { const d = Math.abs(r.index - 桁); if (!近 || d < 近.d) 近 = { d, n: r[1] }; }
+      if (近) 状態 = 近.n.slice(3, 4).toLowerCase() + 近.n.slice(4);
+    }
+    名 = (状態 || '状態') + (関数 ? '（' + 関数 + '）' : '');
+  } catch (e) {}
+  return 名;
+}
+const _whoCount = (名) => { _who.回.set(名, (_who.回.get(名) || 0) + 1);
+  _who.通算.set(名, (_who.通算.get(名) || 0) + 1); };   // 通算は検査が読む（表示は0.5秒ごとに数え直す）
+// 値が本当に変わったときだけ数える（同じ値を入れ直しただけなら React は作り直さないので、きっかけに数えない）
+const _whoLast = new WeakMap();
+function _whoUseState(init) {
+  const r = React.useState(init);
+  if (_whoOff) return r;
+  const set = r[1];
+  _whoLast.set(set, r[0]);
+  let w = _whoWrapped.get(set);
+  if (!w) {
+    w = function (v) {
+      if (!_who.on) return set(v);
+      const 名 = _whoLabel();
+      if (typeof v === 'function') return set((prev) => { const n = v(prev); if (n !== prev) _whoCount(名); return n; });
+      if (v !== _whoLast.get(set)) _whoCount(名);
+      return set(v);
+    };
+    _whoWrapped.set(set, w);
+  }
+  return [r[0], w];
+}
+
 window.App = function App() {
+  // App の状態の書き換えを数えるため、この本体の中の useState だけ差し替える（上の説明）
+  const useState = _whoUseState;
   const [nodes, setNodes] = useState(initNodes);
   const [segs] = useState(initSegs);
   const [currentSSE, setCurrentSSE] = useState(null); // 3DタイルSSE表示用
@@ -6517,6 +6587,8 @@ window.App = function App() {
         _loaf.observe({ type: 'long-animation-frame', buffered: false });
       }
     } catch (e) { _loaf = null; }
+    // 作り直しのきっかけを数え始める（表示を出している間だけ。上の _whoUseState）
+    _who.on = true; _who.回 = new Map(); let 誰表 = '';
     let rend0 = _perfRef.current.renders, mv0 = _perfRef.current.camMoves;
     let ces0 = null, 地表 = '';
     let rps = 0, mps = 0, drawMs = 0, cab0 = _perfRef.current.cabRenders || 0, cps = 0;
@@ -6554,8 +6626,14 @@ window.App = function App() {
           } else 長表 = '長いコマ 0 回' + (fps > 0 && fps < 30 ? '（ページの中は1コマ 50ms 未満＝遅さはページの外）' : '') + '\n';
           長 = { n: 0, 合: 0, 脚: 0, 強: 0, 描: 0, 配: 0, 重: new Map() };
         }
+        // 作り直しのきっかけ（この0.5秒に App の状態を書き換えた所。多い順に3つ）
+        { const 並 = [..._who.回].sort((a, b) => b[1] - a[1]);
+          誰表 = 並.length ? 並.slice(0, 3).map(([k, v]) => '  ' + k + ' ' + Math.round(v * 1000 / acc) + ' 回/秒\n').join('') : '  なし\n';
+          if (typeof window !== 'undefined') window.__renderWhoLast = 並.slice(0, 8).map(([k, v]) => [k, Math.round(v * 1000 / acc)]);
+          _who.回 = new Map(); }
         acc = 0; frames = 0;
         el.textContent = `${fps} fps\n` + (長表 || '') + `マウス ${mps} 回/秒\n画面の作り直し ${rps} 回/秒\n`
+          + `作り直しのきっかけ\n` + 誰表
           + `1回の作り直し ${(_perfRef.current.renderMs || 0).toFixed(1)} ms\n`
           + `3次元図の作り直し ${cps} 回/秒\n3次元図1回 ${(_perfRef.current.cabRenderMs || 0).toFixed(1)} ms\n`
           + `奥行き順の計算 ${(_perfRef.current.orderMs || 0).toFixed(1)} ms\n盤の描画 ${drawMs.toFixed(1)} ms\n`
@@ -6571,7 +6649,7 @@ window.App = function App() {
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
-    return () => { cancelAnimationFrame(raf); el.remove(); if (_loaf) try { _loaf.disconnect(); } catch (e) {} };
+    return () => { cancelAnimationFrame(raf); el.remove(); _who.on = false; _who.回 = new Map(); if (_loaf) try { _loaf.disconnect(); } catch (e) {} };
   }, [perfHud]);
   // 検査（checks/）から中身を見る・盤を1台置くための口。表示や操作は変えない
   useEffect(() => { window.__equipmentRecords = equipmentRecords; }, [equipmentRecords]);

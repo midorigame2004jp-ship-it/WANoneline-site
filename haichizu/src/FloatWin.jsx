@@ -83,12 +83,20 @@ function FloatWin({ id, title, icon, winState, setWinState, bringFront, children
   const raise = () => { fwBlurForeignFocus(id); bringFront(id); };
 
   const lastClickRef = useRef(0);
+  const rootRef = useRef(null);
+  // 【動かしている間は画面を作り直さない・2026-11-28 ユーザー報告「建物を表示したときからウインドウの移動さえ重い」】
+  //   以前は mousemove のたびに setWinState していたので、窓を1px動かすたびに App 全体（平面図の 1万個を超える
+  //   SVG・3次元図…）を作り直していた（実測: 1回 65ms・11回/秒）。窓の位置・大きさは見た目だけの話なので、
+  //   動かしている間はこの窓の箱（一番外の div）の style だけを書き換え、離したときに1回だけ setWinState する。
+  //   React は前回の props と比べて差分だけ DOM に書くので、途中で別の理由の作り直しが来ても書き換えた位置は戻らない。
+  //   旗 window.__FLOATWIN_DOM_DRAG=false で従来（動かすたびに作り直す）＝陽性対照
+  const domDrag = () => window.__FLOATWIN_DOM_DRAG !== false && !!rootRef.current;
   const startMove = (e) => {
     e.preventDefault(); e.stopPropagation(); raise();
     // ダブルクリック検出（500ms以内の2回mousedown）
     const now = Date.now();
     const gap = now - lastClickRef.current;
-    console.warn('[DBLCLICK]', { gap, id });
+    if (window.__DEBUG_TRACE === true) console.warn('[DBLCLICK]', { gap, id });
     if (gap < 500) {
       lastClickRef.current = 0;
       setWinState(pr => {
@@ -107,8 +115,19 @@ function FloatWin({ id, title, icon, winState, setWinState, bringFront, children
     const _ov = document.createElement('div');
     _ov.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:default;';
     let _ovAdded = false;
-    const mv = (ev) => { if (!_ovAdded) { _ovAdded = true; document.body.appendChild(_ov); } const p = getXY(ev); setWinState(pr => ({ ...pr, [id]: { ...pr[id], x: origX + p.x - start.x, y: origY + p.y - start.y } })); };
-    const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); window.removeEventListener("touchmove", mv); window.removeEventListener("touchend", up); if (_ov.parentNode) _ov.parentNode.removeChild(_ov); };
+    const _dom = domDrag();
+    let 今 = null;   // DOM だけ動かしているときの最後の位置（離したときに1回だけ記録へ書く）
+    const mv = (ev) => {
+      if (!_ovAdded) { _ovAdded = true; document.body.appendChild(_ov); }
+      const p = getXY(ev);
+      const nx = origX + p.x - start.x, ny = origY + p.y - start.y;
+      if (_dom && rootRef.current) { 今 = { x: nx, y: ny }; rootRef.current.style.left = nx + 'px'; rootRef.current.style.top = ny + 'px'; return; }
+      setWinState(pr => ({ ...pr, [id]: { ...pr[id], x: nx, y: ny } }));
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); window.removeEventListener("touchmove", mv); window.removeEventListener("touchend", up); if (_ov.parentNode) _ov.parentNode.removeChild(_ov);
+      if (今) { const 終 = 今; 今 = null; setWinState(pr => ({ ...pr, [id]: { ...pr[id], x: 終.x, y: 終.y } })); }
+    };
     window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
     window.addEventListener("touchmove", mv, { passive: false }); window.addEventListener("touchend", up);
   };
@@ -121,6 +140,8 @@ function FloatWin({ id, title, icon, winState, setWinState, bringFront, children
     const _ov = document.createElement('div');
     _ov.style.cssText = 'position:fixed;inset:0;z-index:2147483647;cursor:default;';
     let _ovAdded = false;
+    const _dom = domDrag();
+    let 今 = null;
     const mv = (ev) => {
       if (!_ovAdded) { _ovAdded = true; document.body.appendChild(_ov); }
       ev.preventDefault();
@@ -131,9 +152,19 @@ function FloatWin({ id, title, icon, winState, setWinState, bringFront, children
       if (edges.b) nh = Math.max(MIN_H, orig.h + dy);
       if (edges.l) { const dw = Math.min(dx, orig.w - MIN_W); nx = orig.x + dw; nw = orig.w - dw; }
       if (edges.t) { const dh = Math.min(dy, orig.h - MIN_H); ny = orig.y + dh; nh = orig.h - dh; }
+      // 大きさも同じく箱の style だけ書き換える。中身は箱の大きさに合わせて並び直し、
+      //   大きさを見張っている中身（3次元図の倍率・地図）はそれぞれ自分で追従する
+      if (_dom && rootRef.current) {
+        今 = { x: nx, y: ny, w: nw, h: nh };
+        const st = rootRef.current.style; st.left = nx + 'px'; st.top = ny + 'px'; st.width = nw + 'px'; st.height = nh + 'px';
+        return;
+      }
       setWinState(pr => ({ ...pr, [id]: { ...pr[id], x: nx, y: ny, w: nw, h: nh } }));
     };
-    const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); window.removeEventListener("touchmove", mv); window.removeEventListener("touchend", up); if (_ov.parentNode) _ov.parentNode.removeChild(_ov); };
+    const up = () => {
+      window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up); window.removeEventListener("touchmove", mv); window.removeEventListener("touchend", up); if (_ov.parentNode) _ov.parentNode.removeChild(_ov);
+      if (今) { const 終 = 今; 今 = null; setWinState(pr => ({ ...pr, [id]: { ...pr[id], ...終 } })); }
+    };
     window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
     window.addEventListener("touchmove", mv, { passive: false }); window.addEventListener("touchend", up);
   };
@@ -147,7 +178,7 @@ function FloatWin({ id, title, icon, winState, setWinState, bringFront, children
   });
 
   return (
-    <div data-floatwinid={id} onMouseDown={raise} onTouchStart={raise}
+    <div ref={rootRef} data-floatwinid={id} onMouseDown={raise} onTouchStart={raise}
       style={{
         position: "absolute", left: w.x, top: w.y,
         width: minimized ? 130 : w.w,

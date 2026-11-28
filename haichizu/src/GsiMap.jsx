@@ -451,6 +451,21 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     setView(v => ({ ...v, z: nz, lng: gsiTileXToLng(ncx, nz), lat: gsiTileYToLat(ncy, nz) }));
   };
 
+  // 【ホイールは箱へ直接付ける・2026-11-28 ユーザーの画面のコンソールに「passive の受け口の中で preventDefault できない」が並んでいた】
+  //   React の onWheel は passive（preventDefault が効かない）で付くので、拡大縮小のたびにエラーが出て、
+  //   ページ側のスクロールも止められていなかった。3次元図（App.jsx）と同じく passive:false で箱に直接付ける。
+  //   中身は毎回最新の onWheel を呼ぶ（地図の位置・倍率が変わるたびに付け直さない）。旗 __GSI_WHEEL_NATIVE=false で従来
+  const _ホイール直付け = window.__GSI_WHEEL_NATIVE !== false;
+  const _ホイール最新 = React.useRef(null);
+  _ホイール最新.current = onWheel;
+  React.useEffect(() => {
+    if (!_ホイール直付け) return;
+    const el = boxRef.current; if (!el) return;
+    const 受 = (e) => { if (_ホイール最新.current) _ホイール最新.current(e); };
+    el.addEventListener('wheel', 受, { passive: false });
+    return () => el.removeEventListener('wheel', 受);
+  }, []);
+
   // ── 3次元範囲を設定（ドラッグの四角／クリックでつないだ形 → フィールド）──
   // 原点と縮尺を決める式は cesiumUtils.js の fieldFrameFromPolygon 1か所（Cesium の多角形クリックと同じ commitFieldPolygon を通る）。
   //   図面（平面図・3次元図）は形の外接する四角がぴったり収まる大きさ・縦横比になる（constants.js の fieldCellsFromPolygon）。
@@ -622,7 +637,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       {/* 地図 */}
       <div ref={boxRef} data-gsi-map="1" data-gsi-rot={回転}
         style={{ position: 'relative', flex: 1, overflow: 'hidden', cursor: pickMode ? 'crosshair' : 'grab', background: '#1e293b' }}
-        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp} onWheel={onWheel}
+        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp} onWheel={_ホイール直付け ? undefined : onWheel}
         onAuxClick={(e) => { if (e.button === 1) e.preventDefault(); }}
         onContextMenu={(e) => {
           // 右クリックで閉じる（3点以上・Cesium の建屋追加と同じ）。点をつないでいる間はブラウザのメニューを出さない
@@ -667,6 +682,9 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
             const h = 先 ? 先.target : null;
             const 閉じる = !!(先 && 先.種 === 'start');
             const 寄せた = !!(先 && (先.種 === '90' || 先.種 === 'axis'));
+            // 線を緑にするのは直角に吸い付いたときだけ。Shift の垂直・水平は線の色を変えない（2026-11-28 ユーザー指摘
+            //   「Shiftで水平垂直の時に緑の線になる必要はない」）。直角の印は Shift でも出す。旗 __GSI_AXIS_ORANGE=false で従来（緑）
+            const 緑線 = !!(先 && (先.種 === '90' || (先.種 === 'axis' && window.__GSI_AXIS_ORANGE === false)));
             const 線 = S.concat(h ? [h] : []);
             const L字 = (角, 元, 先2) => { const el = Math.hypot(角.x - 元.x, 角.y - 元.y);
               return el > 1e-9 ? perpMark2D(角, 元, 先2, _直角機能 ? el * 印の割合 : 10) : null; };
@@ -675,10 +693,10 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
             if (寄せた && h && 先.snapClose90 && S.length >= 2) 印ら.push(L字(h, last, S[0]));
             return (<g data-gsi="pick-poly" data-gsi-snap={先 ? 先.種 : ''}>
               {pts.length >= 3 && <polygon points={S.map(q => q.x + ',' + q.y).join(' ')} fill="rgba(249,115,22,0.12)" stroke="none" />}
-              <polyline data-gsi="pick-line" points={線.map(q => q.x + ',' + q.y).join(' ')} fill="none" stroke={寄せた ? '#22c55e' : '#f97316'} strokeWidth={2} />
+              <polyline data-gsi="pick-line" points={線.map(q => q.x + ',' + q.y).join(' ')} fill="none" stroke={緑線 ? '#22c55e' : '#f97316'} strokeWidth={2} />
               {/* 始点へ戻る辺（直角なら緑） */}
               {h && !閉じる && pts.length >= 2 && <line data-gsi="pick-close" x1={h.x} y1={h.y} x2={S[0].x} y2={S[0].y}
-                stroke={寄せた && 先.snapClose90 ? '#22c55e' : '#f97316'} strokeWidth={1} strokeDasharray="4 3" opacity={0.8} />}
+                stroke={緑線 && 先.snapClose90 ? '#22c55e' : '#f97316'} strokeWidth={1} strokeDasharray="4 3" opacity={0.8} />}
               {印ら.filter(Boolean).map((m, i) => <polyline key={'p' + i} data-gsi="perp-mark" points={m.map(q => q.x + ',' + q.y).join(' ')}
                 fill="none" stroke="#22c55e" strokeWidth={2} />)}
               {S.map((q, i) => <circle key={i} cx={q.x} cy={q.y} r={i === 0 ? (閉じる ? 8 : 6) : 4}
