@@ -11104,20 +11104,34 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
   }
 
   function strengthenOcrStrokes(source) {
-    const scale = Math.min(1, 700 / Math.max(source.width, source.height));
+    const scale = Math.min(1, 650 / Math.max(source.width, source.height));
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(1, Math.round(source.width * scale));
     canvas.height = Math.max(1, Math.round(source.height * scale));
-    const ctx = canvas.getContext('2d', {alpha: false, willReadFrequently: true});
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+    const ctx = canvas.getContext('2d', {alpha: false});
     const {width, height} = canvas;
-    const image = ctx.getImageData(0, 0, width, height);
+    const image = ctx.createImageData(width, height);
     const pixels = image.data;
     const gray = new Uint8Array(width * height);
-    for (let i = 0; i < gray.length; i++) {
-      const offset = i * 4;
-      gray[i] = Math.round(.299 * pixels[offset] + .587 * pixels[offset + 1] + .114 * pixels[offset + 2]);
+    const sourcePixels = source.getContext('2d').getImageData(0, 0, source.width, source.height).data;
+    // Average source pixels by covered area for consistent downsampling across browsers.
+    for (let y = 0; y < height; y++) {
+      const top = y * source.height / height;
+      const bottom = (y + 1) * source.height / height;
+      for (let x = 0; x < width; x++) {
+        const left = x * source.width / width;
+        const right = (x + 1) * source.width / width;
+        let sum = 0;
+        for (let row = Math.floor(top); row < Math.ceil(bottom); row++) {
+          const vertical = Math.min(bottom, row + 1) - Math.max(top, row);
+          for (let col = Math.floor(left); col < Math.ceil(right); col++) {
+            const weight = vertical * (Math.min(right, col + 1) - Math.max(left, col));
+            const i = (row * source.width + col) * 4;
+            sum += weight * (.299 * sourcePixels[i] + .587 * sourcePixels[i + 1] + .114 * sourcePixels[i + 2]);
+          }
+        }
+        gray[y * width + x] = Math.round(sum / ((bottom - top) * (right - left)));
+      }
     }
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
@@ -11129,6 +11143,7 @@ for(const record of group.records)if(record.type==='/TrueType'&&record.values.ha
         }
         const offset = (y * width + x) * 4;
         pixels[offset] = pixels[offset + 1] = pixels[offset + 2] = darkest;
+        pixels[offset + 3] = 255;
       }
     }
     ctx.putImageData(image, 0, 0);
