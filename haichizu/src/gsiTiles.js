@@ -813,7 +813,22 @@ function gsiRoadFacesInTile(芯ら, 縁線, ext, 単位m, opt) {
     隣[v].sort((a, b) => Math.atan2(頂[a].y - p.y, 頂[a].x - p.x) - Math.atan2(頂[b].y - p.y, 頂[b].x - p.x));
   }
   // ── 面をたどる（囲まれた面は面積が正）──
-  const 通 = new Set(), 面ら = [];
+  // 【島（穴）・2026-11-28 ユーザー指摘「島：どれもNG。ちゃんと島も取り込め」】
+  //   線のつながり（成分）ごとに、外まわりは面積が負の輪になる。ほかの成分の面の中にある負の輪は、その面の「穴」＝島
+  //   （中央分離帯・環状交差点の真ん中など、縁の線が閉じていて外とつながらない形）。従来は負の輪を捨てていたので島まで塗っていた。
+  //   旗 globalThis.__GSI_ROAD_ISLANDS = false で従来（島も道路の色で塗る）
+  const _島も = !(typeof globalThis !== 'undefined' && globalThis.__GSI_ROAD_ISLANDS === false);
+  const 成 = new Int32Array(頂.length).fill(-1);
+  if (_島も) {
+    let n成 = 0;
+    for (let v = 0; v < 頂.length; v++) {
+      if (消[v] || !隣[v] || 成[v] >= 0) continue;
+      const 待2 = [v]; 成[v] = n成;
+      while (待2.length) { const a = 待2.pop(); for (const w of 隣[a] || []) if (成[w] < 0 && !消[w]) { 成[w] = n成; 待2.push(w); } }
+      n成++;
+    }
+  }
+  const 通 = new Set(), 面ら = [], 外まわり = [];
   for (let u0 = 0; u0 < 頂.length; u0++) {
     if (消[u0] || !隣[u0]) continue;
     for (const v0 of 隣[u0]) {
@@ -825,7 +840,25 @@ function gsiRoadFacesInTile(芯ら, 縁線, ext, 単位m, opt) {
         u = v; v = w;
       } while (!(u === u0 && v === v0) && ++歩 < 200000);
       let a2 = 0; for (let k = 0; k < 輪.length; k++) { const p = 頂[輪[k]], q = 頂[輪[(k + 1) % 輪.length]]; a2 += p.x * q.y - q.x * p.y; }
-      if (a2 > 0) 面ら.push({ 番: 輪, 面積: a2 / 2 });
+      if (a2 > 0) 面ら.push({ 番: 輪, 面積: a2 / 2, 成: 成[u0], 穴: [] });
+      else if (_島も && a2 < 0) 外まわり.push({ 番: 輪, 面積: -a2 / 2, 成: 成[u0] });
+    }
+  }
+  if (_島も) {
+    // 各成分の外まわりを、それを囲む一番小さい（ほかの成分の）面の穴にする
+    const _中2 = (P, q) => { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j]; if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
+    const 箱ら = 面ら.map(f => { let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const v of f.番) { const q = 頂[v]; if (q.x < x0) x0 = q.x; if (q.y < y0) y0 = q.y; if (q.x > x1) x1 = q.x; if (q.y > y1) y1 = q.y; } return [x0, y0, x1, y1]; });
+    for (const H of 外まわり) {
+      const h = 頂[H.番[0]];
+      let 最 = null;
+      面ら.forEach((f, k) => {
+        if (f.成 === H.成 || f.面積 <= H.面積) return;
+        const b = 箱ら[k]; if (h.x < b[0] || h.x > b[2] || h.y < b[1] || h.y > b[3]) return;
+        if (最 && f.面積 >= 最.面積) return;
+        if (_中2(f.番.map(v => 頂[v]), h)) 最 = f;
+      });
+      if (最) 最.穴.push(H);
     }
   }
   // ── 3) 道路の面を選ぶ ──
@@ -845,34 +878,102 @@ function gsiRoadFacesInTile(芯ら, 縁線, ext, 単位m, opt) {
     }
     return false;
   };
+  // 【島の輪・2026-11-28】閉じた縁の線で、中にほかの縁の線が無いもの＝島（中央分離帯・環状交差点の真ん中）。
+  //   地理院の中心線は島の真ん中を通して描かれている（実データで確認）ので、「中心線が入っている面＝道路」だけでは
+  //   島の中まで道路に選ばれる（しかも交差点の切り線で島が細かく割られる）。島の輪の中に収まる面は道路にしない。
+  const 島輪 = [];
+  if (_島も) {
+    const 閉 = 縁線.filter(g => g.length >= 4 && g[0].x === g[g.length - 1].x && g[0].y === g[g.length - 1].y);
+    for (const g of 閉) {
+      let a2 = 0; for (let k = 0; k < g.length - 1; k++) a2 += g[k].x * g[k + 1].y - g[k + 1].x * g[k].y;
+      if (Math.abs(a2 / 2) * 単位m * 単位m < 4) continue;   // 4m² 未満は描いても見えない
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const q of g) { if (q.x < x0) x0 = q.x; if (q.y < y0) y0 = q.y; if (q.x > x1) x1 = q.x; if (q.y > y1) y1 = q.y; }
+      const 中に縁 = 縁線.some(h => h !== g && h.some(q => q.x > x0 && q.x < x1 && q.y > y0 && q.y < y1 && 中(g, q)
+        && !g.some(r => Math.abs(r.x - q.x) < 1e-6 && Math.abs(r.y - q.y) < 1e-6)));
+      if (!中に縁) 島輪.push({ P: g, 箱: [x0, y0, x1, y1] });
+    }
+  }
+  const 島の上1 = (I, q) => {   // その島の輪の中か縁の上（0.05m 以内）
+    const tol = 0.05 / 単位m;
+    const b = I.箱; if (q.x < b[0] - tol || q.x > b[2] + tol || q.y < b[1] - tol || q.y > b[3] + tol) return false;
+    if (中(I.P, q)) return true;
+    for (let k = 1; k < I.P.length; k++) {
+      const a = I.P[k - 1], c = I.P[k], ex = c.x - a.x, ey = c.y - a.y, L2 = ex * ex + ey * ey;
+      let t = L2 > 0 ? ((q.x - a.x) * ex + (q.y - a.y) * ey) / L2 : 0; t = Math.max(0, Math.min(1, t));
+      if (Math.hypot(a.x + ex * t - q.x, a.y + ey * t - q.y) <= tol) return true;
+    }
+    return false;
+  };
+  const 島の中 = (q) => 島輪.some(I => { const b = I.箱; return q.x > b[0] && q.x < b[2] && q.y > b[1] && q.y < b[3] && 中(I.P, q); });
   const 採 = [];
+  // 島の成分（道路の面の穴になった成分）の内側の面は道路にしない（島の中を通る中心線で選ばれないように）
+  const 島の成分 = new Set();
   for (const f of 面ら) {
     const P = f.番.map(v => 頂[v]);
+    const 穴P = f.穴.map(H => H.番.map(v => 頂[v]));
+    const 中F = (q) => 中(P, q) && !穴P.some(Q => 中(Q, q));
     let cx = 0, cy = 0; for (const q of P) { cx += q.x; cy += q.y; } cx /= P.length; cy /= P.length;
     if (cx < 0 || cx > ext || cy < 0 || cy > ext) continue;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const q of P) { if (q.x < x0) x0 = q.x; if (q.y < y0) y0 = q.y; if (q.x > x1) x1 = q.x; if (q.y > y1) y1 = q.y; }
-    const 入 = 標.filter(q => q.x >= x0 && q.x <= x1 && q.y >= y0 && q.y <= y1 && 中(P, q));
+    const 入 = 標.filter(q => q.x >= x0 && q.x <= x1 && q.y >= y0 && q.y <= y1 && 中F(q));
     if (!入.length) continue;
-    // 4) 漏れの検査
-    const 面積m2 = f.面積 * 単位m * 単位m;
+    // 4) 漏れの検査（島の中は数えない）
+    const 面積m2 = (f.面積 - f.穴.reduce((a, H) => a + H.面積, 0)) * 単位m * 単位m;
     if (面積m2 > 40000) { 数('大きすぎて漏れ'); if (o.記録) o.記録.push({ 理由: '大きすぎて漏れ', 輪: P }); continue; }
     const 歩幅 = Math.max(2 / 単位m, Math.sqrt(f.面積 / 1500));
     let 全数 = 0, 遠 = 0;
     for (let x = x0 + 歩幅 / 2; x < x1; x += 歩幅) for (let y = y0 + 歩幅 / 2; y < y1; y += 歩幅) {
-      const q = { x, y }; if (!中(P, q)) continue; 全数++; if (!近さ(q)) 遠++;
+      const q = { x, y }; if (!中F(q)) continue; 全数++; if (!近さ(q)) 遠++;
     }
     if (全数 && 遠 / 全数 > 0.05) { 数('街区へ漏れた'); if (o.記録) o.記録.push({ 理由: '街区へ漏れた', 輪: P, 遠: 遠, 全: 全数 }); continue; }
     // 一直線上の点を落とす
-    const 簡 = P.filter((q, k) => { const a = P[(k - 1 + P.length) % P.length], b = P[(k + 1) % P.length];
+    const _簡 = (P) => P.filter((q, k) => { const a = P[(k - 1 + P.length) % P.length], b = P[(k + 1) % P.length];
       return Math.abs((q.x - a.x) * (b.y - a.y) - (q.y - a.y) * (b.x - a.x)) > 1e-6 * Math.max(1, Math.hypot(b.x - a.x, b.y - a.y)); });
+    const 簡 = _簡(P);
     if (簡.length < 3) continue;
-    採.push({ 輪: 簡, 元: P, 線: [...new Set(入.map(q => q.i))] });
+    const 穴 = 穴P.map(_簡).filter(Q => Q.length >= 3);
+    for (const H of f.穴) 島の成分.add(H.成);
+    採.push({ 輪: 簡, 穴, 元: P, 元穴: 穴P, 成: f.成, 線: [...new Set(入.map(q => q.i))] });
   }
-  出.面 = 採;
-  // 全部が面に入った中心線
+  // 【島か、道路の輪郭か・2026-11-28】閉じた縁の線には「島」と「道路そのものを輪郭で描いたもの」がある（どちらも中に縁の線が無い）。
+  //   見分け方: 島は外側をぐるっと道路が囲む／道路の輪郭は外側が街区。輪の外側 1m の点のうち、
+  //   道路の面（その輪の中に収まる面を除く）に入る割合が 6割以上なら島とする（実データで道路の輪郭を島と取り違えていた）。
+  const _輪の中の面 = (I, f) => { const b = I.箱; const tol = 0.05 / 単位m;
+    return f.元.every(q => q.x >= b[0] - tol && q.x <= b[2] + tol && q.y >= b[1] - tol && q.y <= b[3] + tol) && f.元.every(q => 島の上1(I, q)); };
+  const 確かな島 = [];
+  for (const I of 島輪) {
+    const 外の面 = 採.filter(f => !_輪の中の面(I, f));
+    const P = I.P, 離 = 1 / 単位m, 刻 = 3 / 単位m;
+    let 全 = 0, 道 = 0;
+    for (let k = 1; k < P.length; k++) {
+      const a = P[k - 1], c = P[k], len = Math.hypot(c.x - a.x, c.y - a.y); if (len < 1e-9) continue;
+      const nx = -(c.y - a.y) / len, ny = (c.x - a.x) / len;
+      for (let t = 刻 / 2; t < len; t += 刻) {
+        const mx = a.x + (c.x - a.x) * t / len, my = a.y + (c.y - a.y) * t / len;
+        let q = { x: mx + nx * 離, y: my + ny * 離 };
+        if (中(P, q)) q = { x: mx - nx * 離, y: my - ny * 離 };
+        if (中(P, q) || q.x < 0 || q.x > ext || q.y < 0 || q.y > ext) continue;
+        全++;
+        if (外の面.some(f => 中(f.元, q) && !f.元穴.some(Q => 中(Q, q)))) 道++;
+      }
+    }
+    if (全 && 道 / 全 >= 0.6) 確かな島.push(I); else 数('道路の輪郭（島ではない）');
+  }
+  島輪.length = 0; for (const I of 確かな島) 島輪.push(I);
+  出.島輪 = 島輪.map(I => I.P);
+  // 島の成分の中の面・島の輪の中に収まる面は捨てる（島の内側の面が中心線で選ばれていたら道路にしない）
+  const 採2 = 採.filter(f => {
+    if (島の成分.has(f.成)) { 数('島の中の面'); return false; }
+    if (島輪.some(I => _輪の中の面(I, f))) { 数('島の中の面'); if (o.記録) o.記録.push({ 理由: '島の中の面', 輪: f.元 }); return false; }
+    return true; });
+  出.面 = 採2;
+  出.島 = 採2.reduce((a, f) => a + f.穴.length, 0);
+  // 全部が面に入った中心線（島の中は面の外）
+  const 中f = (f, q) => 中(f.元, q) && !f.元穴.some(Q => 中(Q, q));
   const 外 = new Set();
-  for (const q of 標) if (!採.some(f => 中(f.元, q))) 外.add(q.i);
+  for (const q of 標) if (!島の中(q) && !採2.some(f => 中f(f, q))) 外.add(q.i);
   for (let i = 0; i < 線.length; i++) if (!外.has(i) && 標.some(q => q.i === i)) 出.覆う線.add(i);
   return 出;
 }
@@ -1700,7 +1801,7 @@ async function gsiLoadBuildings(bounds, opts) {
   const items = []; let 穴 = 0, 範囲外 = 0, 余白 = 0, 切れ = 0, 上限超過 = false;
   let 範囲外の種類 = 0;   // ft範囲の外で取らなかった地物（道路の縁の線など）
   let 交差点の角 = 0;
-  let 道路の面 = 0, 面に置き換えた線 = 0;   // 縁の線から作った道路の面の数・面に置き換えた中心線の数     // 道路縁の線から角の形を取った交差点の数
+  let 道路の面 = 0, 面に置き換えた線 = 0, 道路の島 = 0, 水面の島 = 0;   // 縁の線から作った道路の面の数・面に置き換えた中心線の数     // 道路縁の線から角の形を取った交差点の数
   // 【上限はレイヤごと・2026-11-24】建物と道路で枠を分ける。混ぜると道路が枠を食って建物が途中で止まる
   const 層数 = {};
   const 鍵 = new Set();
@@ -1816,16 +1917,40 @@ async function gsiLoadBuildings(bounds, opts) {
             if (上限超過) break;
             continue;
           }
-          for (const ring of gsiMvtRings(f.geom)) {
+          // 【地面に塗る面（水面）の島・2026-11-28 ユーザー指摘「島：どれもNG。ちゃんと島も取り込め」】
+          //   1つの地物の輪は「外まわり（面積が正）→その中の島（面積が負）…」の順に来る。島を外まわりに付けて穴として運ぶ。
+          //   旗 globalThis.__GSI_WATER_ISLANDS = false で従来（中の島も水面のまま塗る）
+          const _水の島も = !(typeof globalThis !== 'undefined' && globalThis.__GSI_WATER_ISLANDS === false);
+          let _水の穴ら = null;
+          const _輪ら = gsiMvtRings(f.geom);   // 1回だけ作る（下の穴の表は輪そのものを鍵にするため）
+          if (表.塗る && 表.枠で切る) {
+            _水の穴ら = new Map();
+            let 親 = null;
+            for (const r of _輪ら) {
+              if (r.length < 3) continue;
+              if (gsiRingArea(r) >= 0) { 親 = r; _水の穴ら.set(r, []); }
+              else if (親 && _水の島も) _水の穴ら.get(親).push(r);
+            }
+          }
+          for (const ring of _輪ら) {
             if (ring.length < 3) continue;
             // 【地面に塗る面（水面）・2026-11-27】タイルの枠で切って、形（輪）で運ぶ。重心の規則は使わない（切った片は全部採る）
             if (表.塗る && 表.枠で切る) {
-              if (gsiRingArea(ring) < 0) continue;   // 中の島は水面のまま塗る（穴として数えない）
-              let R = ring;
-              for (const [軸, v, 向] of [['x', 0, 1], ['x', ext, -1], ['y', 0, 1], ['y', ext, -1]]) R = gsiClipRingAxis(R, 軸, v, 向);
+              if (gsiRingArea(ring) < 0) continue;   // 島は外まわりの穴として下で運ぶ
+              const _枠で切る = (r0) => { let R0 = r0;
+                for (const [軸, v, 向] of [['x', 0, 1], ['x', ext, -1], ['y', 0, 1], ['y', ext, -1]]) R0 = gsiClipRingAxis(R0, 軸, v, 向);
+                return R0; };
+              const R = _枠で切る(ring);
               if (R.length < 3 || !(gsiRingArea2(R) > 0)) continue;
               const 細w = gsiThinRing(R, 単位m); if (細w.length < 3) continue;
               const ll = 細w.map(pt => ({ lat: gsiTileYToLat(ty + pt.y / ext, z), lng: gsiTileXToLng(tx + pt.x / ext, z) }));
+              const _穴w = [];
+              for (const h of ((_水の穴ら && _水の穴ら.get(ring)) || [])) {
+                const H = _枠で切る(h);
+                if (H.length < 3 || !(Math.abs(gsiRingArea2(H)) > 0)) continue;
+                const 細h = gsiThinRing(H, 単位m); if (細h.length < 3) continue;
+                _穴w.push(細h.map(pt => ({ lat: gsiTileYToLat(ty + pt.y / ext, z), lng: gsiTileXToLng(tx + pt.x / ext, z) })));
+              }
               let n = -Infinity, sth = Infinity, w = Infinity, e = -Infinity, la = 0, lo = 0;
               for (const q of ll) { if (q.lat > n) n = q.lat; if (q.lat < sth) sth = q.lat; if (q.lng < w) w = q.lng; if (q.lng > e) e = q.lng; la += q.lat; lo += q.lng; }
               if (sth > bounds.north || n < bounds.south || e < bounds.west || w > bounds.east) { 範囲外++; continue; }
@@ -1834,7 +1959,9 @@ async function gsiLoadBuildings(bounds, opts) {
               鍵.add(key);
               if ((層数[L.name] || 0) >= (表.上限 || GSI_IMPORT_MAX)) { 上限超過 = true; break; }
               層数[L.name] = (層数[L.name] || 0) + 1;
-              items.push({ layer: L.name, ftCode: f.props.ftCode, 種別, key, 塗る: true, 輪: ll, color: 表.色 });
+              const _水 = { layer: L.name, ftCode: f.props.ftCode, 種別, key, 塗る: true, 輪: ll, color: 表.色 };
+              if (_穴w.length) { _水.穴 = _穴w; 水面の島 += _穴w.length; }
+              items.push(_水);
               continue;
             }
             if (gsiRingArea(ring) < 0) { 穴++; continue; }
@@ -1888,7 +2015,7 @@ async function gsiLoadBuildings(bounds, opts) {
         //   （gsiRoadNodes → gsiRoadCornerFill＝角を取るだけの面取り）。自分のタイルの中の交差点だけ（隣のタイルと二重にしない）。
         //   旗 globalThis.__GSI_ROAD_CORNER_FILL = false で従来（角を取らない）＝陽性対照。
         // 道路の面（縁の線で囲まれた領域）。面に入った中心線の帯と、面の中の交差点の角は出さない
-        let _面ら = [];
+        let _面ら = [], _島ら = [];
         if (_面にする && !上限超過) {
           const F = gsiRoadFacesInTile(道路の芯, 縁線, ext, 単位m);
           for (const f of F.面) {
@@ -1899,20 +2026,25 @@ async function gsiLoadBuildings(bounds, opts) {
             const key = L.name + ':面:' + (la / ll.length).toFixed(6) + ',' + (lo / ll.length).toFixed(6);
             if (鍵.has(key)) continue;
             鍵.add(key);
-            items.push({ layer: L.name, ftCode: null, 種別: (表.名 || L.name) + '（縁の線から作った面）', key,
-              塗る: !!表.塗る, 輪: ll, color: 表.色, srcAdd: { 道路の面: true, 中心線: f.線.length } });
+            const _穴 = (f.穴 || []).map(Q => Q.map(pt => ({ lat: gsiTileYToLat(ty + pt.y / ext, z), lng: gsiTileXToLng(tx + pt.x / ext, z) })));
+            const _項 = { layer: L.name, ftCode: null, 種別: (表.名 || L.name) + '（縁の線から作った面）', key,
+              塗る: !!表.塗る, 輪: ll, color: 表.色, srcAdd: { 道路の面: true, 中心線: f.線.length } };
+            if (_穴.length) { _項.穴 = _穴; 道路の島 += _穴.length; }
+            items.push(_項);
             道路の面++;
           }
-          _面ら = F.面;
+          _面ら = F.面; _島ら = F.島輪 || [];
           for (const c of 帯の候補) { if (F.覆う線.has(c.ci)) { 面に置き換えた線++; continue; } items.push(c.it); }
         } else for (const c of 帯の候補) items.push(c.it);
-        const _面の中 = (q) => _面ら.some(f => { const P = f.元; let c = false;
+        const _内 = (P, q) => { let c = false;
           for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j];
-            if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; });
+            if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
+        const _面の中 = (q) => _面ら.some(f => _内(f.元, q) && !(f.元穴 || []).some(Q => _内(Q, q)));
         if (表.縁の範囲 && 縁線.length && 道路の芯.length >= 2 && !上限超過
             && !(typeof globalThis !== 'undefined' && globalThis.__GSI_ROAD_CORNER_FILL === false)) {
           for (const { 節, 輪 } of gsiRoadCornersInTile(道路の芯, 縁線, ext, 単位m)) {
             if (_面の中(節)) continue;   // 交差点が道路の面に入っている＝縁の線どおりに塗れている
+            if (_島ら.some(Q => _内(Q, 節))) continue;   // 島の中の節（環状交差点の真ん中など）は角を作らない
             const ll = 輪.map(pt => ({ lat: gsiTileYToLat(ty + pt.y / ext, z), lng: gsiTileXToLng(tx + pt.x / ext, z) }));
             const cla = gsiTileYToLat(ty + 節.y / ext, z), clo = gsiTileXToLng(tx + 節.x / ext, z);
             if (cla > bounds.north || cla < bounds.south || clo < bounds.west || clo > bounds.east) continue;
@@ -1948,5 +2080,5 @@ async function gsiLoadBuildings(bounds, opts) {
   }
   return { items: _縫.items, 穴, 範囲外, 余白, 切れ, つないだ: _縫.つないだ,
     縫いの試行: _縫.試した || 0, 縫いの理由: _縫.理由 || {}, 枠で切った: _縫.枠で切った || 0, 含まれて捨てた: _縫.含まれて捨てた || 0,
-    層数, 線をつないだ: _繋.つないだ, タイル数: タイル総数, 上限超過, 範囲外の種類, 交差点の角, 道路の面, 面に置き換えた線 };
+    層数, 線をつないだ: _繋.つないだ, タイル数: タイル総数, 上限超過, 範囲外の種類, 交差点の角, 道路の面, 面に置き換えた線, 道路の島, 水面の島 };
 }

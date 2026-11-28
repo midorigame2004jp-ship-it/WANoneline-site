@@ -149,7 +149,9 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
         //   帯は描く側（地面の canvas・平面図）が地面の起伏に乗せて作る。
         if (it.塗る && Array.isArray(it.中心線)) return Object.assign(他, { 中心線: _グ(it.中心線) });
         // 【交差点の角は形（輪）で運ぶ・2026-11-27】道路縁の線から取った隅切りの面
-        if (it.塗る && Array.isArray(it.輪)) return Object.assign(他, { 輪: _グ(it.輪) });
+        // 島（穴）も同じ変換でグリッドへ（2026-11-28）
+        if (it.塗る && Array.isArray(it.輪)) return Object.assign(他, { 輪: _グ(it.輪) },
+          Array.isArray(it.穴) && it.穴.length ? { 穴: it.穴.map(_グ) } : {});
         return Object.assign(他, { points: _グ(it.ring || []) });
       });
       const res = (typeof onBuildings === 'function') ? onBuildings(items) : null;
@@ -172,6 +174,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (r.道路の面) 行.push('道路は道路の縁の線で囲まれた形をそのまま面にしました（' + r.道路の面 + ' 面・中心線 ' + (r.面に置き換えた線 || 0)
         + ' 本ぶん）。縁の線で閉じない道路だけ中心線の帯です');
       if (r.交差点の角) 行.push('交差点の角 ' + r.交差点の角 + ' か所は道路の縁の線から隅切りの形を取りました');
+      if (r.道路の島 || r.水面の島) 行.push('島 ' + ((r.道路の島 || 0) + (r.水面の島 || 0)) + ' か所（道路の中 ' + (r.道路の島 || 0) + '・水面の中 ' + (r.水面の島 || 0) + '）は塗らずに抜きました');
       if (r.範囲外の種類 && !r.道路の面) 行.push('道路の縁の線など ' + r.範囲外の種類 + ' 本は取り込んでいません（道路は中心線だけを帯にします）');
       if (r.切れ) 行.push('タイルの境目で切れた形 ' + r.切れ + ' 件（端がまっすぐに見えます）');
       if (res && res.交差) 行.push('形が自分と交わっていた ' + res.交差 + ' 件は落としました');

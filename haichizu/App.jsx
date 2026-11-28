@@ -683,7 +683,14 @@ function wheelIntent(e) {
   // 横の方が大きい＝左右チルト（または2本指の横スワイプ）→ 倍率は変えず左右へ流す
   if (Math.abs(dx) > Math.abs(dy)) return { dir: 0, panX: dx };
   if (!dy) return { dir: 0, panX: 0 };          // 何も動いていない。0を拡大と読まない
-  return { dir: dy > 0 ? -1 : 1, panX: 0 };     // 下へ回す=縮小 / 上へ回す=拡大
+  // 【1回の拡大量は回した量で決める・2026-11-28 ユーザー要望「スクロールをかなりしないと平面図では拡大縮小ができない」】
+  //   従来は1回の通知ごとに 1.07 倍（マウスのホイール1目盛で 7%＝2倍にするのに約10目盛）。
+  //   回した量（px に直した deltaY）で決め、ホイール1目盛（100px）で 1.25 倍にする。タッチパッドの細かい通知は細かく効く。
+  //   どの図も同じ式（倍率の決め方はここ1か所）。旗 window.__WHEEL_ZOOM_BY_DELTA = false で従来（1回 1.07 倍）
+  const _従来 = (typeof window !== 'undefined' && window.__WHEEL_ZOOM_BY_DELTA === false);
+  const _量 = Math.min(Math.abs(dy), 300);
+  const factorUp = _従来 ? 1.07 : Math.exp(_量 * Math.log(1.25) / 100);
+  return { dir: dy > 0 ? -1 : 1, panX: 0, factor: dy > 0 ? 1 / factorUp : factorUp };     // 下へ回す=縮小 / 上へ回す=拡大
 }
 
 // 診断まわりの版。「直したはずなのに改善なし」のとき、
@@ -1683,7 +1690,9 @@ window.App = function App() {
         if (Array.isArray(it.輪) && it.輪.length >= 3) {
           if (既.has(it.key)) { 重複++; continue; }
           既.add(it.key);
-          新面.push({ id: 'ga' + (++c), key: it.key, 種別: it.種別, 輪: it.輪, color: it.color || "#9CA3AF",
+          // 【島（穴）・2026-11-28】道路の中の島・池の中の島は 穴 で運ぶ（描くときに抜く）
+          const _穴 = Array.isArray(it.穴) ? it.穴.filter(Q => Array.isArray(Q) && Q.length >= 3) : [];
+          新面.push({ id: 'ga' + (++c), key: it.key, 種別: it.種別, 輪: it.輪, ...(_穴.length ? { 穴: _穴 } : {}), color: it.color || "#9CA3AF",
             _src: Object.assign({ 由来: "gsi-bvmap", key: it.key, 種別: it.種別 }, it.srcAdd || {}) });
           continue;
         }
@@ -6505,7 +6514,7 @@ window.App = function App() {
     // 建屋の中身（形・階・機器）を検査から読む
     // 観測（製品は読まない）: 地面に塗る面（道路）の中心線と幅。検査が「実際の幅で描いたか」を見る・2026-11-27
     window.__groundAreasForCheck = () => (groundAreasRef.current || []).map(a => ({
-      id: a.id, 種別: a.種別, 中心線: a.中心線 || null, 輪: a.輪 || null, 幅m: a.幅m,
+      id: a.id, 種別: a.種別, 中心線: a.中心線 || null, 輪: a.輪 || null, 穴: a.穴 || null, 幅m: a.幅m,
       幅左m: a.幅左m || null, 幅右m: a.幅右m || null, 出所: a._src && a._src.幅の出所 }));
     window.__buildingsForCheck = () => (buildingsRef.current || []).map(b => ({
       id: b.id, label: b.label,
@@ -8500,6 +8509,7 @@ window.App = function App() {
   const [diagZoom, setDiagZoom] = useState(1);
   // zoom値を追跡するref（ホイールハンドラで最新値を即取得）
   const planZoomRef = useRef(1); planZoomRef.current = planZoom;
+  const planFitRoRef = useRef(null);   // 開いた直後に全体を入れる見張り（窓に大きさが付くまで）
   const elevZoomRef = useRef(1); elevZoomRef.current = elevZoom;
   const sideZoomRef = useRef(1); sideZoomRef.current = sideZoom;
   const diagZoomRef = useRef(1); diagZoomRef.current = diagZoom;
@@ -8655,6 +8665,32 @@ window.App = function App() {
       planSc.scrollLeft = VIEW_PAD + TW / 2 - planSc.clientWidth  / 2;
       planSc.scrollTop  = VIEW_PAD + TH / 2 - planSc.clientHeight / 2;
     }
+    // 【開いた直後は図面の全体が入る倍率にする・2026-11-28 ユーザー要望】
+    //   「平面図は開いた直後、範囲によらず左上の一部を拡大した表示になる」→「拡大しなくてそのままにしてくれ」
+    //   倍率1は図面1升＝36px なので、図面（160升＝5760px）の一部しか窓に入らない。窓に大きさが付いた最初の1回だけ、
+    //   全体（TW×TH）が入る倍率にして中央へ寄せる（その後の窓の大きさの変化では触らない＝ユーザーの拡大を邪魔しない）。
+    //   旗 window.__PLAN_FIT_ON_OPEN = false で従来（倍率1）
+    if (planSc && !(typeof window !== 'undefined' && window.__PLAN_FIT_ON_OPEN === false)) {
+      let 済 = false, ro = null;
+      const 合わせる = () => {
+        if (済) return true;
+        const cw = planSc.clientWidth, ch = planSc.clientHeight;
+        if (cw < 50 || ch < 50) return false;
+        済 = true;
+        const z = Math.max(0.05, Math.min(1, Math.min(cw * 0.94 / TW, ch * 0.94 / TH)));
+        planZoomRef.current = z;
+        scrollUpdateRef.current = { scrollEl: planSc, left: VIEW_PAD + TW * z / 2 - cw / 2, top: VIEW_PAD + TH * z / 2 - ch / 2 };
+        setPlanZoom(z);
+        if (typeof window !== 'undefined') window.__planFitOnOpen = { z, cw, ch };
+        return true;
+      };
+      if (!合わせる() && typeof ResizeObserver !== 'undefined') {
+        ro = new ResizeObserver(() => { if (合わせる() && ro) { ro.disconnect(); ro = null; } });
+        ro.observe(planSc);
+      }
+      // 戻り値の後始末はこの effect の外（下の return）で行う
+      planFitRoRef.current = ro;
+    }
     // 断面図・側面図: GL（地面）が表示領域の60%位置に来るよう設定
     [elevRef, sideRef].forEach(ref => {
       const sc = ref.current?.parentElement?.parentElement;
@@ -8662,6 +8698,7 @@ window.App = function App() {
       sc.scrollLeft = VIEW_PAD;
       sc.scrollTop  = Math.max(0, VIEW_PAD + GL_Y - sc.clientHeight * 0.6);
     });
+    return () => { if (planFitRoRef.current) { planFitRoRef.current.disconnect(); planFitRoRef.current = null; } };
   }, []);
 
   // zoom変化後・ペイント前にスクロールを同期適用（バタつき防止）
@@ -8746,7 +8783,7 @@ window.App = function App() {
           else scrollContainer.scrollLeft = scrollLeftBefore + _wi.panX;
           return;
         }
-        const factor = _wi.dir > 0 ? 1.07 : (1 / 1.07);
+        const factor = _wi.factor;
         const newZoom = Math.max(0.05, Math.min(maxZ, prevZoom * factor));
         // 【上下限に張り付いたら何もしない】倍率が変わらないと React が再レンダーせず、
         // useLayoutEffect も発火しないため、保留スクロールが消費されずに残る。
@@ -9558,11 +9595,20 @@ window.App = function App() {
     // 観測（製品は読まない）: カメラ移動で何回・何ms 走るか。WebGL 化で減るのはここではない
     const _t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
     const allFaces = [];
+    // 高さの換算（メートル→グリッドpx）は比例なので1回だけ求める（頂点ごとに呼ぶと重い・2026-11-28 実測で1割近く）
+    const _zk = _bldZPx(1);
+    // 投影の係数も1回だけ作る（proj は呼ぶたびに三角関数を4回計算する。式は makeProjector 1本で同じ）
+    //   旗 window.__CAB_FACE_FAST_PROJ = false で従来（頂点ごとに proj）
+    const _速 = !(typeof window !== 'undefined' && window.__CAB_FACE_FAST_PROJ === false) && typeof makeProjector === 'function';
+    const _c5 = _速 ? _camNow() : null;
+    const _P = _速 ? makeProjector(_c5[0], _c5[1], _c5[2], _c5[3], _c5[4]) : null;
+    const _zm = _zk * (_mpp || 1);
     (drawSolids || []).forEach(solid => {
       if (!solid.faces) return;
       solid.faces.filter(f => f.vertices && f.vertices.length >= 3).forEach(f => {
         // 立体の頂点の z も blockToSolid に渡したメートル（proj はグリッドpx）
-        const projected = f.vertices.map(v => proj(v.x, v.y, _bldZPx(v.z)));
+        const projected = _速 ? f.vertices.map(v => _P(v.x, v.y, (v.z || 0) * _zm))
+          : f.vertices.map(v => proj(v.x, v.y, (v.z || 0) * _zk));
         const depth = projected.reduce((s, q) => s + q.depth, 0) / projected.length;
         // 画面上での回り方（符号付き面積）。裏を向いた三角形を落とすのに使う
         let area2 = 0;
@@ -9605,6 +9651,62 @@ window.App = function App() {
     }
     return { allFaces, frontSign, solidSign };
   }, [proj]);
+  // ══ 面を「描くか・どう束ねるか」を決める（SVG と canvas が同じこれを使う）・2026-11-28 ══
+  // 【なぜ切り出すか】カメラを動かしている間は建物を canvas に描く（下の _useCabSolidsCanvas）。
+  //   描く・描かない（裏面）と円柱の側面の束ね方を2か所に書くと、止めた瞬間に絵が変わる。
+  // 【返すもの】allFaces の各要素 → { 飛ばす } ／ { 円柱: [{ 明, fill, 面ら }] }（その立体の側面の1枚目だけ） ／ { 面: 明るさ }
+  const _cabSolidsPlan = useCallback((allFaces, frontSign, solidSign) => {
+    const 決 = new Map(), _帯済 = new Set();
+    const _cylOne = !(typeof window !== 'undefined' && window.__CYL_AS_ONE === false);
+    const _cullOn = (typeof window !== 'undefined' && window.__CAB_BACKFACE_CULL === true);
+    const _帯色 = !(typeof window !== 'undefined' && window.__CYL_SHADE_BANDS === false);
+    const _明 = (n0) => { const _n = n0 || { nx: 0, ny: 0, nz: 1 };
+      return (typeof bcFaceShade === 'function') ? bcFaceShade(_n)
+        : Math.min(1, 0.62 + 0.42 * Math.max(0, _n.nx * 0.40 + _n.ny * (-0.28) + _n.nz * 0.87)); };
+    // 円柱の側面を立体ごとに先に集める（allFaces の順＝奥→手前）
+    const 側ら = new Map();
+    if (_cylOne) for (const it of allFaces) {
+      if (!it.solid._circle || it.face.type === 'top' || it.face.type === 'bottom') continue;
+      const k = it.solid.id; if (!側ら.has(k)) 側ら.set(k, []); 側ら.get(k).push(it);
+    }
+    for (const it of allFaces) {
+      const { face, solid, area2 } = it;
+      // 裏を向いた三角形は描かない（閉じた立体なので外形はこれで出る）
+      if (frontSign && solid._csg && area2 * frontSign <= 0) { 決.set(it, { 飛ばす: true }); continue; }
+      const _不透明 = !!(solid._csg || (typeof bcIsSmoothSolid === 'function' && bcIsSmoothSolid(solid)));
+      if (_cullOn && _不透明 && !solid._preview) {
+        const _ss = solidSign && solidSign.get(solid.id);
+        if (_ss && area2 * _ss.sign <= 0) { 決.set(it, { 飛ばす: true }); continue; }
+      }
+      // 円柱の側面は1枚目にまとめる（側面の中で一番手前の面の回り方を手前向きにする）
+      if (_cylOne && solid._circle && face.type !== 'top' && face.type !== 'bottom') {
+        if (_帯済.has(solid.id)) { 決.set(it, { 飛ばす: true }); continue; }
+        _帯済.add(solid.id);
+        const _全側 = 側ら.get(solid.id) || [];
+        let _近 = null;
+        for (const q of _全側) { if (Math.abs(q.area2) < 1e-9) continue; if (!_近 || q.depth < _近.depth) _近 = q; }
+        const _符 = _近 ? (_近.area2 > 0 ? 1 : -1) : 0;
+        const _側 = (_符 && !solid._preview) ? _全側.filter(q => q.area2 * _符 > 0) : _全側;
+        if (!_側.length) { 決.set(it, { 飛ばす: true }); continue; }
+        const _地 = solid.color || '#6B7A8D';
+        const _段数 = 20;
+        let 束;
+        if (!_帯色) {
+          const _b = _側.reduce((a, q) => a + _明(q.face.normal), 0) / _側.length;
+          束 = [{ 明: _b, 面ら: _側 }];
+        } else {
+          const m = new Map();
+          for (const q of _側) { const _b = Math.round(_明(q.face.normal) * _段数) / _段数; if (!m.has(_b)) m.set(_b, []); m.get(_b).push(q); }
+          束 = [...m.keys()].sort((a, b) => a - b).map(_b => ({ 明: _b, 面ら: m.get(_b) }));
+        }
+        for (const t of 束) t.fill = (typeof csgShadeColor === 'function') ? csgShadeColor(_地, t.明) : _地;
+        決.set(it, { 円柱: 束, 帯色: _帯色 });
+        continue;
+      }
+      決.set(it, { 面: _明(face.normal) });
+    }
+    return 決;
+  }, []);
   // ── 地形の面を canvas に描く（2026-11-23）──
   // 色ごとにまとめて塗る＝ fillStyle の変更回数を段の数に抑える。形・色・順序は SVG 版と同じ。
   // 半透明は canvas 要素の CSS opacity（ここでは globalAlpha を使わない）。
@@ -9816,13 +9918,19 @@ window.App = function App() {
     //   【起伏に沿う】辺を地面の格子の間隔で刻んでから各点の高さを引く（Codex監査の必須条件）。
     //     頂点だけ乗せると長い直線の途中が浮く／埋もれる。
     //   旗 window.__GROUND_AREA_PAINT = false で塗らない＝陽性対照。
-    let 塗数 = 0;
+    let 塗数 = 0, 穴数 = 0, 切り方 = null;
     if (_塗りあり) {
       const _div = uiSettingValue(uiSettings, 'terrainGrid');
       const _mpp = _bldZMpp();
       // 【範囲の形で切る・2026-11-28】範囲（フィールド）が四角でないときは、形の外にはみ出した分を描かない。
       //   形の辺を地面の格子で刻んで起伏に乗せ、画面の上で切り抜く（塗る面はすべて地面の上なので画面で切ってよい）。
-      const _形で切る = _fieldPolyClip();
+      // 【図面の板の外へはみ出さない・2026-11-28】道路の面・帯・水面は取り込んだ形のまま持つので、範囲の境目をまたぐ物は
+      //   板の外まで描かれていた（平面図は図面の大きさで切れるので3次元図だけ）。形が四角のときも図面の四角で切る。
+      //   旗 window.__GROUND_CLIP_SHEET = false で従来（四角のときは切らない）
+      const _形の切り = _fieldPolyClip();
+      const _形で切る = _形の切り
+        || (!(typeof window !== 'undefined' && window.__GROUND_CLIP_SHEET === false) ? [{ x: 0, y: 0 }, { x: TW, y: 0 }, { x: TW, y: TH }, { x: 0, y: TH }] : null);
+      切り方 = _形の切り ? '範囲の形' : (_形で切る ? '図面の四角' : null);
       if (_形で切る) {
         ctx.save();
         const 刻 = (typeof terrainResample === 'function') ? terrainResample(_形で切る.concat([_形で切る[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : _形で切る;
@@ -9862,16 +9970,27 @@ window.App = function App() {
         }
         if (!輪 || 輪.length < 3) continue;
         ctx.beginPath();
-        for (let i = 0; i < 輪.length; i++) {
-          const q = 輪[i];
-          const z = (typeof terrainZAt === 'function')
-            ? terrainZAt(terrainDraw, TW, TH, q.x, q.y, terrainExag, _terrainMToPx(), _div) : 0;
-          const pr = _地面の投影(q.x, q.y, z);
-          if (i === 0) ctx.moveTo(pr.x, pr.y); else ctx.lineTo(pr.x, pr.y);
+        const _なぞる = (R) => {
+          for (let i = 0; i < R.length; i++) {
+            const q = R[i];
+            const z = (typeof terrainZAt === 'function')
+              ? terrainZAt(terrainDraw, TW, TH, q.x, q.y, terrainExag, _terrainMToPx(), _div) : 0;
+            const pr = _地面の投影(q.x, q.y, z);
+            if (i === 0) ctx.moveTo(pr.x, pr.y); else ctx.lineTo(pr.x, pr.y);
+          }
+          ctx.closePath();
+        };
+        _なぞる(輪);
+        // 【島（穴）は塗らない・2026-11-28】穴の輪も同じ道（地面の格子で刻んで起伏に乗せる）で足し、evenodd で抜く。
+        //   旗 window.__GROUND_AREA_HOLES = false で従来（穴を無視して塗る）
+        const _穴を抜く = _輪あり && Array.isArray(a.穴) && a.穴.length && !(typeof window !== 'undefined' && window.__GROUND_AREA_HOLES === false);
+        if (_穴を抜く) for (const Q of a.穴) {
+          if (!Array.isArray(Q) || Q.length < 3) continue;
+          穴数++;
+          _なぞる((typeof terrainResample === 'function') ? terrainResample(Q.concat([Q[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : Q);
         }
-        ctx.closePath();
         ctx.fillStyle = a.color || '#9CA3AF';
-        ctx.fill();
+        ctx.fill(_穴を抜く ? 'evenodd' : 'nonzero');
         // 【継ぎ目を隠す・2026-11-27 ユーザー指摘「貼り合わせているのがバレてないか」】隣り合う面は同じ線を共有するが、
         //   縁の滑らかさ（アンチエイリアス）で継ぎ目が薄い線に見える。同じ色の細い線（画面で約1px）で縁をなぞって埋める。
         //   旗 window.__GROUND_AREA_SEAM_STROKE = false で従来（なぞらない）
@@ -9891,7 +10010,7 @@ window.App = function App() {
         描いたカメラ: _camNow().join(','),
         面: 面数, GL: _gl描いた, GL失敗: (terrainGLRef.current && terrainGLRef.current.失敗) || null,
         頂点を送った: !!(terrainGLRef.current && terrainGLRef.current.送った),
-        塗り: 塗数, 段: 束.size, ms: Math.round(performance.now() - t0),
+        塗り: 塗数, 穴: 穴数, 切り: 切り方, 段: 束.size, ms: Math.round(performance.now() - t0),
         回: ((window.__terrainCanvasInfo || {}).回 || 0) + 1,
       };
     }
@@ -15048,6 +15167,103 @@ window.App = function App() {
     return items;
   }, [segs, nodes, allMapPos, segWp, wpZ, proj, routeSegs, cam, _boxNodePos, placedPanels]);
 
+  // ══ カメラを動かしている間は建物を canvas に描く・2026-11-28 ユーザー報告 ══
+  // 【報告】「画像のような規模（建物 約500棟）になると、建物だけ配置したときでもじゃっかんヌルっとしていて軽快ではない」
+  // 【発生源（実測）】建物の面（約3,100枚）を、カメラが1コマ動くたびに部品（SVG の polygon）として作り直していた。
+  //   1コマ約100ms のうち、部品の作り直しと画面の配置計算（属性の書き換え・並べ替え・寸法の取り直し）が大半。
+  // 【直し方】動かしている間（カメラが変わってから 0.2 秒）は、同じ面の列・同じ描き方の決め（_cabSolidsPlan）・
+  //   同じ見た目（_cabFaceLook）で canvas に描き、SVG の面は直前のまま隠しておく（部品を作り直さない）。
+  //   止まったら SVG に戻す（面を押す・光らせるなどの操作は SVG の面が受け持つ）。
+  //   旗 window.__CAB_SOLIDS_CANVAS_WHILE_MOVING = false で従来（動かしている間も SVG を作り直す）
+  const solidsCanvasRef = useRef(null);
+  const cabSolidsSvgCacheRef = useRef(null);
+  const _cabSolidsCanvasOn = () => !(typeof window !== 'undefined' && window.__CAB_SOLIDS_CANVAS_WHILE_MOVING === false);
+  // 描く物の列（面ごとの形・色）は「向き（az・el）と立体」が同じ間は使い回す。
+  //   移動（パン）と拡大縮小は平行投影なので形も前後関係も変わらず、画面上で平行移動・拡大するだけ
+  //   （makeProjector: x = rx*zoom + panX + CAB_W/2）。canvas の変換で合わせる＝面の列を作り直さない。
+  //   旗 window.__CAB_SOLIDS_REUSE_LIST = false で毎コマ作り直す
+  const cabSolidsListRef = useRef(null);
+  const _drawSolidsCanvas = (moving) => {
+    const cv = solidsCanvasRef.current; if (!cv) return;
+    if (!moving) {
+      if (cv._描いた) { const c0 = cv.getContext('2d'); c0.setTransform(1, 0, 0, 1, 0, 0); c0.clearRect(0, 0, cv.width, cv.height); cv._描いた = false; }
+      cabSolidsListRef.current = null;
+      return;
+    }
+    const t0 = performance.now();
+    const b = _cabCanvasBegin(cv); if (!b) return;
+    const ctx = b.ctx;
+    const c5 = _camNow();
+    const 立体ら = [solids, csgSolids, sketchSolids, previewSolids];
+    const 前 = cabSolidsListRef.current;
+    const _使い回す = !(typeof window !== 'undefined' && window.__CAB_SOLIDS_REUSE_LIST === false)
+      && 前 && 前.az === c5[0] && 前.el === c5[1] && 前.立体ら.every((a, k) => a === 立体ら[k]);
+    let 列;
+    if (_使い回す) 列 = 前;
+    else {
+      const 全 = [...(solids || []), ...((csgSolids && csgSolids.length) ? csgSolids : []), ...(sketchSolids || []), ...(previewSolids || [])];
+      const { allFaces, frontSign, solidSign } = _cabFaceList(全);
+      const 決 = _cabSolidsPlan(allFaces, frontSign, solidSign);
+      const 描 = [];
+      for (const it of allFaces) {
+        const d = 決.get(it); if (!d || d.飛ばす) continue;
+        // 継ぎ目: SVG は crispEdges（ふちをぼかさない）で隣の面との間に筋が出ないが、canvas はふちをぼかすので
+        //   同じ色の細い線でなぞって筋を消す（円柱の側面・なめらかな立体）
+        // 円柱の側面: 段と段の境目に地面が透ける筋が出るので、側面全体を真ん中の段の色で下塗りしてから段を重ねる
+        if (d.円柱) {
+          const 中段 = d.円柱[Math.floor(d.円柱.length / 2)];
+          描.push({ 円柱: d.円柱.flatMap(t => t.面ら.map(q => q.projected)), fill: 中段.fill, alpha: 0.95 });
+          for (const t of d.円柱) 描.push({ 円柱: t.面ら.map(q => q.projected), fill: t.fill, alpha: 0.95 });
+          continue;
+        }
+        const 見 = _cabFaceLook(it.solid, d.面, false);
+        描.push({ P: it.projected, fill: 見.fill, alpha: 見.fillOpacity,
+          stroke: (見.stroke && 見.stroke !== 'none' && 見.strokeWidth > 0) ? 見.stroke : null, lw: 見.strokeWidth,
+          継ぎ目: 見.shapeRendering === 'crispEdges' });
+      }
+      列 = { az: c5[0], el: c5[1], zoom: c5[2], panX: c5[3], panY: c5[4], 立体ら, 描 };
+      cabSolidsListRef.current = 列;
+    }
+    // 作ったときのカメラ → いまのカメラ（同じ向きなら拡大と平行移動だけ）
+    const k = (列.zoom > 0 && c5[2] > 0) ? c5[2] / 列.zoom : 1;
+    const ax = 列.panX + CAB_W / 2, ay = 列.panY + CAB_H / 2, bx = c5[3] + CAB_W / 2, by = c5[4] + CAB_H / 2;
+    ctx.translate(bx, by); ctx.scale(k, k); ctx.translate(-ax, -ay);
+    const _輪 = (P) => { for (let i = 0; i < P.length; i++) { if (i) ctx.lineTo(P[i].x, P[i].y); else ctx.moveTo(P[i].x, P[i].y); } ctx.closePath(); };
+    ctx.lineJoin = 'round';
+    for (const e of 列.描) {
+      ctx.beginPath();
+      if (e.円柱) for (const P of e.円柱) _輪(P); else _輪(e.P);
+      ctx.globalAlpha = e.alpha; ctx.fillStyle = e.fill; ctx.fill();
+      if (e.継ぎ目) { ctx.strokeStyle = e.fill; ctx.lineWidth = 0.5 / ((b.sc || 1) * (b.dpr || 1) * k); ctx.stroke(); }
+      if (e.stroke) { ctx.globalAlpha = 1; ctx.strokeStyle = e.stroke; ctx.lineWidth = e.lw / k; ctx.stroke(); }
+    }
+    ctx.restore();
+    cv._描いた = true;
+    if (typeof window !== 'undefined') {
+      const 前情報 = window.__cabSolidsCanvasInfo || {};
+      window.__cabSolidsCanvasInfo = { 面: 列.描.length, ms: Math.round(performance.now() - t0), 回: (前情報.回 || 0) + 1,
+        使い回し: (前情報.使い回し || 0) + (_使い回す ? 1 : 0) };
+    }
+  };
+  const _useCabMoving = ({ camAz, camEl, camZoom, camPanX, camPanY }) => {
+    const [, set刻] = useState(0);
+    const r = useRef({ cam5: null, until: 0, timer: 0 }).current;
+    const cam5 = camAz + ',' + camEl + ',' + camZoom + ',' + camPanX + ',' + camPanY;
+    const on = _cabSolidsCanvasOn();
+    if (on && r.cam5 !== null && r.cam5 !== cam5) {
+      r.until = performance.now() + 200;
+      clearTimeout(r.timer);
+      r.timer = setTimeout(() => set刻(x => x + 1), 230);
+    }
+    r.cam5 = cam5;
+    useEffect(() => () => clearTimeout(r.timer), []);
+    // 観測（製品は読まない）: 検査が「動かしている間の絵」と「止まったときの絵」を同じカメラで比べるために立てる
+    const moving = on && ((typeof window !== 'undefined' && window.__CAB_FORCE_MOVING === true) || performance.now() < r.until);
+    useLayoutEffect(() => { _drawSolidsCanvas(moving); });
+    if (typeof window !== 'undefined') window.__cabMoving = moving;
+    return moving;
+  };
+
   // 3次元図の購読箱（StoreScope）の中で呼ぶ、カメラに依存するフック群。呼び順を変えないこと
   const useCabCamDerived = (cam) => {
     // 速度表示の内訳: 3次元図だけの作り直し（App 全体の作り直しとは別に数える）
@@ -15062,7 +15278,8 @@ window.App = function App() {
     _useTerrainCanvasEffect(cam);   // 地形canvasも同じ箱の中で予約する（2026-11-23）
     const cabSortedSegs = _useCabSortedSegs(cam);
     const isFaceAligned = _calcFaceAligned(cam);
-    return { _iconBoxHitElems, sortedPlacedPanels, cabSortedSegs, isFaceAligned };
+    const _cabMoving = _useCabMoving(cam);   // 動かしている間は建物を canvas に（2026-11-28）
+    return { _iconBoxHitElems, sortedPlacedPanels, cabSortedSegs, isFaceAligned, _cabMoving };
   };
 
   // セグメント描画（ホバーで折れ点表示、クリックで追加、plan/elevで操作可能）
@@ -17312,12 +17529,19 @@ window.App = function App() {
                 if (!輪 || 輪.length < 3) return null;
                 // 継ぎ目を隠す（隣の面と共有する線のアンチエイリアスの薄い線を同じ色の細い線で埋める）。
                 //   組の透明度は1回なので線を重ねても濃くならない。旗 window.__GROUND_AREA_SEAM_STROKE = false で従来
-                return (<polygon key={`ga${a.id}`} data-ground-area="1"
-                  points={輪.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join(' ')}
-                  fill={a.color || '#9CA3AF'} fillOpacity={_組で ? 1 : 0.55}
-                  {...(_組で && !(typeof window !== 'undefined' && window.__GROUND_AREA_SEAM_STROKE === false)
-                    ? { stroke: a.color || '#9CA3AF', strokeWidth: 1, vectorEffect: 'non-scaling-stroke', strokeLinejoin: 'round' } : { stroke: 'none' })}
-                  style={{ pointerEvents: 'none' }} />);
+                // 【島（穴）は塗らない・2026-11-28】穴があれば path（evenodd）にする。旗 window.__GROUND_AREA_HOLES = false で従来
+                const _穴 = (Array.isArray(a.輪) && Array.isArray(a.穴) && a.穴.length && !(typeof window !== 'undefined' && window.__GROUND_AREA_HOLES === false))
+                  ? a.穴.filter(Q => Array.isArray(Q) && Q.length >= 3) : null;
+                const _線 = (R) => 'M' + R.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join('L') + 'Z';
+                const _形 = _穴 && _穴.length
+                  ? { d: [輪, ..._穴].map(_線).join(''), fillRule: 'evenodd', 'data-holes': _穴.length }
+                  : { points: 輪.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join(' ') };
+                const _要素 = _穴 && _穴.length ? 'path' : 'polygon';
+                return React.createElement(_要素, { key: `ga${a.id}`, 'data-ground-area': '1', ..._形,
+                  fill: a.color || '#9CA3AF', fillOpacity: _組で ? 1 : 0.55,
+                  ...(_組で && !(typeof window !== 'undefined' && window.__GROUND_AREA_SEAM_STROKE === false)
+                    ? { stroke: a.color || '#9CA3AF', strokeWidth: 1, vectorEffect: 'non-scaling-stroke', strokeLinejoin: 'round' } : { stroke: 'none' }),
+                  style: { pointerEvents: 'none' } });
               });
               // 範囲の形が四角でないときは、形の外にはみ出した分を描かない（3次元図と同じ判定 _fieldPolyClip）
               const _形 = _fieldPolyClip();
@@ -18981,7 +19205,7 @@ window.App = function App() {
           </>
         }>
         <StoreScope store={camStore} useDerive={useCabCamDerived}
-          render={({ camAz, camEl, camZoom, camPanX, camPanY }, { _iconBoxHitElems, sortedPlacedPanels, cabSortedSegs, isFaceAligned }) => (
+          render={({ camAz, camEl, camZoom, camPanX, camPanY }, { _iconBoxHitElems, sortedPlacedPanels, cabSortedSegs, isFaceAligned, _cabMoving }) => (
         <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%',
           position: 'relative' }}>
         {/* 【建屋のツール列・3次元図側・2026-10-11】平面図とまったく同じ関数を呼ぶ。
@@ -19635,6 +19859,9 @@ window.App = function App() {
           <canvas ref={terrainCanvasRef} data-terrain-canvas="1"
             style={{ position: 'absolute', inset: 0, width: '100%', height: '100%',
               pointerEvents: 'none', opacity: 0.7 }} />
+          {/* 建物の面（カメラを動かしている間だけ。止まると SVG の面に戻る）・2026-11-28 */}
+          <canvas ref={solidsCanvasRef} data-cab-solids-canvas="1"
+            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }} />
           <svg viewBox={`0 0 ${CAB_W} ${CAB_H}`} preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}>
             {/* 地形の輪郭・等高線・崖（面は上の canvas）。線なので SVG のままで軽い */}
             {(() => {
@@ -20076,6 +20303,10 @@ window.App = function App() {
                 ...((csgSolids && csgSolids.length) ? csgSolids : []),
                 ...(sketchSolids || []), ...(previewSolids || [])];
               if (!_drawSolids || _drawSolids.length === 0) return null;
+              // 【動かしている間は直前の面のまま隠す・2026-11-28】部品を作り直さない（canvas が描く）。止まったら作り直す
+              if (_cabMoving && cabSolidsSvgCacheRef.current) {
+                return (<g data-cab-solids="1" style={{ display: 'none' }}>{cabSolidsSvgCacheRef.current}</g>);
+              }
               // 【面の列は _cabFaceList 1か所で作る・2026-11-23 段0】
               //   canvas 版と同じ列を使う（同じ並べ方を2か所に書かない）。
               const { allFaces, frontSign: _frontSignFromList, solidSign: _solidSign } = _cabFaceList(_drawSolids);
@@ -20085,101 +20316,28 @@ window.App = function App() {
               //   形も色も同じまま、DOM の数だけが 48→1 になる。
               //   明るさは側面の平均（横から見た円柱は左右で明暗が付くが、まずは要素を減らす）。
               //   旗 window.__CYL_AS_ONE = false で従来（48面のまま）＝陽性対照。
-              const _帯済 = new Set();
-              const _cylOne = !(typeof window !== 'undefined' && window.__CYL_AS_ONE === false);
+              // 描く・描かない・円柱の束ね方は _cabSolidsPlan 1か所（canvas と同じ）
+              const _計画 = _cabSolidsPlan(allFaces, _frontSign, _solidSign);
               // 【観測の口・2026-11-25 段0-c】いま描かれている面を控える（製品は読まない）。
               //   段3で WebGL にすると polygon が無くなるので、検査はこの口を読む。
               //   既定OFF（カメラを動かすたびに作るため）。検査が window.__CAB_FACE_OBS = true を立てる。
               const _観る = (typeof window !== 'undefined' && window.__CAB_FACE_OBS === true);
               const _観 = _観る ? [] : null;
-              const _要素 = allFaces.map(({ face, solid, projected, area2, depth }) => {
-                // 裏を向いた三角形は描かない（閉じた立体なので外形はこれで出る）
-                if (_frontSign && solid._csg && area2 * _frontSign <= 0) return null;
-                // 【閉じた不透明な立体も裏面を描かない・2026-11-23 ユーザー報告「重い」】
-                //   円柱は48角形なので側面が48面ある。裏側の24面は手前の面に必ず隠れるので
-                //   描く意味がない。**不透明な立体だけ**（半透明の建屋の殻は中が見えなくなる）。
-                //   判定は立体ごとの手前向きの符号。旗 __CAB_BACKFACE_CULL=false で従来。
-                //   実測: タンク43件で 2791面 → 約1760面。
-                const _不透明 = !!(solid._csg || (typeof bcIsSmoothSolid === 'function' && bcIsSmoothSolid(solid)));
-                // ★既定OFF（2026-11-24）: 立体ごとの符号を「一番手前の面」で決めていたが、円柱では
-                //   それが**上面**になり、側面が全部「裏」と判定されて消えた（実測: タンクが円盤になった）。
-                //   面の種類ごとに符号を決めるか、法線で判定し直すまで止める。__CAB_BACKFACE_CULL=true で試せる。
-                const _cullOn = (typeof window !== 'undefined' && window.__CAB_BACKFACE_CULL === true);
-                if (_cullOn && _不透明 && !solid._preview) {
-                  const _ss = _solidSign && _solidSign.get(solid.id);
-                  if (_ss && area2 * _ss.sign <= 0) return null;
-                }
-                // 【円柱の側面をまとめる】上面・下面はそのまま。側面だけ1枚にする
-                if (_cylOne && solid._circle && face.type !== 'top' && face.type !== 'bottom') {
-                  if (_帯済.has(solid.id)) return null;   // 2枚目以降は描かない
-                  _帯済.add(solid.id);
-                  const _全側 = [];
-                  for (const it of allFaces) {
-                    if (it.solid.id !== solid.id) continue;
-                    if (it.face.type === 'top' || it.face.type === 'bottom') continue;
-                    _全側.push(it);
-                  }
-                  // 【側面だけで手前向きを決める・2026-11-24】
-                  //   立体全体の符号（_solidSign）は**一番手前の面＝上面**で決まるので、
-                  //   円柱に当てると側面が48面とも「裏」と判定されて消えた（2026-11-24 に実際に踏んだ）。
-                  //   閉じた立体なら、外を向いた面の画面上の回り方は一定。**側面の中で**一番手前の
-                  //   ものを基準にすれば、手前の24面だけが残る（裏は必ず手前に隠れるので描かなくてよい）。
-                  //   手前だけ残せば面どうしが重ならないので、**明るさ順に束ねても描画順が壊れない**。
-                  let _近 = null;
-                  for (const it of _全側) { if (Math.abs(it.area2) < 1e-9) continue;
-                    if (!_近 || it.depth < _近.depth) _近 = it; }
-                  const _符 = _近 ? (_近.area2 > 0 ? 1 : -1) : 0;
-                  // ★**円柱は閉じた立体なので裏は必ず隠れる**。_不透明（CSG か なめらか立体か）で
-                  //   判定すると、取り込んだ円柱は普通の立体なので false になり48面とも描いていた
-                  //   （2026-11-24 実測: 1本の側面が48のまま）。下見中（半透明）だけ裏も残す。
-                  const _側 = (_符 && !solid._preview)
-                    ? _全側.filter(it => it.area2 * _符 > 0) : _全側;
-                  if (_側.length) {
-                    const _地 = solid.color || '#6B7A8D';
-                    const _明 = (it) => { const _n = it.face.normal || { nx: 0, ny: 0, nz: 1 };
-                      return (typeof bcFaceShade === 'function') ? bcFaceShade(_n)
-                        : Math.min(1, 0.62 + 0.42 * Math.max(0, _n.nx * 0.40 + _n.ny * (-0.28) + _n.nz * 0.87)); };
-                    // 【明暗を段で付ける・2026-11-24 ユーザー報告「円柱の側面がない」】
-                    //   1色（平均）だと上面と見分けがつかず**円盤に見える**。段ごとに塗り分ける。
-                    //   ★**並び順は変えない**。_側 は allFaces（奥→手前に並べ替え済み）の順なので、
-                    //     明るさが変わった所で path を区切れば Painter's の順が保たれる
-                    //     （段ごとに集めると裏の面が手前に来て円柱が壊れる）。
-                    //   旗 window.__CYL_SHADE_BANDS = false で従来（平均の1色）＝陽性対照。
-                    // 明るさの式（bcFaceShade）の幅は 0.62〜1.00 と狭いので、段数を上げないと
-                    // 4段くらいにしかならず階段に見える。20段で実際に出るのは8段ほど
-                    const _段数 = 20;
-                    const _帯色 = !(typeof window !== 'undefined' && window.__CYL_SHADE_BANDS === false);
-                    if (!_帯色) {
-                      let _d = '', _b = 0;
-                      for (const it of _側) {
-                        _d += 'M' + it.projected.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join('L') + 'Z';
-                        _b += _明(it);
-                      }
-                      _b /= _側.length;
-                      const _f = (typeof csgShadeColor === 'function') ? csgShadeColor(_地, _b) : _地;
-                      return (<path key={`cyl_${solid.id}`} d={_d} fill={_f} fillOpacity={0.95}
-                        stroke="none" shapeRendering="crispEdges"
-                        data-bld-face="1" data-cyl-side={solid.id}
-                        style={{ pointerEvents: _面が入力を受けるか(solid) }} />);
-                    }
-                    // 明るさを段に丸めて**段ごとに1つ**の path にする（手前だけなので順序は自由）
-                    const _束 = new Map();
-                    for (const it of _側) {
-                      const _b = Math.round(_明(it) * _段数) / _段数;
-                      const _seg = 'M' + it.projected.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join('L') + 'Z';
-                      _束.set(_b, (_束.get(_b) || '') + _seg);
-                    }
-                    const _出 = [];
-                    for (const _b of [..._束.keys()].sort((a, b) => a - b)) {
-                      const _f = (typeof csgShadeColor === 'function') ? csgShadeColor(_地, _b) : _地;
-                      _出.push(<path key={`cyl_${solid.id}_${_b}`} d={_束.get(_b)} fill={_f} fillOpacity={0.95}
-                        stroke="none" shapeRendering="crispEdges"
-                        data-bld-face="1" data-cyl-side={solid.id}
-                        style={{ pointerEvents: _面が入力を受けるか(solid) }} />);
-                    }
-                    return _出;
-                  }
-                  return null;
+              const _要素 = allFaces.map((_it) => {
+                const { face, solid, projected, area2, depth } = _it;
+                const _決 = _計画.get(_it);
+                if (!_決 || _決.飛ばす) return null;
+                // 【円柱の側面をまとめる】上面・下面はそのまま。側面だけ明るさの段ごとに1枚にする
+                if (_決.円柱) {
+                  const _d列 = _決.円柱.map(t => t.面ら.map(it => 'M' + it.projected.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join('L') + 'Z').join(''));
+                  if (!_決.帯色) return (<path key={`cyl_${solid.id}`} d={_d列[0]} fill={_決.円柱[0].fill} fillOpacity={0.95}
+                    stroke="none" shapeRendering="crispEdges"
+                    data-bld-face="1" data-cyl-side={solid.id}
+                    style={{ pointerEvents: _面が入力を受けるか(solid) }} />);
+                  return _決.円柱.map((t, k) => (<path key={`cyl_${solid.id}_${t.明}`} d={_d列[k]} fill={t.fill} fillOpacity={0.95}
+                    stroke="none" shapeRendering="crispEdges"
+                    data-bld-face="1" data-cyl-side={solid.id}
+                    style={{ pointerEvents: _面が入力を受けるか(solid) }} />));
                 }
                 const pts = projected.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
                 const n = face.normal || { nx: 0, ny: 0, nz: 1 };
@@ -20193,8 +20351,7 @@ window.App = function App() {
                 // 【明るさは1つの式・2026-10-18】種類で分けない（buildingDrawCore.js）。
                 //   旧：CSG は内積で 0.62〜1.0、それ以外は幅 0.05 でほぼ一定だったので、
                 //   回したものの側面が全部同じ色になり『円に見せかけた面の並び』に見えていた。
-                const brightness = (typeof bcFaceShade === 'function') ? bcFaceShade(n)
-                  : Math.min(1, 0.62 + 0.42 * _dot);
+                const brightness = _決.面;   // 明るさの式は _cabSolidsPlan の中（bcFaceShade）。void _dot
                 // 曲面を含む立体か（継ぎ目に線を引かず、明るさを色に乗せる）
                 // 【不透明度は役割で決める】建屋の殻は半透明のまま（中に置いた盤・機器が
                 //   見えなくなると使い物にならない）。曲面の立体も明るさは**色**に乗せたので、
@@ -20372,7 +20529,8 @@ window.App = function App() {
                   return 勝;
                 };
               }
-              return _要素;
+              cabSolidsSvgCacheRef.current = _要素;
+              return (<g data-cab-solids="1">{_要素}</g>);
             })()}
             {/* 【2026-09-22】選んでいる建屋の寸法（2Dビューと同じ _bldDimLabels で作る）。
                 高さの投影は proj が「グリッドpx」で受けるので _bldZPx でメートルから直してから渡す */}
@@ -22696,7 +22854,7 @@ window.App = function App() {
                         else parent.scrollLeft = baseL + _wi.panX;
                         return;
                       }
-                      const factor = _wi.dir > 0 ? 1.07 : (1 / 1.07);
+                      const factor = _wi.factor;
                       const nz = Math.max(0.05, Math.min(500, pz * factor));
                       // 上下限に張り付いて倍率が変わらないときは保留を作らない（残骸が後で飛ぶ原因）
                       if (nz === pz) return;
@@ -23409,7 +23567,7 @@ window.App = function App() {
                       if (_wi.panX) el.scrollLeft += _wi.panX;
                       return;
                     }
-                    const factor = _wi.dir > 0 ? 1.07 : (1 / 1.07);
+                    const factor = _wi.factor;
                     // 拡大の上下限は平面図・立面図・側面図（App.jsx:2231-2233 の 0.05〜500）に揃える。
                     // 追加平面図だけ8倍で頭打ちだと、配電盤（幅600mm）に寄り切れない。
                     const newZ = Math.max(0.05, Math.min(500, prevZ * factor));
