@@ -36,7 +36,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   const [hover, setHover] = React.useState(null);     // 範囲指定中のカーソル位置
   const [四角, set四角] = React.useState(null);       // ドラッグ中の四角 { a, b }（緯度経度）
   const pickRef = React.useRef(null);                  // 押した点 { sx, sy, p, 動いた }
-  const 範囲の案内 = 'ドラッグで四角を囲む／クリックで点をつなぎ、始点をクリックで閉じる（直角に吸い付く・Alt で吸い付かない／Backspace で1点戻す・Esc でやめる）';
+  const 範囲の案内 = 'ドラッグで四角を囲む／クリックで点をつなぎ、始点をクリックか右クリックで閉じる（直角・始点に吸い付く・Alt で吸い付かない／Backspace で1点戻す・Esc でやめる）';
   const [busy, setBusy] = React.useState(null);       // 取得中の進捗の文字
   const [msg, setMsg] = React.useState('');
   // 取り込み対象が上限より多いときの確認（すべて読み込む／上限まで／やめる）。{ items, 情報, 超え: [{名, 数}], 上限 }
@@ -105,6 +105,8 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       }
     }
   }
+
+  const タイルの重ね = (typeof window !== 'undefined' && window.__GSI_TILE_OVERLAP === false) ? 0 : 1;
 
   // いまのフィールド（図面の範囲）を枠で出す
   const 枠 = (() => {
@@ -288,7 +290,14 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     } catch (e) { setMsg('取り込みに失敗: ' + (e && e.message)); }
   };
   // ── 操作 ──
-  const 閉じる距離px = 10;   // 始点からこの距離以内をクリックしたら閉じる
+  // 【点をつなぐ作図は Cesium の「建物を点で結ぶ」と同じ・2026-11-28 ユーザー指摘「90度のマークはこれじゃねぇよ。
+  //   cesiumで建物つくるときに…既存のコードを確認しろ」】src/CesiumMap.jsx の建屋追加（始点の吸い付き SNAP_PX=20・
+  //   カーソルの線・始点へ戻る線・L字の印・右クリックで確定）とそろえる。見た目の値は下の 作図の見た目 1か所。
+  //   旗 __GSI_PICK_LIKE_CESIUM=false で従来（始点 10px・緑の小さい印・全体の線が緑）＝陽性対照。
+  // 作図の見た目（Cesium の Cesium.Color.CYAN / Cesium.Color.LIME と同じ色・印は辺の長さの 15%＝CesiumMap.jsx の drawPerpMark）
+  const 作図の見た目 = { 水色: '#00ffff', 黄緑: '#00ff00', 印の割合: 0.15 };
+  const _Cesiumと同じ = !(typeof window !== 'undefined' && window.__GSI_PICK_LIKE_CESIUM === false);
+  const 閉じる距離px = _Cesiumと同じ ? 20 : 10;   // 始点からこの距離より近ければ始点に吸い付き、押すと閉じる（Cesium の SNAP_PX）
   const onDown = (e) => {
     const r = boxRef.current.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
@@ -368,13 +377,14 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (pts.length === 0) { set四角(null); 四角を確定(k.p, 画面から(sx, sy), { x: k.sx, y: k.sy }, { x: sx, y: sy }); }
       return;
     }
-    // クリック: 始点の近くなら閉じる。そうでなければ点を足す
-    if (pts.length >= 3) {
+    // クリック: 始点の近くなら閉じる（Alt を押していれば閉じずに点を置く＝Cesium と同じ）。そうでなければ点を足す
+    const _止 = (typeof snapSuppressedFor === 'function') ? snapSuppressedFor(e) : !!e.altKey;
+    if (pts.length >= 3 && (!_Cesiumと同じ || !_止)) {
       const s0 = 画面へ(pts[0].lat, pts[0].lng);
-      if (Math.hypot(sx - s0.x, sy - s0.y) <= 閉じる距離px) { 多角形を確定(pts); return; }
+      const d0 = Math.hypot(sx - s0.x, sy - s0.y);
+      if (_Cesiumと同じ ? d0 < 閉じる距離px : d0 <= 閉じる距離px) { 多角形を確定(pts); return; }
     }
     // 直角に吸い付いた位置に置く（Alt を押していれば押した所のまま）
-    const _止 = (typeof snapSuppressedFor === 'function') ? snapSuppressedFor(e) : !!e.altKey;
     const 吸 = (typeof window !== 'undefined' && window.__GSI_PERP_SNAP === false) ? null : _直角(k.sx, k.sy, _止);
     const 置く = 吸 ? 画面から(吸.target.x, 吸.target.y) : k.p;
     setPts(prev => [...prev, 置く]);
@@ -572,13 +582,23 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       <div ref={boxRef} data-gsi-map="1" data-gsi-rot={回転}
         style={{ position: 'relative', flex: 1, overflow: 'hidden', cursor: pickMode ? 'crosshair' : 'grab', background: '#1e293b' }}
         onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp} onWheel={onWheel}
-        onAuxClick={(e) => { if (e.button === 1) e.preventDefault(); }}>
+        onAuxClick={(e) => { if (e.button === 1) e.preventDefault(); }}
+        onContextMenu={(e) => {
+          // 右クリックで閉じる（3点以上・Cesium の建屋追加と同じ）。点をつないでいる間はブラウザのメニューを出さない
+          if (!pickMode) return;
+          e.preventDefault();
+          if (_Cesiumと同じ && pts.length >= 3) 多角形を確定(pts);
+        }}>
         {/* タイルは北が上の並びのまま、入れ物ごと回す（真ん中を中心に） */}
         <div data-gsi-tiles="1" style={{ position: 'absolute', inset: 0, pointerEvents: 'none',
           transform: 回転 ? 'rotate(' + 回転 + 'deg)' : undefined, transformOrigin: 半W + 'px ' + 半H + 'px' }}>
+          {/* 【タイルの継ぎ目・2026-11-28 ユーザー報告「何この糸みたいなグリッド」】回すとタイルの縁がなめらかにぼかされ、
+              隣どうしの縁が両方とも半透明になって下の地色が細い線で透けていた。各タイルを右と下へ 1px はみ出させて
+              隣と重ねる（どの縁でもどちらかのタイルは不透明なので地色が透けない。1/256 の伸びは見た目に出ない）。
+              旗 __GSI_TILE_OVERLAP=false で従来（陽性対照）。 */}
           {タイルら.map(t => (
-            <img key={t.key} src={t.url} alt="" draggable={false}
-              style={{ position: 'absolute', left: t.left, top: t.top, width: GSI_TILE_SIZE, height: GSI_TILE_SIZE, userSelect: 'none', pointerEvents: 'none' }} />
+            <img key={t.key} src={t.url} alt="" draggable={false} data-gsi-tile="1"
+              style={{ position: 'absolute', left: t.left, top: t.top, width: GSI_TILE_SIZE + タイルの重ね, height: GSI_TILE_SIZE + タイルの重ね, userSelect: 'none', pointerEvents: 'none' }} />
           ))}
         </div>
 
@@ -597,7 +617,39 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
               width={Math.abs(a.x - b.x)} height={Math.abs(a.y - b.y)}
               fill="rgba(249,115,22,0.15)" stroke="#f97316" strokeWidth={2} />;
           })()}
-          {pts.length > 0 && (() => {
+          {pts.length > 0 && _Cesiumと同じ && (() => {
+            // Cesium の建屋追加と同じ描き方（src/CesiumMap.jsx: 置いた点・置いた線＝始点まで閉じた水色の線／
+            //   カーソルの線＝吸い付いたら黄緑の太線／始点へ戻る線＝直角なら黄緑／始点に吸い付いたら始点を黄緑で囲む／
+            //   L字の印＝角に入る辺の長さの 15%）
+            const 見 = 作図の見た目;
+            const S = pts.map(p => 画面へ(p.lat, p.lng));
+            const last = S[S.length - 1];
+            const h0 = hover ? 画面へ(hover.lat, hover.lng) : null;
+            const 吸い付き禁止 = alt || (typeof window !== 'undefined' && window.__GSI_PERP_SNAP === false);
+            const 始点に寄る = !!(h0 && pts.length >= 3 && !alt && Math.hypot(h0.x - S[0].x, h0.y - S[0].y) < 閉じる距離px);
+            const 吸 = (h0 && !始点に寄る && !吸い付き禁止) ? _直角(h0.x, h0.y, false) : null;
+            const h = 始点に寄る ? S[0] : (吸 ? 吸.target : h0);
+            const 寄る = 始点に寄る || !!吸;
+            const L字 = (角, 元, 先) => { const el = Math.hypot(角.x - 元.x, 角.y - 元.y); return el > 1e-9 ? perpMark2D(角, 元, 先, el * 見.印の割合) : null; };
+            const 印ら = [];
+            if (吸 && 吸.snap90 && S.length >= 2) 印ら.push(L字(last, S[S.length - 2], h));
+            if (吸 && 吸.snapClose90 && S.length >= 2) 印ら.push(L字(h, last, S[0]));
+            const 線 = (q) => q.map(p => p.x + ',' + p.y).join(' ');
+            return (<g data-gsi="pick-poly" data-gsi-snap={寄る ? (始点に寄る ? 'start' : '90') : ''}>
+              {S.length >= 2 && <polyline data-gsi="pick-placed" points={線(S.concat([S[0]]))} fill="none"
+                stroke={見.水色} strokeOpacity={0.8} strokeWidth={2} />}
+              {h && <line data-gsi="pick-cursor" x1={last.x} y1={last.y} x2={h.x} y2={h.y}
+                stroke={寄る ? 見.黄緑 : 見.水色} strokeOpacity={寄る ? 1 : 0.6} strokeWidth={寄る ? 3 : 1.5} />}
+              {h && !始点に寄る && pts.length >= 2 && <line data-gsi="pick-close" x1={h.x} y1={h.y} x2={S[0].x} y2={S[0].y}
+                stroke={吸 && 吸.snapClose90 ? 見.黄緑 : 見.水色} strokeOpacity={吸 && 吸.snapClose90 ? 0.6 : 0.3} strokeWidth={吸 && 吸.snapClose90 ? 2.5 : 1} />}
+              {始点に寄る && <circle data-gsi="pick-start-snap" cx={S[0].x} cy={S[0].y} r={7} fill={見.黄緑} fillOpacity={0.5} stroke={見.黄緑} strokeWidth={2} />}
+              {印ら.filter(Boolean).map((m, i) => <polyline key={'p' + i} data-gsi="perp-mark" points={線(m)}
+                fill="none" stroke={見.黄緑} strokeWidth={2} />)}
+              {S.map((q, i) => <circle key={i} cx={q.x} cy={q.y} r={i === 0 ? 5 : 3.5}
+                fill={i === 0 ? 見.水色 : '#ffffff'} stroke="#000000" strokeWidth={1} />)}
+            </g>);
+          })()}
+          {pts.length > 0 && !_Cesiumと同じ && (() => {
             const S = pts.map(p => 画面へ(p.lat, p.lng));
             const h0 = hover ? 画面へ(hover.lat, hover.lng) : null;
             const 閉じる = !!(h0 && pts.length >= 3 && Math.hypot(h0.x - S[0].x, h0.y - S[0].y) <= 閉じる距離px);
