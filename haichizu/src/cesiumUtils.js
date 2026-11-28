@@ -19,7 +19,7 @@ function saveFieldPolygon(pts) {
 // 【なぜ1か所か】同じ式が「読み込み時の初期化」と「Cesium のフィールド確定」(CesiumMap.jsx) に
 //   手書きで2つあり、国土地理院の窓が3つ目になるところだった。四角（2点で作る4点）も
 //   多角形として同じここを通す＝形で分岐しない。
-// 【意味】図面（TW×TH グリッド）がその多角形の外接矩形の 90% に収まるよう縮尺を決め、
+// 【意味】図面（TW×TH グリッド）にその多角形の外接矩形がぴったり収まるよう縮尺を決め（2026-11-28 以前は 90%）、
 //   図面の中心が多角形の中心に重なるよう原点（南西の角）を逆算する。
 function fieldFrameFromPolygon(poly) {
   if (!Array.isArray(poly) || poly.length < 3) return null;
@@ -29,7 +29,12 @@ function fieldFrameFromPolygon(poly) {
   const mPerDegLng = 111320 * Math.cos(centerLat * Math.PI / 180);
   const bboxW = (Math.max(...lngs) - Math.min(...lngs)) * mPerDegLng;
   const bboxH = (Math.max(...lats) - Math.min(...lats)) * M_PER_DEG_LAT;
-  const mpp = Math.max(bboxW / (TW * 0.9), bboxH / (TH * 0.9), 0.001);
+  // 【外接する四角がぴったり図面になる・2026-11-28】升の数（TW×TH）は constants.js が範囲の縦横比で決めている。
+  //   旗 window.__FIELD_AREA_FIT = false で従来（図面の 90% に収める）
+  //   以前に決めた範囲（field_fit が無い）は従来のまま＝保存した図がずれない（述語は constants.js の fieldAreaFitEnabled 1つ）
+  const _ぴったり = (typeof fieldAreaFitEnabled === 'function') ? fieldAreaFitEnabled() : false;
+  const mpp = _ぴったり ? Math.max(bboxW / TW, bboxH / TH, 0.001)
+    : Math.max(bboxW / (TW * 0.9), bboxH / (TH * 0.9), 0.001);
   return {
     origin: {
       lat: centerLat - (TH / 2) * mpp / M_PER_DEG_LAT,
@@ -74,6 +79,8 @@ function updateGeoOrigin(lat, lng) {
 //   派生値で、読み手（App.jsx の useMemo 多数・geometry.js）が依存配列に入れていない。
 //   既存の Cesium 側も location.reload() で合わせている。再読込しない反映は別の段で直す（負債）。
 function commitFieldPolygon(poly, opts) {
+  // この版以降に決めた範囲は、図面の大きさ・縮尺を範囲に合わせる（constants.js の fieldAreaFitEnabled が読む印）
+  if (!(typeof window !== 'undefined' && window.__FIELD_AREA_FIT === false)) { try { localStorage.setItem('field_fit', '1'); } catch (_) {} }
   const fr = fieldFrameFromPolygon(poly);
   if (!fr) return false;
   saveFieldPolygon(poly);
@@ -85,6 +92,7 @@ function commitFieldPolygon(poly, opts) {
 // フィールドの解除も同じ場所に置く（記録を消す所を散らさない）
 function clearFieldPolygon(opts) {
   try { localStorage.removeItem('field_polygon'); } catch (_) {}
+  try { localStorage.removeItem('field_fit'); } catch (_) {}
   try { localStorage.removeItem('geo_origin'); } catch (_) {}
   try { localStorage.removeItem(getElevCacheKey()); } catch (_) {}
   if (!(opts && opts.noReload)) location.reload();

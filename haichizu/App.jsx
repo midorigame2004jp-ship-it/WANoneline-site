@@ -8045,6 +8045,21 @@ window.App = function App() {
    //   ＝ 3次元範囲を変えると 1px の実寸が変わる。建屋はその場で換算するので追従するが、
    //   地形メッシュは useMemo の依存に入っていなかったので**古いスケールのまま**だった。
    //   値を依存に入れて、範囲が変わったらメッシュを作り直す。
+  // 【範囲の形（フィールド）が四角でないときだけ、その形（図面座標）を返す・2026-11-28】
+  //   四角（外接する四角そのもの＝図面いっぱい）なら切る必要が無いので null。地形・塗る面・平面図が同じ判定を使う。
+  //   旗 window.__FIELD_CLIP = false で切らない（従来）
+  const _fieldPolyClip = () => {
+    if (typeof window !== 'undefined' && window.__FIELD_CLIP === false) return null;
+    const P = (typeof FIELD_POLY_GRID !== 'undefined') ? FIELD_POLY_GRID : null;
+    if (!Array.isArray(P) || P.length < 3) return null;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, a2 = 0;
+    for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length];
+      x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); a2 += p.x * q.y - q.x * p.y; }
+    const 箱 = (x1 - x0) * (y1 - y0);
+    return (箱 > 0 && Math.abs(a2 / 2) >= 箱 * 0.999) ? null : P;   // 面積が外接する四角と同じ＝四角
+  };
+  const _ptInPolyXY = (P, x, y) => { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j];
+    if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) c = !c; } return c; };
   const _mToPx今 = _terrainMToPx();
   // 地形メッシュ（メモ化）
   const terrainMesh = useMemo(() => {
@@ -8055,6 +8070,13 @@ window.App = function App() {
     //   細かさを上げても表示が変わらなかった（2026-11-23 ユーザー報告）
     const _div = uiSettingValue(uiSettings, 'terrainGrid');
     const _m = terrainToMesh(t2, TW, TH, terrainExag, _terrainMToPx(), _div);
+    // 【地面も範囲の形の中だけ・2026-11-28】範囲が四角でないときは、中心が形の外にある面を描かない
+    const _形 = _fieldPolyClip();
+    if (_形 && _m && Array.isArray(_m.quads)) {
+      const 前 = _m.quads.length;
+      _m.quads = _m.quads.filter(q => _ptInPolyXY(_形, (q.x0 + q.x2) / 2, (q.y0 + q.y2) / 2));
+      _m.形の外で落とした = 前 - _m.quads.length;
+    }
     // 観測専用（製品は読まない）。「実寸か」をコンソールで検算できるようにする・2026-11-23
     //   window.__terrainInfo で 1m が何px か・高低差が画面で何px か・図面の実寸が分かる
     if (typeof window !== "undefined") {
@@ -8070,7 +8092,7 @@ window.App = function App() {
         高低差px: 差 * _m.zScale,
         図面px: [TW, TH], 図面の実寸m: [TW * mpp, TH * mpp],
         高低差の割合: (差 / (TW * mpp)),
-        面: _m.quads.length,
+        面: _m.quads.length, 形の外で落とした: _m.形の外で落とした || 0,
       };
     }
     return _m;
@@ -9798,6 +9820,21 @@ window.App = function App() {
     if (_塗りあり) {
       const _div = uiSettingValue(uiSettings, 'terrainGrid');
       const _mpp = _bldZMpp();
+      // 【範囲の形で切る・2026-11-28】範囲（フィールド）が四角でないときは、形の外にはみ出した分を描かない。
+      //   形の辺を地面の格子で刻んで起伏に乗せ、画面の上で切り抜く（塗る面はすべて地面の上なので画面で切ってよい）。
+      const _形で切る = _fieldPolyClip();
+      if (_形で切る) {
+        ctx.save();
+        const 刻 = (typeof terrainResample === 'function') ? terrainResample(_形で切る.concat([_形で切る[0]]), terrainDraw, TW, TH, _div).slice(0, -1) : _形で切る;
+        ctx.beginPath();
+        刻.forEach((q, i) => {
+          const zz = (typeof terrainZAt === 'function') ? terrainZAt(terrainDraw, TW, TH, q.x, q.y, terrainExag, _terrainMToPx(), _div) : 0;
+          const pr = _地面の投影(q.x, q.y, zz);
+          if (i === 0) ctx.moveTo(pr.x, pr.y); else ctx.lineTo(pr.x, pr.y);
+        });
+        ctx.closePath();
+        ctx.clip();
+      }
       for (const a of groundAreas) {
         if (!a) continue;
         // 【形（輪）で持つ面＝交差点の角・2026-11-27】輪の辺を地面の格子の間隔で刻んで起伏に乗せる
@@ -9846,10 +9883,12 @@ window.App = function App() {
         }
         塗数++;
       }
+      if (_形で切る) ctx.restore();
     }
     ctx.restore();
     if (typeof window !== 'undefined') {
       window.__terrainCanvasInfo = {
+        描いたカメラ: _camNow().join(','),
         面: 面数, GL: _gl描いた, GL失敗: (terrainGLRef.current && terrainGLRef.current.失敗) || null,
         頂点を送った: !!(terrainGLRef.current && terrainGLRef.current.送った),
         塗り: 塗数, 段: 束.size, ms: Math.round(performance.now() - t0),
@@ -9874,15 +9913,28 @@ window.App = function App() {
   _terrainDrawRef.current = _drawTerrainCanvas;
   const _terrainRafRef = useRef(0);
   const _terrainCamRef = useRef(null);
+  // 【カメラが動いたら同じコマで描く・2026-11-28 ユーザー報告「3次元図をドラッグすると建物は追従するが道路と地面は遅れてついてくる」】
+  //   建物（SVG）は描き直しの同じ回で動くのに、地面と道路（このcanvas）は「描き直しが画面に出た後（useEffect）」に
+  //   さらに次のコマ（requestAnimationFrame）を待って描いていたので、1〜2コマ遅れていた。
+  //   カメラが変わったときは、画面に出る前（useLayoutEffect）にその場で描く＝建物と同じコマに出る。
+  //   カメラ以外の変化（地形・塗る面・設定）は従来どおり次のコマにまとめる。
+  //   旗 window.__TERRAIN_DRAW_SAME_FRAME = false で従来（遅れる）＝陽性対照。
+  const _同じコマ = !(typeof window !== 'undefined' && window.__TERRAIN_DRAW_SAME_FRAME === false);
   const _useTerrainCanvasEffect = ({ camAz, camEl, camZoom, camPanX, camPanY }) => {
-    useEffect(() => {
+    (_同じコマ ? useLayoutEffect : useEffect)(() => {
       const cam5 = camAz + ',' + camEl + ',' + camZoom + ',' + camPanX + ',' + camPanY;
       const 前 = _terrainCamRef.current;
       _terrainCamRef.current = { cam5, draw: _drawTerrainCanvas };
       if (typeof window !== 'undefined') window.__terrainEffect = { 走った: ((window.__terrainEffect || {}).走った || 0) + 1, cam5 };
       const 従来 = (typeof window !== 'undefined' && window.__TERRAIN_CANVAS_FOLLOW_CAM === false);
       // 描き手が同じ＝App は作り直されていない＝カメラだけが動いた、と判る
-      if (従来 && 前 && 前.draw === _drawTerrainCanvas && 前.cam5 !== cam5) return;
+      const カメラだけ = 前 && 前.draw === _drawTerrainCanvas && 前.cam5 !== cam5;
+      if (従来 && カメラだけ) return;
+      if (_同じコマ && 前 && 前.cam5 !== cam5) {
+        if (_terrainRafRef.current) { cancelAnimationFrame(_terrainRafRef.current); _terrainRafRef.current = 0; }
+        try { _terrainDrawRef.current(); } catch (e) { console.warn('[地形canvas]', e && e.message); }
+        return;
+      }
       if (_terrainRafRef.current) return;
       _terrainRafRef.current = requestAnimationFrame(() => {
         _terrainRafRef.current = 0;
@@ -17267,7 +17319,12 @@ window.App = function App() {
                     ? { stroke: a.color || '#9CA3AF', strokeWidth: 1, vectorEffect: 'non-scaling-stroke', strokeLinejoin: 'round' } : { stroke: 'none' })}
                   style={{ pointerEvents: 'none' }} />);
               });
-              return _組で ? (<g data-ground-areas="1" opacity={0.55} style={{ pointerEvents: 'none' }}>{_面}</g>) : _面;
+              // 範囲の形が四角でないときは、形の外にはみ出した分を描かない（3次元図と同じ判定 _fieldPolyClip）
+              const _形 = _fieldPolyClip();
+              const _切り = _形 ? { clipPath: 'url(#ground-field-clip)' } : {};
+              const _定義 = _形 ? (<defs><clipPath id="ground-field-clip"><polygon points={_形.map(p => p.x + ',' + p.y).join(' ')} /></clipPath></defs>) : null;
+              return _組で ? (<g data-ground-areas="1" opacity={0.55} style={{ pointerEvents: 'none' }} {..._切り}>{_定義}{_面}</g>)
+                : (<g {..._切り}>{_定義}{_面}</g>);
             })()}
             {(() => {
               // 建屋ごとにグループ化して一体表示

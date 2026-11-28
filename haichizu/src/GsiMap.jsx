@@ -26,8 +26,13 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     return { lat: o.lat, lng: o.lng, z: 15 };
   });
   const [pickMode, setPickMode] = React.useState(false);
-  const [pts, setPts] = React.useState([]);          // 範囲指定の2点 [{lat,lng}]
+  // 【範囲の指定・2026-11-28 ユーザー要望】ドラッグ＝四角で囲む（離したら確認）／クリック＝点をつないでいき、
+  //   始点をクリックすると閉じた形（建物を点で結んで作るときと同じ）。地面と建物の取り込みもその範囲の中だけ。
+  const [pts, setPts] = React.useState([]);          // クリックでつないだ点 [{lat,lng}]
   const [hover, setHover] = React.useState(null);     // 範囲指定中のカーソル位置
+  const [四角, set四角] = React.useState(null);       // ドラッグ中の四角 { a, b }（緯度経度）
+  const pickRef = React.useRef(null);                  // 押した点 { sx, sy, p, 動いた }
+  const 範囲の案内 = 'ドラッグで四角を囲む／クリックで点をつなぎ、始点をクリックで閉じる（Backspace で1点戻す・Esc でやめる）';
   const [busy, setBusy] = React.useState(null);       // 取得中の進捗の文字
   const [msg, setMsg] = React.useState('');
   const dragRef = React.useRef(null);
@@ -124,7 +129,21 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       //   高さ・色・意図（中心線・幅員区分）を渡すようにしても**ここで落ちていた**。
       //   足したものを書き忘れない形にする（solidModel の _作図の入力 と同じ作法）。
       const _グ = (a) => a.map(q => { const g = geoToGrid(q.lat, q.lng); return { x: g.x, y: g.y }; });
-      const items = r.items.map(it => {
+      // 【範囲の中だけ取り込む・2026-11-28】範囲（フィールドの形）が四角でなくても、その中だけにする。
+      //   建物＝重心が形の中／地面に塗る面（道路・水面）＝少しでも形にかかるもの（はみ出した分は描くときに形で切る）。
+      //   旗 window.__GSI_IMPORT_IN_FIELD = false で従来（図面の四角の中を全部）
+      let 範囲の外 = 0;
+      const _形 = !(typeof window !== 'undefined' && window.__GSI_IMPORT_IN_FIELD === false) ? _範囲の形() : null;
+      const _採る = (it) => {
+        if (!_形) return true;
+        const 点 = it.ring || it.輪 || it.中心線 || [];
+        if (!点.length) return true;
+        if (it.塗る) return 点.some(q => _中(_形, q));
+        let la = 0, lo = 0; for (const q of 点) { la += q.lat; lo += q.lng; }
+        return _中(_形, { lat: la / 点.length, lng: lo / 点.length });
+      };
+      const _中の = r.items.filter(it => { const ok = _採る(it); if (!ok) 範囲の外++; return ok; });
+      const items = _中の.map(it => {
         const 他 = Object.assign({}, it); delete 他.ring; delete 他.中心線;
         // 【塗る面は中心線＋幅で運ぶ・2026-11-24】輪（ring）を持たないので points も作らない。
         //   帯は描く側（地面の canvas・平面図）が地面の起伏に乗せて作る。
@@ -146,6 +165,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       if (res && res.地面に乗せなかった) 行.push(res.地面に乗せなかった + ' 件は地面に乗せず、高さ 0m の基準面に置きました');
       if (res && res.重複) 行.push('すでにある ' + res.重複 + ' 件は足していません');
       if (res && res.重なり) 行.push('手で作った建屋と重なる ' + res.重なり + ' 件は足していません');
+      if (範囲の外) 行.push('範囲の形の外の ' + 範囲の外 + ' 件は取り込んでいません');
       if (r.穴) 行.push('中庭などの穴 ' + r.穴 + ' 件は落としました');
       // 【道路の縁の線は取らない・2026-11-27】道路は中心線だけを帯にする（gsiTiles.js の GSI_IMPORT_LAYERS の ft範囲）
       // 【道路の面・2026-11-27】道路の縁の線で囲まれた形をそのまま面にした数（交差点も縁の線どおり）
@@ -174,18 +194,15 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     finally { setBusy(false); }
   };
   // ── 操作 ──
+  const 閉じる距離px = 10;   // 始点からこの距離以内をクリックしたら閉じる
   const onDown = (e) => {
     if (e.button !== 0) return;
     const r = boxRef.current.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
     if (pickMode) {
-      const p = 画面から(sx, sy);
-      setPts(prev => {
-        if (prev.length >= 2) return [p];
-        const next = [...prev, p];
-        if (next.length === 2) 範囲を確定(next[0], next[1]);
-        return next;
-      });
+      // 押した時点では決めない（離したときに「ドラッグか・クリックか」で分ける）
+      pickRef.current = { sx, sy, p: 画面から(sx, sy), 動いた: false, lat: view.lat, lng: view.lng };
+      e.preventDefault();
       return;
     }
     dragRef.current = { sx, sy, lat: view.lat, lng: view.lng };
@@ -194,14 +211,57 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
   const onMove = (e) => {
     const r = boxRef.current.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
-    if (pickMode && pts.length === 1) setHover(画面から(sx, sy));
+    if (pickMode) {
+      setHover(画面から(sx, sy));
+      const k = pickRef.current;
+      if (k) {
+        if (!k.動いた && Math.hypot(sx - k.sx, sy - k.sy) > 5) k.動いた = true;
+        if (k.動いた) {
+          if (pts.length === 0) set四角({ a: k.p, b: 画面から(sx, sy) });   // 最初の点の前のドラッグ＝四角で囲む
+          else {
+            // 点をつないでいる途中のドラッグは地図を動かす（つなぎかけの点は残す）
+            const fx = gsiLngToTileX(k.lng, z) - (sx - k.sx) / GSI_TILE_SIZE;
+            const fy = gsiLatToTileY(k.lat, z) - (sy - k.sy) / GSI_TILE_SIZE;
+            setView(v => ({ ...v, lng: gsiTileXToLng(fx, z), lat: gsiTileYToLat(fy, z) }));
+          }
+        }
+      }
+      return;
+    }
     const d = dragRef.current;
     if (!d) return;
     const fx = gsiLngToTileX(d.lng, z) - (sx - d.sx) / GSI_TILE_SIZE;
     const fy = gsiLatToTileY(d.lat, z) - (sy - d.sy) / GSI_TILE_SIZE;
     setView(v => ({ ...v, lng: gsiTileXToLng(fx, z), lat: gsiTileYToLat(fy, z) }));
   };
-  const onUp = () => { dragRef.current = null; };
+  const onUp = (e) => {
+    dragRef.current = null;
+    const k = pickRef.current; pickRef.current = null;
+    if (!pickMode || !k || !e || e.type === 'mouseleave') { if (e && e.type === 'mouseleave') set四角(null); return; }
+    const r = boxRef.current.getBoundingClientRect();
+    const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    if (k.動いた) {
+      if (pts.length === 0) { set四角(null); 四角を確定(k.p, 画面から(sx, sy)); }
+      return;
+    }
+    // クリック: 始点の近くなら閉じる。そうでなければ点を足す
+    if (pts.length >= 3) {
+      const s0 = 画面へ(pts[0].lat, pts[0].lng);
+      if (Math.hypot(sx - s0.x, sy - s0.y) <= 閉じる距離px) { 多角形を確定(pts); return; }
+    }
+    setPts(prev => [...prev, k.p]);
+  };
+  // Backspace で1点戻す・Esc でやめる（範囲の指定中だけ）
+  React.useEffect(() => {
+    if (!pickMode) return undefined;
+    const onKey = (e) => {
+      const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.key === 'Escape') { setPts([]); set四角(null); setPickMode(false); setMsg('範囲の指定をやめました'); e.preventDefault(); }
+      else if (e.key === 'Backspace') { setPts(prev => prev.slice(0, -1)); e.preventDefault(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [pickMode]);
   const onWheel = (e) => {
     e.preventDefault();
     const r = boxRef.current.getBoundingClientRect();
@@ -214,32 +274,55 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
     setView({ z: nz, lng: gsiTileXToLng(ncx, nz), lat: gsiTileYToLat(ncy, nz) });
   };
 
-  // ── 3次元範囲を設定（2点の四角 → フィールド）──
-  const 範囲を確定 = (p1, p2) => {
-    const north = Math.max(p1.lat, p2.lat), south = Math.min(p1.lat, p2.lat);
-    const west = Math.min(p1.lng, p2.lng), east = Math.max(p1.lng, p2.lng);
+  // ── 3次元範囲を設定（ドラッグの四角／クリックでつないだ形 → フィールド）──
+  // 原点と縮尺を決める式は cesiumUtils.js の fieldFrameFromPolygon 1か所（Cesium の多角形クリックと同じ commitFieldPolygon を通る）。
+  //   図面（平面図・3次元図）は形の外接する四角がぴったり収まる大きさ・縦横比になる（constants.js の fieldCellsFromPolygon）。
+  const _外接 = (poly) => {
+    const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
+    const north = Math.max(...lats), south = Math.min(...lats), west = Math.min(...lngs), east = Math.max(...lngs);
     const mPerDegLng = 111320 * Math.cos(((north + south) / 2) * Math.PI / 180);
-    const 幅m = (east - west) * mPerDegLng, 高m = (north - south) * 111320;
-    if (幅m < 1 || 高m < 1) { setMsg('範囲が小さすぎます。離れた2点を押してください'); setPts([]); return; }
-    const poly = [
-      { lat: north, lng: west }, { lat: north, lng: east },
-      { lat: south, lng: east }, { lat: south, lng: west },
-    ];
-    const 文 = '3次元の範囲をこの四角にします。\n'
-      + '  東西 ' + Math.round(幅m) + ' m ／ 南北 ' + Math.round(高m) + ' m\n\n'
-      + '図面（平面図・3次元図）の座標がこの範囲に合わせ直され、\n画面を読み込み直します。よろしいですか？';
-    setPickMode(false);
+    return { north, south, west, east, 幅m: (east - west) * mPerDegLng, 高m: (north - south) * 111320, mPerDegLng };
+  };
+  const _確かめて決める = (poly, 文) => {
+    setPickMode(false); setPts([]); set四角(null); setHover(null);
     setTimeout(() => {
-      if (window.confirm(文)) {
-        // 原点と縮尺を決める式は cesiumUtils.js の fieldFrameFromPolygon 1か所。
-        // Cesium の多角形クリックと同じ道（commitFieldPolygon）を通る。
-        commitFieldPolygon(poly);
-      } else {
-        setPts([]);
-        setMsg('範囲の設定をやめました');
-      }
+      if (window.confirm(文)) commitFieldPolygon(poly);
+      else setMsg('範囲の設定をやめました');
     }, 0);
   };
+  const 四角を確定 = (p1, p2) => {
+    const poly0 = [p1, p2];
+    const b = _外接(poly0);
+    if (b.幅m < 1 || b.高m < 1) { setMsg('範囲が小さすぎます。もう少し大きく囲んでください'); return; }
+    const poly = [
+      { lat: b.north, lng: b.west }, { lat: b.north, lng: b.east },
+      { lat: b.south, lng: b.east }, { lat: b.south, lng: b.west },
+    ];
+    _確かめて決める(poly, 'この四角を3次元の範囲にしますか？\n'
+      + '  東西 ' + Math.round(b.幅m) + ' m ／ 南北 ' + Math.round(b.高m) + ' m\n\n'
+      + '図面（平面図・3次元図）の範囲がこの四角になり、地面と建物もこの中を取り込みます。\n'
+      + '座標が合わせ直され、画面を読み込み直します。');
+  };
+  const 多角形を確定 = (poly) => {
+    const b = _外接(poly);
+    if (b.幅m < 1 || b.高m < 1) { setMsg('範囲が小さすぎます'); return; }
+    // 自分と交わる形は範囲にできない（中と外が決まらない）
+    const P = poly.map(p => ({ x: (p.lng - b.west) * b.mPerDegLng, y: (b.north - p.lat) * 111320 }));
+    const 交わる = (a, c, d, e) => { const o = (p, q, r) => Math.sign((q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x));
+      return o(a, c, d) * o(a, c, e) < 0 && o(d, e, a) * o(d, e, c) < 0; };
+    for (let i = 0; i < P.length; i++) for (let j = i + 2; j < P.length; j++) {
+      if (i === 0 && j === P.length - 1) continue;
+      if (交わる(P[i], P[(i + 1) % P.length], P[j], P[(j + 1) % P.length])) { setMsg('線が交わっている形は範囲にできません。Backspace で戻して描き直してください'); setPickMode(true); return; }
+    }
+    _確かめて決める(poly, 'この形（' + poly.length + ' 点）を3次元の範囲にしますか？\n'
+      + '  外接する四角 東西 ' + Math.round(b.幅m) + ' m ／ 南北 ' + Math.round(b.高m) + ' m\n\n'
+      + '図面（平面図・3次元図）の範囲はこの形が入る四角になり、地面と建物はこの形の中だけ取り込みます。\n'
+      + '座標が合わせ直され、画面を読み込み直します。');
+  };
+  // 取り込みを範囲の中だけにする（範囲＝保存されたフィールドの形）
+  const _範囲の形 = () => { const p = (typeof getSavedFieldPolygon === 'function') ? getSavedFieldPolygon() : null; return p && p.length >= 3 ? p : null; };
+  const _中 = (P, q) => { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j];
+    if ((a.lat > q.lat) !== (b.lat > q.lat) && q.lng < (b.lng - a.lng) * (q.lat - a.lat) / (b.lat - a.lat) + a.lng) c = !c; } return c; };
 
   // ── 地面を作る（DEM を取得して3次元図へ）──
   const 地面を作る = async () => {
@@ -300,7 +383,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
       {/* 道具 */}
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '4px 6px', background: '#1e293b', flexWrap: 'wrap' }}>
         <button data-gsi-btn="range" style={ボタン(pickMode ? 'rgba(234,88,12,0.95)' : 'rgba(59,130,246,0.85)')}
-          onClick={() => { setPickMode(m => !m); setPts([]); setHover(null); setMsg(pickMode ? '' : '地図の上で2点を押してください（四角の対角）'); }}>
+          onClick={() => { setPickMode(m => !m); setPts([]); set四角(null); setHover(null); setMsg(pickMode ? '' : 範囲の案内); }}>
           {pickMode ? '範囲の指定をやめる' : '3次元範囲を設定'}
         </button>
         <button data-gsi-btn="ground" style={ボタン(busy ? 'rgba(100,116,139,0.8)' : 'rgba(22,163,74,0.9)')}
@@ -353,16 +436,24 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
             <polygon data-gsi="field" points={枠.map(p => p.x + ',' + p.y).join(' ')}
               fill="rgba(250,204,21,0.08)" stroke="#facc15" strokeWidth={2} />
           )}
-          {pts.length === 1 && hover && (() => {
-            const a = 画面へ(pts[0].lat, pts[0].lng), b = 画面へ(hover.lat, hover.lng);
+          {四角 && (() => {
+            const a = 画面へ(四角.a.lat, 四角.a.lng), b = 画面へ(四角.b.lat, 四角.b.lng);
             return <rect data-gsi="pick" x={Math.min(a.x, b.x)} y={Math.min(a.y, b.y)}
               width={Math.abs(a.x - b.x)} height={Math.abs(a.y - b.y)}
               fill="rgba(249,115,22,0.15)" stroke="#f97316" strokeWidth={2} />;
           })()}
-          {pts.map((p, i) => {
-            const s = 画面へ(p.lat, p.lng);
-            return <circle key={i} cx={s.x} cy={s.y} r={4} fill="#f97316" stroke="#fff" strokeWidth={1.5} />;
-          })}
+          {pts.length > 0 && (() => {
+            const S = pts.map(p => 画面へ(p.lat, p.lng));
+            const h = hover ? 画面へ(hover.lat, hover.lng) : null;
+            const 閉じる = !!(h && pts.length >= 3 && Math.hypot(h.x - S[0].x, h.y - S[0].y) <= 閉じる距離px);
+            const 線 = S.concat(h ? [閉じる ? S[0] : h] : []);
+            return (<g data-gsi="pick-poly">
+              {pts.length >= 3 && <polygon points={S.map(q => q.x + ',' + q.y).join(' ')} fill="rgba(249,115,22,0.12)" stroke="none" />}
+              <polyline points={線.map(q => q.x + ',' + q.y).join(' ')} fill="none" stroke="#f97316" strokeWidth={2} />
+              {S.map((q, i) => <circle key={i} cx={q.x} cy={q.y} r={i === 0 ? (閉じる ? 8 : 6) : 4}
+                fill={i === 0 ? (閉じる ? '#22c55e' : '#fff') : '#f97316'} stroke={i === 0 ? '#f97316' : '#fff'} strokeWidth={i === 0 ? 2.5 : 1.5} />)}
+            </g>);
+          })()}
         </svg>
 
         {/* 出典（地理院タイルの利用条件） */}
@@ -373,7 +464,7 @@ function GsiMapPanel({ onTerrain, terrain, gridN, demSource, onClose, onBuilding
 
       {/* 知らせ */}
       <div style={{ fontSize: 11, padding: '3px 6px', background: '#1e293b', minHeight: 18, lineHeight: '14px' }}>
-        {busy ? busy : (msg || (pickMode ? '地図の上で2点を押してください（四角の対角）' : '水色の点線＝いまの図面の範囲／黄色＝フィールド'))}
+        {busy ? busy : (msg || (pickMode ? 範囲の案内 : '水色の点線＝いまの図面の範囲／黄色＝フィールド'))}
       </div>
     </div>
   );

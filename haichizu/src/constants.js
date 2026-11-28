@@ -1,6 +1,37 @@
 ﻿// ===== 定数定義 =====
 const MAJOR = 36, MINOR = MAJOR / 5;
-const MC = 160, MR = 112, TW = MC * MAJOR, TH = MR * MAJOR, MAX_Z = 8 * MAJOR;
+// 【図面の升目の数は選んだ範囲の縦横比に合わせる・2026-11-28 ユーザー要望】
+//   「3次元図には今は固定で横長長方形となっているが、範囲選択したものが四角の場合はそれを描写範囲とし、
+//    四角でなければそれが入るような四角を描写エリアの四角としてくれ」
+//   範囲（localStorage の field_polygon）の外接する四角の縦横比で、長い辺を 160 升にする（升の数は従来の長い辺と同じ）。
+//   範囲が無ければ従来どおり 160×112。縮尺（1升の実寸）は cesiumUtils.js の fieldFrameFromPolygon が
+//   外接する四角がぴったり収まるように決める。旗 window.__FIELD_AREA_FIT = false で従来（160×112 固定・90%に収める）。
+// 【以前に決めた範囲は従来の図面のまま・2026-11-28】図面の大きさと縮尺が変わると、その範囲で作って保存した図（座標は升目）が
+//   地図とずれる。範囲に合わせるのは、この版以降に決めた範囲（commitFieldPolygon が field_fit=1 を残す）だけにする。
+//   述語はここ1つ（升の数 fieldCellsFromPolygon と縮尺 fieldFrameFromPolygon が同じものを読む）。
+function fieldAreaFitEnabled() {
+  if (typeof window !== 'undefined' && window.__FIELD_AREA_FIT === false) return false;
+  try { return typeof localStorage !== 'undefined' && localStorage.getItem('field_fit') === '1'; } catch (e) { return false; }
+}
+function fieldCellsFromPolygon(poly) {
+  const 既定 = { MC: 160, MR: 112 };
+  if (!fieldAreaFitEnabled()) return 既定;
+  if (!Array.isArray(poly) || poly.length < 3) return 既定;
+  const lats = poly.map(p => p.lat), lngs = poly.map(p => p.lng);
+  if (!lats.every(Number.isFinite) || !lngs.every(Number.isFinite)) return 既定;
+  const 中lat = (Math.min(...lats) + Math.max(...lats)) / 2;
+  const W = (Math.max(...lngs) - Math.min(...lngs)) * 111320 * Math.cos(中lat * Math.PI / 180);
+  const H = (Math.max(...lats) - Math.min(...lats)) * 111320;
+  if (!(W > 0 && H > 0)) return 既定;
+  const 長 = 160, 短の下限 = 8;
+  if (W >= H) return { MC: 長, MR: Math.max(短の下限, Math.min(長, Math.round(長 * H / W))) };
+  return { MC: Math.max(短の下限, Math.min(長, Math.round(長 * W / H))), MR: 長 };
+}
+const _FIELD_CELLS = (() => {
+  try { const s = (typeof localStorage !== 'undefined') ? localStorage.getItem('field_polygon') : null; return fieldCellsFromPolygon(s ? JSON.parse(s) : null); }
+  catch (e) { return { MC: 160, MR: 112 }; }
+})();
+const MC = _FIELD_CELLS.MC, MR = _FIELD_CELLS.MR, TW = MC * MAJOR, TH = MR * MAJOR, MAX_Z = 8 * MAJOR;
 const VIEW_PAD = 600; // 平面図・断面図・側面図の回転用余白（px）
 const CAB_W = 900, CAB_H = 700;
 const DEF_AZ = -0.21, DEF_EL = 0.26;
